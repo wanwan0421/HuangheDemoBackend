@@ -1,6 +1,6 @@
 import { Controller, Get, Query, Param } from '@nestjs/common';
 import { ResourceService } from './resource.service';
-import { ResourceDto, ResourceType } from './dto/resource.dto';
+import { ResourceDto, ResourceType } from './dto/modelResourceIO.dto';
 
 @Controller('resource')
 export class ResourceController {

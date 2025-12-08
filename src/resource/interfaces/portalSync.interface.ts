@@ -17,3 +17,7 @@ export interface OnePageMd5Result {
     totalNumber: number;
     md5List: string[]; // only return the md5 list for internal use
 }
+
+export interface MdlEventParameter {
+    datasetReference?: string;
+}

@@ -3,6 +3,7 @@ import { Type } from "class-transformer";
 import { ModelItemEventDataDto } from "./modelItemEventData.dto";
 
 // 描述模型State中的一个Event
+// 例如：<Event name="Years_zip" type="response" description="研究区域历史影像文件" optional="False">
 export class ModelItemEventDto {
     @IsString()
     @IsNotEmpty()

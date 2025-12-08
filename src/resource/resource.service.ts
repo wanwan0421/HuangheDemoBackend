@@ -1,32 +1,18 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
-import { ResourceDto, ResourceType } from './dto/modelResourceIO.dto';
-import { ModelResource } from './entities/modelResource.entity';
-import { Md5Item, OnePageMd5Result, PortalMd5Data } from './interfaces/portalSync.interface';
+import { plainToInstance } from 'class-transformer';
+import { ModelResource, ResourceType } from './entities/modelResource.entity';
+import { Md5Item, OnePageMd5Result, PortalMd5Data, MdlEventParameter } from './interfaces/portalSync.interface';
 import { firstValueFrom } from 'rxjs';
-
-// 假设的内存数据库存储资源元数据
-const MOCK_RESOURCES: ResourceDto[] = [
-    {
-        id: 'model-a',
-        type: ResourceType.MODEL,
-        name: '气候预测模型A',
-        description: '基于时间序列的降雨量预测模型',
-        input_requirements: [{ name: '历史数据', type: 'array<number>' }],
-        output_requirements: [{ name: '预测值', type: 'number' }],
-        external_url: 'http://external-model-service.com/api/predict/a',
-    },
-    {
-        id: 'method-normalize',
-        type: ResourceType.METHOD,
-        name: '数据归一化方法',
-        description: '将数据缩放到 [0, 1] 区间',
-        input_requirements: [{ name: '原始数据', type: 'array<number>' }],
-        output_requirements: [{ name: '归一化数据', type: 'array<number>' }],
-        external_url: 'http://data-process-service.com/api/normalize',
-    },
-];
+import { ModelItemDataDto } from './dto/modelItemData.dto';
+import { ModelItemStateDto } from './dto/modelItemState.dto';
+import { ModelUtilsService } from './modelUtils.service';
+import { ModelItemEventDataDto } from './dto/modelItemEventData.dto';
+import { ModelItemEventDataNodeDto } from './dto/modelItemEventDataNode.dto';
+import { ModelItemEventDto } from './dto/modelItemEvent.dto';
 
 @Injectable()
 export class ResourceService {
@@ -38,6 +24,9 @@ export class ResourceService {
 
     constructor(private readonly httpService: HttpService,
                 private readonly configService: ConfigService,
+                private readonly modelUtilsService: ModelUtilsService,
+                @InjectRepository(ModelResource)
+                private modelResourceRepository: Repository<ModelResource>,
     ) {
         this.portalLocation = this.configService.get<string>('portalLocation')!;
         this.portalToken = this.configService.get<string>('portalToken')!;
@@ -104,6 +93,7 @@ export class ResourceService {
         return modelsMd5List;
     }
 
+    // 主入口：获取门户模型并同步到本地
     public async synchronizePortalModels(): Promise<void> {
         const modelsMd5List = await this.getPortalModelMd5();
         const baseUrl = `http://${this.portalLocation}/computableModel/ModelInfoAndClassifications_pid/`;
@@ -121,38 +111,150 @@ export class ResourceService {
                 }
 
                 const modelData = detailResponse.data.data;
-                
+                // 将mdl的XML转换为JSON对象
+                const mdlJson = await this.modelUtilsService.convertMdlXmlToJson(modelData.mdl);
+
+                // 获取mdl中的states
+                const statesJson = mdlJson['mdl']?.states;
+                // 获取mdl中的data
+                const modelItemData = this.getModelItemData(statesJson);
+
+                // 解析最后修改时间
+                const updateTime = new Date(modelData.lastModifyTime);
+
                 const newModel: Partial<ModelResource> = {
                     name: modelData.name,
                     id: modelData.id,
                     description: modelData.overview,
                     author: modelData.author,
-                    
 
-                }
+                    normalTags: modelData.itemClassifications,
+                    type: ResourceType.MODEL,
+                    md5: modelData.md5,
+                    mdl: modelData.mdl,
+                    mdlJson: mdlJson,
+                    data: modelItemData,
+                    updateTime: updateTime,
+                };
 
+                await this.saveModel(newModel);
+
+            } catch (error) {
+                this.logger.error(`Error processing model with md5 ${md5}: ${error}`);
             }
         }
     }
 
-    // get resources list by type
-    findAll(type?: ResourceType): ResourceDto[] {
-        if (type) {
-            return MOCK_RESOURCES.filter(resource => resource.type === type);
+    // 从解析后的MDL中的states中提取输入/输出数据结构
+    // @param statesJson 经过MDL解析后的States JSON数组
+    public getModelItemData(states: Record<string, any>[] | null | undefined): ModelItemDataDto {
+        const inputStates: ModelItemStateDto[] = [];
+        const outputStates: ModelItemStateDto[] = [];
+
+        if (states && Array.isArray(states)) {
+            for (const state of states) {
+                const { input, output } = this.getModelItemStates(state);
+                inputStates.push(input);
+                outputStates.push(output);
+            }
         }
-        return MOCK_RESOURCES;
+
+        // 转换为顶层 ModelItemDataDto 实例
+        return plainToInstance(ModelItemDataDto, {
+            input: inputStates,
+            output: outputStates
+        });
     }
 
-    // get resource by id
-    findOne(id: string): ResourceDto {
-        const resource = MOCK_RESOURCES.find(resource => resource.id === id);
-        if (!resource) {
-            this.logger.error(`Resource with id ${id} not found`);
-            throw new Error(`Resource with id ${id} not found`);
+    // 从解析后的MDL中提取states流程
+    private getModelItemStates(state: Record<string, any>): { input: ModelItemStateDto, output: ModelItemStateDto } {
+        const inputEvents: ModelItemEventDto[] = [];
+        const outputEvents: ModelItemEventDto[] = [];
+
+        const events = state.event;
+        if (events && Array.isArray(events)) {
+            for (const event of events) {
+                const modelItemEvent = this.getModelItemEvents(event);
+
+                // 根据eventType区分输入输出事件
+                if (modelItemEvent.eventType === "response") {
+                    inputEvents.push(modelItemEvent);
+                } else {
+                    outputEvents.push(modelItemEvent);
+                }
+            } 
         }
-        return resource;
+
+        // 组合state对象
+        const statePlain = {
+            stateName: state.stateName,
+            stateDescription: state.stateDesc,
+        };
+
+        // 创建inputState DTO实例
+        const inputStateDto = plainToInstance(ModelItemStateDto, {
+            ...statePlain,
+            events: inputEvents
+        });
+
+        // 创建outputState DTO实例
+        const outputStateDto = plainToInstance(ModelItemStateDto, {
+            ...statePlain,
+            events: outputEvents
+        });
+
+        return { input: inputStateDto, output: outputStateDto };
     }
 
-    // invoke external resource
+    // 从解析后的MDL中的states中提取events事件
+    private getModelItemEvents(event: Record<string, any>): ModelItemEventDto {
+        // 需要手动处理optional字段，因为有些JSON中不存在该字段
+        let optional = false;
+        if (event.optional !== undefined && event.optional !== null) {
+            optional = !!event.optional;
+        }
+
+        // 递归获取Event事件中的数据
+        const eventData = this.getModelItemEventData(event.data);
+
+        // 组合event对象
+        const eventPlain = {
+            eventName: event.eventName,
+            eventDescription: event.eventDesc,
+            eventType: event.eventType,
+            optional: optional,
+            eventData: eventData,
+        }
+
+        // 转换为ModelItemEventDto实例并返回
+        return plainToInstance(ModelItemEventDto, eventPlain);
+    }
+
+    // 从解析后的MDL中的states中提取event事件中使用的data细节结构
+    private getModelItemEventData(dataArr: any[] | null | undefined): ModelItemEventDataDto | null {
+        if (!dataArr || !Array.isArray(dataArr) || dataArr.length === 0) {
+            return null;
+        }
+
+        const eventData = dataArr[0]; // 目前只处理第一个data节点
+        // 手动处理nodes列表（因为nodes字段在MDL的JSON结构中是ModelItemEventData的子字段）
+        let nodeList: ModelItemEventDataNodeDto[] = [];
+        if (eventData.nodes && Array.isArray(eventData.nodes)) {
+            // 转换每个node为ModelItemEventDataNodeDto实例，其中第一个参数为类构造函数，第二个参数为数组
+            nodeList = plainToInstance<ModelItemEventDataNodeDto, any[]>(ModelItemEventDataNodeDto, eventData.nodes);
+        }
+
+        // 组合eventData对象
+        const eventDataPlain = {
+            eventDataType: eventData.dataType,
+            eventDataText: eventData.text,
+            exentDataDesc: eventData.description,
+            nodeList: nodeList
+        };
+
+        // 转换为ModelItemEventDataDto实例并返回
+        return plainToInstance(ModelItemEventDataDto, eventDataPlain);
+    }
+
 
 }

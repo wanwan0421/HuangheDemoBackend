@@ -2,7 +2,8 @@ import { IsString, IsNotEmpty, IsOptional, IsArray, ValidateNested } from "class
 import { Type } from "class-transformer";
 import { ModelItemEventDataNodeDto } from "./modelItemEventDataNode.dto";
 
-// 描述模型Event所需的数据详情
+// 描述Event使用了什么数据
+// 例如：<ResponseParameter datasetReference="Years_zip" description="研究区域历史影像文件" />
 export class ModelItemEventDataDto {
     @IsString()
     @IsNotEmpty()

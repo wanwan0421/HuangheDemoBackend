@@ -1,23 +1,17 @@
-import { Controller, Get, Query, Param } from '@nestjs/common';
+import { Controller, Post, Get, Query, Param, HttpCode, HttpStatus } from '@nestjs/common';
 import { ResourceService } from './resource.service';
-import { ResourceDto, ResourceType } from './dto/modelResourceIO.dto';
 
 @Controller('resource')
 export class ResourceController {
     constructor(private readonly resourceService: ResourceService) {}
 
-    // get all resources or by type
-    // GET /resources
-    // GET /resources?type=MODEL
-    @Get()
-    findAll(@Query('type') type?: ResourceType): ResourceDto[] {
-        return this.resourceService.findAll(type);
-    }
-
-    // get resource by id
-    // GET /resource/:id
-    @Get(':id')
-    findOne(@Param('id') id:string): ResourceDto {
-        return this.resourceService.findOne(id);
+    @Post('synchronizePortalModels')
+    @HttpCode(HttpStatus.OK)
+    async synchronizePortalModels(): Promise<void> {
+        try {
+            await this.resourceService.synchronizePortalModels();
+        } catch (error) {
+            throw new Error(`Failed to synchronize portal resources: ${error.message}`);
+        }
     }
 }

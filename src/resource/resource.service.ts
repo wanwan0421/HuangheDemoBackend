@@ -1,11 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model } from 'mongoose';
 import { ConfigService } from '@nestjs/config';
 import { plainToInstance } from 'class-transformer';
 import { ModelResource, ResourceType } from './entities/modelResource.entity';
-import { Md5Item, OnePageMd5Result, PortalMd5Data, MdlEventParameter } from './interfaces/portalSync.interface';
+import { Md5Item, OnePageMd5Result, PortalMd5Data } from './interfaces/portalSync.interface';
 import { firstValueFrom } from 'rxjs';
 import { ModelItemDataDto } from './dto/modelItemData.dto';
 import { ModelItemStateDto } from './dto/modelItemState.dto';
@@ -20,13 +20,12 @@ export class ResourceService {
     private readonly portalLocation: string;
     private readonly portalToken: string;
     private readonly pageSize = 20;
-    private localModels: ModelResource[] = []; // 本地存储的模型资源列表
 
     constructor(private readonly httpService: HttpService,
                 private readonly configService: ConfigService,
                 private readonly modelUtilsService: ModelUtilsService,
-                @InjectRepository(ModelResource)
-                private modelResourceRepository: Repository<ModelResource>,
+                @InjectModel(ModelResource.name)
+                private modelResourceModel: Model<ModelResource>,
     ) {
         this.portalLocation = this.configService.get<string>('portalLocation')!;
         this.portalToken = this.configService.get<string>('portalToken')!;
@@ -36,7 +35,7 @@ export class ResourceService {
     // @param page 页码
     // @param pageSize 每页数量
     private async getHealthyModelMd5List(page: number, pageSize: number): Promise<OnePageMd5Result> {
-        const url = `http://${this.portalLocation}/managementSystem/deyployedModel?${this.portalToken}`;
+        const url = `http://${this.portalLocation}/managementSystem/deployedModel?${this.portalToken}`;
 
         const body = {
             asc: false,
@@ -95,9 +94,9 @@ export class ResourceService {
 
     // 主入口：获取门户模型并同步到本地
     public async synchronizePortalModels(): Promise<void> {
+        console.log("Start synchronizing portal models...");
         const modelsMd5List = await this.getPortalModelMd5();
         const baseUrl = `http://${this.portalLocation}/computableModel/ModelInfoAndClassifications_pid/`;
-
 
         // 遍历MD5列表，逐个获取模型详情并保存
         for (const md5 of modelsMd5List) {
@@ -105,6 +104,7 @@ export class ResourceService {
                 const detailResponse = await firstValueFrom(
                     this.httpService.get<any>(baseUrl + md5)
                 )
+                console.log(`Processing model with md5: ${md5}`);
 
                 if (detailResponse.status !== 200 || !detailResponse.data) {
                     throw new Error(`Failed to fetch model details for md5 ${md5}, status: ${detailResponse.status}`);
@@ -116,6 +116,7 @@ export class ResourceService {
 
                 // 获取mdl中的states
                 const statesJson = mdlJson['mdl']?.states;
+                console.log(`States JSON: ${JSON.stringify(statesJson)}`);
                 // 获取mdl中的data
                 const modelItemData = this.getModelItemData(statesJson);
 
@@ -140,6 +141,7 @@ export class ResourceService {
                 await this.saveModel(newModel);
 
             } catch (error) {
+                console.error(error);
                 this.logger.error(`Error processing model with md5 ${md5}: ${error}`);
             }
         }
@@ -256,5 +258,25 @@ export class ResourceService {
         return plainToInstance(ModelItemEventDataDto, eventDataPlain);
     }
 
+    // 将解析和转换后的ModelResource保存到数据库
+    // @param modelData 包含模型数据的Partial<ModelResource>对象
+    private async saveModel(modelData: Partial<ModelResource>): Promise<ModelResource> {
+        const updateData = {
+            // 使用$set确保只更新提供的字段
+            $set: {  ...modelData }
+        };
 
+        try {
+            // 使用fineOneAndUpdate实现upsert操作
+            const result = await this.modelResourceModel.findOneAndUpdate(
+                { id: modelData.id }, // 查找条件
+                updateData,          // 更新数据
+                { new: true, upsert: true } // 选项：返回更新后的文档，若不存在则创建新文档
+            ).exec();
+
+            return result;
+        } catch (error) {
+            throw new Error(`Error saving model ${modelData.id}: ${error}`);
+        }
+    }
 }

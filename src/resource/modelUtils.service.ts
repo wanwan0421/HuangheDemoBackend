@@ -59,13 +59,14 @@ export class ModelUtilsService {
             }
 
             // 读取相关数据
-            let RelatedDarasets = Behavior.RelatedDarasets;
-            if (!RelatedDarasets) {
-                RelatedDarasets = Behavior.DatasetDeclarations;
+            let RelatedDatasets = Behavior.RelatedDatasets;
+            if (!RelatedDatasets) {
+                RelatedDatasets = Behavior.DatasetDeclarations;
             }
 
-            const DatasetItems = RelatedDarasets.DatasetItem;
+            const DatasetItems = RelatedDatasets.DatasetItem;
             const items = Array.isArray(DatasetItems) ? DatasetItems : [DatasetItems];
+            console.log(`items: ${JSON.stringify(items)}`);
             const DatasetItemArray: any[] = [];
 
             for (const item of items) {
@@ -77,6 +78,9 @@ export class ModelUtilsService {
                     dataType: item.type,
                     description: item.description
                 };
+
+                console.log(`Processing DatasetItem: ${JSON.stringify(item)}`);
+                console.log(`root: ${JSON.stringify(root)}`);
 
                 if (item.type === "external") {
                     root.externalId = item.externalId?.toLowerCase() || item.EXTERNAL?.toLowerCase() || "";
@@ -155,12 +159,17 @@ export class ModelUtilsService {
                     }
 
                     if (Parameter?.datasetReference) {
-                        // 在 DataItems 中查找对应 datasetReference
-                        for (const ds of mdlObject.DataItems) {
-                            const rootItem = ds[0];
-                            if (rootItem.text === Parameter.datasetReference) {
-                                evObj.data = ds;
+                        // 在 DatasetItems 中查找对应 datasetReference
+                        for (const ds of mdlObject.DatasetItems) {
+                            if (!ds || ds.length === 0) {
+                                console.log('DatasetItems entry is empty or undefined');
+                                continue;
                             }
+                            // const rootItem = ds[0];
+                            if (ds.text === Parameter.datasetReference) {
+                                evObj.data = ds; // 将找到的 DatasetItem 根对象赋值给 evObj.data
+                                break; // 找到后退出循环以提高效率
+                            }
                         }
                     }
 

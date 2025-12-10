@@ -4,6 +4,7 @@ import { AppService } from './app.service';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { ResourceModule } from './resource/resource.module';
 import { MongooseModule } from '@nestjs/mongoose';
+import { ScheduleModule } from '@nestjs/schedule';
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { MongooseModule } from '@nestjs/mongoose';
         uri: configService.get<string>('mongodbUrl'),
       }),
     }),
+    ScheduleModule.forRoot(),
     ResourceModule],
   controllers: [AppController],
   providers: [AppService],

@@ -11,7 +11,7 @@ export class ModelItemEventDataDto {
 
     @IsString()
     @IsOptional()
-    eventDataText?: string;
+    eventDataName?: string;
 
     @IsString()
     @IsOptional()

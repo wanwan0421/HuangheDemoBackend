@@ -10,7 +10,7 @@ export class ModelUtilsService {
     public async convertMdlXmlToJson(mdlXml: string): Promise<Record<string, any>> {
         let xmlObject: any;
         try {
-            const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '' }); // 不忽略属性并去掉属性名前缀
+            const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '', textNodeName: 'text' }); // 不忽略属性并去掉属性名前缀, 保留文本节点名称为 'text'
             xmlObject = parser.parse(mdlXml); // 将XML字符串解析为JS对象
 
             const rootKey = Object.keys(xmlObject)[0]; // 获取根节点，对应MDL中的ModelClass
@@ -47,8 +47,8 @@ export class ModelUtilsService {
             for (const LocalAttribute of locals) {
                 const obj = {
                     localName: LocalAttribute.localName,
-                    keywords: LocalAttribute.Keywords?.text ?? "",
-                    abstract: LocalAttribute.Abstract?.text ?? ""
+                    keywords: LocalAttribute.Keywords,
+                    abstract: LocalAttribute.Abstract
                 };
 
                 if (LocalAttribute.local === 'EN_US') {
@@ -66,7 +66,6 @@ export class ModelUtilsService {
 
             const DatasetItems = RelatedDatasets.DatasetItem;
             const items = Array.isArray(DatasetItems) ? DatasetItems : [DatasetItems];
-            console.log(`items: ${JSON.stringify(items)}`);
             const DatasetItemArray: any[] = [];
 
             for (const item of items) {
@@ -74,13 +73,10 @@ export class ModelUtilsService {
 
                 // 根节点
                 const root: any = {
-                    text: item.name,
-                    dataType: item.type,
+                    name: item.name,
+                    type: item.type,
                     description: item.description
                 };
-
-                console.log(`Processing DatasetItem: ${JSON.stringify(item)}`);
-                console.log(`root: ${JSON.stringify(root)}`);
 
                 if (item.type === "external") {
                     root.externalId = item.externalId?.toLowerCase() || item.EXTERNAL?.toLowerCase() || "";
@@ -90,17 +86,21 @@ export class ModelUtilsService {
                     const Udx = item.UdxDeclaration || item.UDXDeclaration;
 
                     const rootId = Udx.id ? "root" + Udx.id : "root" + crypto.randomUUID();
-                    root.Id = rootId;
+                    root.internalId = rootId;
                     root.parentId = "null";
 
-                    const udxNode = Udx.UDXNode || Udx.UdxNode;
-                    const udxChildren = Array.isArray(udxNode?.UDXNode)
-                        ? udxNode.UDXNode
-                        : udxNode
-                            ? [udxNode]
-                            : [];
+                    let udxNode = Udx.UDXNode || Udx.UdxNode;
 
-                    root.schema = this.extractUdxSchema(mdlXml, root.text);
+                    // 先检查Udx.UDXNode是否是一个包裹对象，里面又嵌套了UDXNode属性
+                    if (udxNode && !Array.isArray(udxNode) && (udxNode.UDXNode || udxNode.UdxNode)) {
+                        udxNode = udxNode.UDXNode || udxNode.UdxNode;
+                    }
+
+                    const udxChildren = Array.isArray(udxNode)
+                        ? udxNode
+                        : udxNode ? [udxNode] : [];
+
+                    root.schema = this.extractUdxSchema(mdlXml, root.name);
                     root.nodes = [];
 
                     // 递归解析UDX树
@@ -122,10 +122,10 @@ export class ModelUtilsService {
 
             for (const state of stateList) {
                 const stateObj: any = {
-                    name: state.name,
-                    type: state.type,
-                    desc: state.description,
-                    Id: state.id,
+                    stateName: state.name,
+                    stateType: state.type,
+                    stateDesc: state.description,
+                    stateId: state.id,
                     event: []
                 };
 
@@ -166,8 +166,8 @@ export class ModelUtilsService {
                                 continue;
                             }
                             // const rootItem = ds[0];
-                            if (ds.text === Parameter.datasetReference) {
-                                evObj.data = ds; // 将找到的 DatasetItem 根对象赋值给 evObj.data
+                            if (ds.name === Parameter.datasetReference) {
+                                evObj.data = [ds]; // 将找到的 DatasetItem 根对象赋值给 evObj.data
                                 break; // 找到后退出循环以提高效率
                             }
                         }
@@ -203,17 +203,18 @@ export class ModelUtilsService {
     public parseUdxNodes(udxNodes: any[], root: any) {
         if (!udxNodes || udxNodes.length === 0) return;
 
-        for (const udxNode of udxNodes) {
+        for (const rawUdxNode of udxNodes) {
+            const udxNode = rawUdxNode?.UdxNode || rawUdxNode;
             const node: any = {};
 
             // name -> text
-            node.text = udxNode.attributes?.name || "";
+            node.name = udxNode?.name || "";
 
             // 类型解析逻辑
-            const dataType = udxNode.attributes?.type || "";
+            const type = udxNode?.type || "";
             let dataTypeResult = "";
 
-            const dataTypes = dataType.split("|");
+            const dataTypes = type.split("|");
 
             if (dataTypes.length > 1) {
                 dataTypes.forEach((dt, index) => {
@@ -228,18 +229,18 @@ export class ModelUtilsService {
                     }
                 });
             } else {
-                const parts = dataType.split("_");
+                const parts = type.split("_");
                 dataTypeResult = parts[1] || "";
             }
 
             node.dataType = dataTypeResult;
 
-            // desc
-            node.desc = udxNode.attributes?.description || "";
+            // description
+            node.description = udxNode?.description || "";
 
             // external 属性
-            if (dataType === "external") {
-                node.externalId = (udxNode.attributes?.externalId || "").toLowerCase();
+            if (type === "external") {
+                node.externalId = (udxNode?.externalId || "").toLowerCase();
             }
 
             // 子节点

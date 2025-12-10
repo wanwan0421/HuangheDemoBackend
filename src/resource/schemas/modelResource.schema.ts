@@ -12,7 +12,7 @@ export enum ResourceType {
 export type ModelResourceDocument = HydratedDocument<ModelResource>;
 
 @Schema({ 
-    timestamps: { createdAt: 'createTime', updatedAt: 'updateTime' },
+    timestamps: { createdAt: 'createTime' },
     collection: 'modelResource'
 })
 export class ModelResource {
@@ -61,14 +61,14 @@ export class ModelResource {
     @Prop()
     uuid?: string; // 数据方法的uuid
 
-    @Prop({ type: [Object] })
-    params?: ModelItemParamDto[];
+    // @Prop({ type: [Object] })
+    // params?: ModelItemParamDto[];
 
-    @Prop({ type: [Object] })
-    inputParams?: ModelItemParamDto[];
+    // @Prop({ type: [Object] })
+    // inputParams?: ModelItemParamDto[];
 
-    @Prop({ type: [Object] })
-    outputParams?: ModelItemParamDto[];
+    // @Prop({ type: [Object] })
+    // outputParams?: ModelItemParamDto[];
 
     // 模型绑定的测试数据
     @Prop({ type: [Object], default: [] })
@@ -81,6 +81,9 @@ export class ModelResource {
     imgWebAddress?: string;
     @Prop()
     imgRelativePath?: string;
+
+    @Prop({ type: Date })
+    modelModifyTime?: Date;
 }
 
 export const ModelResourceSchema = SchemaFactory.createForClass(ModelResource);

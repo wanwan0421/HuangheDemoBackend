@@ -6,7 +6,7 @@ import { IsString, IsNotEmpty, IsOptional } from "class-validator";
 export class ModelItemEventDataNodeDto {
     @IsString()
     @IsNotEmpty()
-    text: string;
+    name: string;
 
     @IsString()
     @IsOptional()

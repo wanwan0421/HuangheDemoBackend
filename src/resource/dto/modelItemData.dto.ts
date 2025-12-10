@@ -8,10 +8,10 @@ export class ModelItemDataDto {
     @IsArray()
     @ValidateNested({ each: true }) // 确保数组中的每个元素都被验证
     @Type(() => ModelItemStateDto) // 指定数组元素的类型转换
-    inputs: ModelItemStateDto[] = []; // 输入数据状态列表
+    input: ModelItemStateDto[] = []; // 输入数据状态列表
 
     @IsArray()
     @ValidateNested({ each: true })
     @Type(() => ModelItemStateDto)
-    outputs: ModelItemStateDto[] = []; // 输出数据状态列表
+    output: ModelItemStateDto[] = []; // 输出数据状态列表
 }

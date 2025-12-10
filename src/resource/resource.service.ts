@@ -4,6 +4,7 @@ import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { ConfigService } from '@nestjs/config';
 import { plainToInstance } from 'class-transformer';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { ModelResource, ResourceType } from './entities/modelResource.entity';
 import { Md5Item, OnePageMd5Result, PortalMd5Data } from './interfaces/portalSync.interface';
 import { firstValueFrom } from 'rxjs';
@@ -93,6 +94,8 @@ export class ResourceService {
     }
 
     // 主入口：获取门户模型并同步到本地
+    // 每小时更新一次
+    // @Cron(CronExpression.EVERY_HOUR)
     public async synchronizePortalModels(): Promise<void> {
         console.log("Start synchronizing portal models...");
         const modelsMd5List = await this.getPortalModelMd5();
@@ -104,7 +107,6 @@ export class ResourceService {
                 const detailResponse = await firstValueFrom(
                     this.httpService.get<any>(baseUrl + md5)
                 )
-                console.log(`Processing model with md5: ${md5}`);
 
                 if (detailResponse.status !== 200 || !detailResponse.data) {
                     throw new Error(`Failed to fetch model details for md5 ${md5}, status: ${detailResponse.status}`);
@@ -116,12 +118,11 @@ export class ResourceService {
 
                 // 获取mdl中的states
                 const statesJson = mdlJson['mdl']?.states;
-                console.log(`States JSON: ${JSON.stringify(statesJson)}`);
                 // 获取mdl中的data
                 const modelItemData = this.getModelItemData(statesJson);
 
                 // 解析最后修改时间
-                const updateTime = new Date(modelData.lastModifyTime);
+                const updateTime = modelData.lastModifyTime;
 
                 const newModel: Partial<ModelResource> = {
                     name: modelData.name,
@@ -141,7 +142,6 @@ export class ResourceService {
                 await this.saveModel(newModel);
 
             } catch (error) {
-                console.error(error);
                 this.logger.error(`Error processing model with md5 ${md5}: ${error}`);
             }
         }
@@ -248,8 +248,8 @@ export class ResourceService {
 
         // 组合eventData对象
         const eventDataPlain = {
-            eventDataType: eventData.dataType,
-            eventDataText: eventData.text,
+            eventDataType: eventData.type,
+            eventDataName: eventData.name,
             exentDataDesc: eventData.description,
             nodeList: nodeList
         };

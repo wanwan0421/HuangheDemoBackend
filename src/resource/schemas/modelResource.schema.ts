@@ -12,7 +12,7 @@ export enum ResourceType {
 export type ModelResourceDocument = HydratedDocument<ModelResource>;
 
 @Schema({ 
-    timestamps: { createdAt: 'createTime' },
+    timestamps: { createdAt: 'createTime', updatedAt: false},
     collection: 'modelResource'
 })
 export class ModelResource {
@@ -83,7 +83,7 @@ export class ModelResource {
     imgRelativePath?: string;
 
     @Prop({ type: Date })
-    modelModifyTime?: Date;
+    updateTime?: Date;
 }
 
 export const ModelResourceSchema = SchemaFactory.createForClass(ModelResource);

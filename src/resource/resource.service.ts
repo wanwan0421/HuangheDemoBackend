@@ -113,6 +113,7 @@ export class ResourceService {
                 }
 
                 const modelData = detailResponse.data.data;
+                console.log(`modelData: ${JSON.stringify(modelData)}`);
                 // 将mdl的XML转换为JSON对象
                 const mdlJson = await this.modelUtilsService.convertMdlXmlToJson(modelData.mdl);
 
@@ -277,6 +278,41 @@ export class ResourceService {
             return result;
         } catch (error) {
             throw new Error(`Error saving model ${modelData.id}: ${error}`);
+        }
+    }
+
+    // 前端查询模型资源列表
+    public async findModels(filter: { categoryId?: string[]; keyword?: string}): Promise<ModelResource[]> {
+        const { categoryId, keyword } = filter;
+        const query: any = {type: ResourceType.MODEL};
+
+        // 根据分类过滤
+        if (categoryId?.length !== 0) {
+            query.normalTags = { $in: categoryId } // 使用 $in 操作符查找normalTags数组中包含任一指定ID(类别)的资源
+
+        }
+
+        // 根据关键字查找
+        if (keyword) {
+            const regex = new RegExp(keyword, 'i') //'i'表示不区分大小写
+
+            // 使用 $or 组合名称和描述的模糊匹配条件
+            const keywordQuery = {
+                $or: [
+                    { name: { $regex: regex }},
+                    { description: { $regex: regex }},
+                ]
+            }
+
+            Object.assign(query, keywordQuery);
+        }
+
+        try {
+            const results = await this.modelResourceModel.find(query).exec();
+
+            return results;
+        } catch(error) {
+            throw new Error("Faild to fetch model resources.");
         }
     }
 }

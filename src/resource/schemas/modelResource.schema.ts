@@ -83,6 +83,9 @@ export class ModelResource {
     imgRelativePath?: string;
 
     @Prop({ type: Date })
+    createTime?: Date;
+
+    @Prop({ type: Date })
     updateTime?: Date;
 }
 

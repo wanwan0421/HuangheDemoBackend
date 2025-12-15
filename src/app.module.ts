@@ -5,6 +5,8 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { ResourceModule } from './resource/resource.module';
 import { MongooseModule } from '@nestjs/mongoose';
 import { ScheduleModule } from '@nestjs/schedule';
+import { LlmAgentModule } from './llm-agent/llm-agent.module';
+import { IndexModule } from './index/index.module';
 
 @Module({
   imports: [
@@ -20,7 +22,9 @@ import { ScheduleModule } from '@nestjs/schedule';
       }),
     }),
     ScheduleModule.forRoot(),
-    ResourceModule],
+    ResourceModule,
+    LlmAgentModule,
+    IndexModule],
   controllers: [AppController],
   providers: [AppService],
 })

@@ -5,7 +5,7 @@ import { Model } from 'mongoose';
 import { ConfigService } from '@nestjs/config';
 import { plainToInstance } from 'class-transformer';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import { ModelResource, ResourceType } from './entities/modelResource.entity';
+import { ModelResource, ResourceType } from './schemas/modelResource.schema';
 import { Md5Item, OnePageMd5Result, PortalMd5Data } from './interfaces/portalSync.interface';
 import { firstValueFrom } from 'rxjs';
 import { ModelItemDataDto } from './dto/modelItemData.dto';

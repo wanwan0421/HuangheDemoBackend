@@ -1,7 +1,7 @@
-import { secondIndexModel } from "./secondIndexModel.interface"
+import { thirdIndex } from "./thirdIndex.interface";
 
-export interface secondIndex{
-    secondIndex_En: string,
-    secondIndex_Cn: string,
-    models: secondIndexModel,
+export interface secondIndex {
+    categoty_id: string,
+    category_name: string,
+    indicators: thirdIndex[]
 }

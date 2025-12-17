@@ -2,9 +2,11 @@ import { Injectable } from '@nestjs/common';
 import { GoogleGenAI, Type } from '@google/genai';
 import { LlmRecommendationModelName } from './interfaces/llmRecommendationModelName.interface';
 import { modelRecommendationTool } from './schemas/llmTools.schema';
+import { IndexService } from 'src/index/index.service';
 
 @Injectable()
 export class LlmAgentService {
+    constructor(private readonly indexService: IndexService) {}
 
     /**
      * 调用LLM API，使用结构化输出获取模型推荐
@@ -12,6 +14,9 @@ export class LlmAgentService {
      * @returens 推荐的模型信息
      */
     private async callLLMForRecommendation(promt: string): Promise<LlmRecommendationModelName | null> {
+        // 从指标库获取指标库数据
+        const indexLibrary = await this.indexService.getIndexSystem();
+        
         const ai = new GoogleGenAI({});
 
         const contents = [

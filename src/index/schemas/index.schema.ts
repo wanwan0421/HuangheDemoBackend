@@ -1,5 +1,5 @@
 import { Prop, SchemaFactory } from "@nestjs/mongoose";
-import { firstIndex } from "../dto/firstIndex.dto";
+import { secondIndex } from "../dto/secondIndex.dto";
 
 
 export class IndexSystem{
@@ -13,7 +13,7 @@ export class IndexSystem{
     sphere_order: number; // 排序
 
     @Prop({ type: Array })
-    categories: firstIndex[] = [];
+    categories: secondIndex[] = [];
 }
 
 export const IndexSystemSchema = SchemaFactory.createForClass(IndexSystem);

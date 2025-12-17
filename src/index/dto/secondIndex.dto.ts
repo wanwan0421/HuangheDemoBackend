@@ -1,26 +1,18 @@
 import { Type } from "class-transformer";
-import { secondIndexModel } from "./secondIndexModel.dto"
+import { thirdIndex } from "./thirdIndex.dto"
 import { IsString, IsNotEmpty, IsArray, ValidateNested } from "class-validator";
 
 export class secondIndex{
     @IsString()
     @IsNotEmpty()
-    code: string;
+    category_id: string;
 
     @IsString()
     @IsNotEmpty()
-    name_en: string;
-
-    @IsString()
-    @IsNotEmpty()
-    name_cn: string;
-
-    @IsString()
-    @IsNotEmpty()
-    field_name: string;
+    category_name: string;
 
     @IsArray()
     @ValidateNested({ each: true })
-    @Type(() => secondIndexModel)
-    models: secondIndexModel[] = []; 
+    @Type(() => thirdIndex)
+    indicators: thirdIndex[] = []; 
 }

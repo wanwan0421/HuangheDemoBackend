@@ -1,6 +1,6 @@
 import { Get, Controller, HttpCode, HttpStatus, Query } from '@nestjs/common';
 import { IndexService } from './index.service';
-import { secondIndex } from './interfaces/secondIndex.interface'
+import { secondIndex } from './interfaces/thirdIndex.interface'
 
 @Controller('api/index')
 export class IndexController {

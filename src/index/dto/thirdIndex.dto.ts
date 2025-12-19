@@ -20,6 +20,9 @@ export class thirdIndex{
     @IsNotEmpty()
     field_name: string;
 
+    @Prop({ type: [Number], index: false })
+    embedding: number[];
+
     @Prop({ type: [thirdIndexModel] })
     @IsArray()
     @ValidateNested({ each: true })

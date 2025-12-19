@@ -6,15 +6,25 @@ export const modelRecommendationTool = {
     parameters: {
         type: Type.OBJECT,
         properties: {
-            name: {
-                type: Type.STRING,
-                description: 'The name of the most matching geographical model recommended by the system (e.g., "UrbanM2M", "SWAT_Model")'
-            },
-            reason: {
-                type: Type.STRING,
-                description: 'Explain why the system recommends the best matching geographic model.'
+            recommendations: {
+                type: Type.ARRAY,
+                items: {
+                    type: Type.OBJECT,
+                    properties: {
+                        name: {
+                            type: Type.STRING,
+                            description: 'The name of the most matching geographical model recommended by the system (e.g., "UrbanM2M", "SWAT_Model")'
+                        },
+                        reason: {
+                            type: Type.STRING,
+                            description: 'Explain why the system recommends the best matching geographic model.'
+                        }
+                    },
+                    required: ['name', 'reason'],
+                },
+                description: 'A list of 5 recommended models',
             }
         },
-        required: ['name', 'reason'],
+        required: ['recommendations'],
     },
 };

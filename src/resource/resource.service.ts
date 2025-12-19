@@ -281,7 +281,7 @@ export class ResourceService {
         }
     }
 
-    // 前端查询模型资源列表
+    // 前端根据关键词或者分类查询模型资源列表
     public async findModels(filter: { categoryId?: string[]; keyword?: string}): Promise<ModelResource[]> {
         const { categoryId, keyword } = filter;
         const query: any = {type: ResourceType.MODEL};
@@ -313,6 +313,13 @@ export class ResourceService {
             return results;
         } catch(error) {
             throw new Error("Faild to fetch model resources.");
+        }
+    }
+
+    // 用于返回5个指标对应的模型名称的详细信息
+    public async getModelDetails(name: string) {
+        if (name) {
+            return await this.modelResourceModel.find({ name: {$in: name}}).lean();
         }
     }
 }

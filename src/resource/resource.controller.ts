@@ -70,5 +70,5 @@ export class ResourceController {
         })
 
         return resourceModelList;
-    } 
+    }
 }

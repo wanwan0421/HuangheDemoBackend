@@ -316,10 +316,8 @@ export class ResourceService {
         }
     }
 
-    // 用于返回5个指标对应的模型名称的详细信息
-    public async getModelDetails(name: string) {
-        if (name) {
-            return await this.modelResourceModel.find({ name: {$in: name}}).lean();
-        }
+    // 用于返回指标对应的单个模型的详细信息
+    public async getModelDetails(name: string): Promise<ModelResource | null> {
+        return this.modelResourceModel.findOne({ name: name }).lean().exec();
     }
 }

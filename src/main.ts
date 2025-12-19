@@ -1,3 +1,4 @@
+import 'global-agent/bootstrap';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 

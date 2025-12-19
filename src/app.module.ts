@@ -7,6 +7,7 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { ScheduleModule } from '@nestjs/schedule';
 import { LlmAgentModule } from './llm-agent/llm-agent.module';
 import { IndexModule } from './index/index.module';
+import { GenAIModule } from './genai/genai.module';
 
 @Module({
   imports: [
@@ -24,7 +25,8 @@ import { IndexModule } from './index/index.module';
     ScheduleModule.forRoot(),
     ResourceModule,
     LlmAgentModule,
-    IndexModule],
+    IndexModule,
+    GenAIModule],
   controllers: [AppController],
   providers: [AppService],
 })

@@ -3,14 +3,17 @@ import { IndexService } from './index.service';
 import { IndexController } from './index.controller';
 import { HttpModule } from '@nestjs/axios';
 import { MongooseModule } from '@nestjs/mongoose';
-import { IndexSystem, IndexSystemSchema } from './schemas/index.schema';
+import { index, IndexSystemSchema } from './schemas/index.schema';
+import { GenAIModule } from 'src/genai/genai.module';
 
 @Module({
   imports: [
     HttpModule,
-    MongooseModule.forFeature([{ name: IndexSystem.name, schema: IndexSystemSchema }])
+    MongooseModule.forFeature([{ name: index.name, schema: IndexSystemSchema }]),
+    GenAIModule
   ],
   providers: [IndexService],
-  controllers: [IndexController]
+  controllers: [IndexController],
+  exports: [IndexService]
 })
 export class IndexModule {}

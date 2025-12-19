@@ -1,17 +1,27 @@
 import { Injectable } from '@nestjs/common';
-import { IndexSystem } from './schemas/index.schema';
+import { index } from './schemas/index.schema';
 import { thirdIndex } from './interfaces/thirdIndex.interface';
 import { indicators } from './interfaces/returnIndex.interface';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
-import { GenAIService } from 'src/llm-agent/genai.service';
+import { GenAIService } from 'src/genai/genai.service';
 
 @Injectable()
 export class IndexService {
     constructor(
-        @InjectModel(IndexSystem.name) private indexModel: Model<IndexSystem & Document>,
+        @InjectModel(index.name) private indexModel: Model<index & Document>,
         private genAIService: GenAIService,
     ){}
+
+    async onModuleInit() {
+        console.log('🚀 正在初始化指标向量数据...');
+        try {
+            await this.initVectorData();
+            console.log('✅ 指标向量初始化完成');
+        } catch (error) {
+            console.error('❌ 指标向量初始化失败:', error);
+        }
+    }
 
     // 获取数据库中的指标体系，即二级指标
     // 获取二级指标中英文名+连接的模型
@@ -37,10 +47,12 @@ export class IndexService {
      */
     public async initVectorData() {
         const data = await this.indexModel.find();
+        console.log(`🔍 查找到 ${data.length} 条领域数据`);
         for (const sphere of data) {
             let isModified = false;
             for (const category of sphere.categories) {
                 for (const indicator of category.indicators) {
+                    console.log("111111");
                     // 只有当向量为空时才生成，避免重复消耗 Token
                     if (!indicator.embedding || indicator.embedding.length === 0) {
                         const textToEmbed = `index_en: ${indicator.name_en}. index_cn: ${indicator.name_cn}. model: ${indicator.models.map(m => m.model_name).join(', ')}`;
@@ -51,6 +63,7 @@ export class IndexService {
             }
             if (isModified) {
                 await sphere.save();
+                console.log("222222");
             }
         }
     }

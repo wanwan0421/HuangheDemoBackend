@@ -32,10 +32,12 @@
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.3",
     "fast-xml-parser": "^5.3.2",
+    "global-agent": "^3.0.0",
     "mongoose": "^8.20.2",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
     "typeorm": "^0.3.28",
+    "undici": "^7.16.0",
     "xml2js": "^0.6.2"
   },
   "devDependencies": {

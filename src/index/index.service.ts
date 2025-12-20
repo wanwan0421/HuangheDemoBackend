@@ -5,6 +5,7 @@ import { indicators } from './interfaces/returnIndex.interface';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { GenAIService } from 'src/genai/genai.service';
+import { delay } from 'rxjs';
 
 @Injectable()
 export class IndexService {
@@ -49,22 +50,53 @@ export class IndexService {
         const data = await this.indexModel.find();
         console.log(`🔍 查找到 ${data.length} 条领域数据`);
         for (const sphere of data) {
-            let isModified = false;
+            // 收集待处理的指标
+            const tasks: { indicator: any, textToEmbed: string }[] = [];
+
             for (const category of sphere.categories) {
                 for (const indicator of category.indicators) {
-                    console.log("111111");
                     // 只有当向量为空时才生成，避免重复消耗 Token
                     if (!indicator.embedding || indicator.embedding.length === 0) {
                         const textToEmbed = `index_en: ${indicator.name_en}. index_cn: ${indicator.name_cn}. model: ${indicator.models.map(m => m.model_name).join(', ')}`;
-                        indicator.embedding = await this.genAIService.generateEmbedding(textToEmbed);
-                        isModified = true;
+                        tasks.push({ indicator, textToEmbed })
                     }
                 }
             }
-            if (isModified) {
-                await sphere.save();
-                console.log("222222");
+
+            if (tasks.length === 0) continue;
+
+            // 每50个指标分一组发送
+            const CHUNK_SIZE = 10;
+            for (let i = 0; i < tasks.length; i += CHUNK_SIZE) {
+                const chunk = tasks.slice(i, i + CHUNK_SIZE);
+                const texts = chunk.map(t => t.textToEmbed)
+                console.log(`正在批量同步处理${chunk.length}条数据...`);
+
+                let success = false;
+                let retryCount = 0;
+
+                while(!success && retryCount < 3) {
+                    console.log(`🚀 [${sphere.sphere_name}] 正在处理批次 ${i/CHUNK_SIZE + 1}...`);
+                    const vectors = await this.genAIService.generateEmbeddings(texts);
+
+                    if (vectors.length > 0) {
+                        vectors.forEach((vec, idx) => {
+                            chunk[idx].indicator.embedding = vec;
+                        });
+                        console.log(`成功获取${vectors.length}条向量`);
+                        success = true;
+                        await new Promise(r => setTimeout(r, 30000));
+                    } else {
+                        retryCount++;
+                        console.warn(`  ⚠️ 触发频率限制，进入 65 秒深度冷却 (重试第 ${retryCount} 次)...`);
+                        // 🚩 遇到 429 后，必须休息超过 60 秒
+                        await new Promise(r => setTimeout(r, 65000));
+                    }
+                }
             }
+
+            sphere.markModified('categories');
+            await sphere.save();
         }
     }
 
@@ -92,11 +124,11 @@ export class IndexService {
             return {
                 name_en: indicator.name_en,
                 name_cn: indicator.name_cn,
-                models: indicator.models.map(model =>  model.model_name),
+                models: indicator.models.map(model =>  model.model_name).slice(0, 10),
                 score:score
             }
         })
 
-        return results.sort((a, b) => b.score - a.score).slice(0, 20);
+        return results.sort((a, b) => b.score - a.score).slice(0, 5);
     }
 }

@@ -17,8 +17,6 @@ export class GenAIService {
         try {
             const dispatcher = new ProxyAgent({ 
                 uri: proxyUrl,
-                // 如果代理证书有问题，可以取消下面行的注释（生产环境慎用）
-                // requestOptions: { rejectUnauthorized: false }
             });
             setGlobalDispatcher(dispatcher);
             console.log("🚀 [GenAI] Global Proxy Dispatcher set to:", proxyUrl);
@@ -27,23 +25,30 @@ export class GenAIService {
         }
     }
 
-    // 实现 OnModuleInit 钩子，在模块初始化时测试连接
-    async onModuleInit() {
-        console.log('🧪 [GenAI] Testing network connectivity...');
+    /**
+     * 将文字转换为数字向量
+     * @param texts 文本内容
+     * @returens 返回的文本向量数值
+     */
+    async generateEmbeddings(texts: string[]): Promise<number[][]> {
         try {
-            // 测试是否能触达 Google
-            await fetch('https://www.google.com', { method: 'HEAD' });
-            console.log('✅ [GenAI] Network check passed (Google is reachable)');
+            const response = await this.client.models.embedContent({
+                model: 'gemini-embedding-001',
+                contents: texts.map(text => ({ parts: [{ text }] })),
+                config: { taskType: 'RETRIEVAL_QUERY' }
+            });
+
+            const embeddings = response.embeddings
+                ? response.embeddings.map(e => e.values).filter((v): v is number[] => !!v)
+                : [];
+
+            return embeddings;
         } catch (e) {
-            console.error('❌ [GenAI] Network check failed. Your proxy might not be working.');
+            console.error('Embedding error', e);
+            return [];
         }
     }
 
-    /**
-     * 将文字转换为数字向量
-     * @param text 文本内容
-     * @returens 返回的文本向量数值
-     */
     async generateEmbedding(text: string): Promise<number[]> {
         try {
             const response = await this.client.models.embedContent({
@@ -58,7 +63,16 @@ export class GenAIService {
         }
     }
 
-    async generateContent(params: any) {
-        return this.client.models.generateContent(params);
+    async generateContent(contents: any, tool: any) {
+        return this.client.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents,
+            config: {
+                tools: [{
+                    functionDeclarations: [tool],
+                }],
+            },
+        });
     }
+
 }

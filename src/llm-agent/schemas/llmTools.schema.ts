@@ -22,7 +22,7 @@ export const indexRecommendationTool = {
                     },
                     required: ['name', 'reason'],
                 },
-                description: 'A list of 5 recommended models',
+                description: 'A list of 3 recommended models',
             }
         },
         required: ['recommendations'],
@@ -43,7 +43,7 @@ export const modelRecommendationTool = {
                 type: Type.STRING,
                 description: 'Explain why the system recommends the best matching geographic model.'
             }
-        }
+        },
+        required: ['name', 'reason'],
     },
-    required: ['name', 'reason'],
 };

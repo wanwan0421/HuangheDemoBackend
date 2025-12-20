@@ -26,37 +26,36 @@ export class LlmAgentService {
 
         // 进行向量搜索，获取相近的20个指标信息
         const relevantIndex = await this.indexService.findRelevantIndex(userQueryVector);
+        console.log("获取相近的5个指标信息:", relevantIndex);
 
         const contents = [
             {
-                role: 'system',
-                content: `You are a professional geographic computing model agent.
-                            Your task is:
-                            1. Analyze the user's needs.
-                            2. From the 20 candidate models provided below, select the 5 appropriate ones.
-                            3. Use the 'recommend_index' tool to return these 5 recommendations.
-                            
-                            Candidate Models Library:
-                            ${JSON.stringify(relevantIndex)}
-                            
-                            If the request is unrelated to geographic models, do not use the tool.`
+                role: 'user',
+                parts: [{
+                    text: `
+                        You are a professional geographic computing model agent.
+
+                        Your task is:
+                        1. Analyze the user's needs.
+                        2. From the 5 candidate models provided below, select the 5 appropriate ones.
+                        3. Use the 'recommend_index' tool to return these 3 recommendations.
+
+                        Candidate Models Library:
+                        ${JSON.stringify(relevantIndex)}
+
+                        If the request is unrelated to geographic models, do not use the tool.
+                            `
+                }]
             },
             {
                 role: 'user',
-                content: prompt,
+                parts: [{ text: prompt }]
             }
         ];
 
         try {
-            const response = await this.genAIService.generateContent({
-                model: 'gemini-2.5-flash',
-                contents: contents,
-                config: {
-                    tools: [{
-                        functionDeclarations: [indexRecommendationTool]
-                    }],
-                },
-            });
+            const response = await this.genAIService.generateContent(contents, indexRecommendationTool);
+            console.log("推荐指标返回结果：", response.functionCalls?.[0]);
 
             // 检查LLM是否决定使用工具，即推荐了模型
             if (response.functionCalls && response.functionCalls.length > 0) {
@@ -96,6 +95,8 @@ export class LlmAgentService {
             return null;
         }
 
+        console.log("指标信息:", JSON.stringify(indexRecommendation.recommendations));
+
         const fetchModelDetails = indexRecommendation.recommendations.map(index => this.resourceService.getModelDetails(index.name))
         // 等待所有查询完成
         const modelDetailsResults = await Promise.all(fetchModelDetails);
@@ -111,33 +112,35 @@ export class LlmAgentService {
                 }
             });
 
+        console.log("精简模型信息:", JSON.stringify(simpleModelList));
+
+
         const contents = [
             {
-                role: 'system',
-                content: `You are a senior geographic information scientist. 
-                          Below are the 5 candidate models with their full technical details:
+                role: 'user',
+                parts: [{
+                    text:
+                    `You are a senior geographic information scientist. 
+                          Below are the 3 candidate models with their full technical details:
                           ${JSON.stringify(simpleModelList)}
                           
-                          Compare their descriptions and MDL (Model Description Language) logic carefully.
-                          Select the ONE best model that perfectly fits the user's request.
-                          Provide a technical reason for your choice.`
+                          Your task:
+                            - Carefully compare their descriptions and MDL logic
+                            - Select exactly ONE best model that fits the user's request
+                            - You MUST call the function "recommend_model"
+                            - Do NOT output natural language
+                            - Return ONLY the function call`
+                }]
             },
             {
                 role: 'user',
-                content: prompt
+                parts: [{ text: prompt }]
             }
         ];
 
         try {
-            const response = await this.genAIService.generateContent({
-                model: 'gemini-2.5-flash',
-                contents: contents,
-                config: {
-                    tools: [{
-                        functionDeclarations: [modelRecommendationTool]
-                    }],
-                },
-            });
+            const response = await this.genAIService.generateContent(contents, modelRecommendationTool);
+            console.log("推荐模型返回结果：", response.functionCalls?.[0]);
 
             // 检查LLM是否决定使用工具，即推荐了模型
             if (response.functionCalls && response.functionCalls.length > 0) {

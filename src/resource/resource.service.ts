@@ -317,7 +317,7 @@ export class ResourceService {
     }
 
     // 用于返回指标对应的单个模型的详细信息
-    public async getModelDetails(name: string): Promise<ModelResource | null> {
-        return this.modelResourceModel.findOne({ name: name }).lean().exec();
+    public async getModelDetails(md5: string): Promise<ModelResource | null> {
+        return this.modelResourceModel.findOne({ md5: md5 }).lean().exec();
     }
 }

@@ -1,3 +1,4 @@
+import { Prop } from "@nestjs/mongoose";
 import { IsArray, IsNotEmpty, IsString } from "class-validator"
 
 export class thirdIndexModel {
@@ -24,4 +25,7 @@ export class thirdIndexModel {
     @IsString()
     @IsNotEmpty()
     primary_indicator: string;
+
+    @IsString()
+    description: string;
 }

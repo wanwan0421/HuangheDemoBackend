@@ -16,7 +16,7 @@ export class LlmAgentService {
     ) {}
 
     /**
-     * 调用LLM API，使用结构化输出获取五个指标推荐
+     * 调用LLM API，使用结构化输出获取5个指标推荐
      * @param prompt 用户输入
      * @param userQueryVector 用户输入转换为的向量
      * @returns 推荐的5个指标信息
@@ -42,13 +42,10 @@ export class LlmAgentService {
                             2. The "name" field in your response must be name_en from the candidates.
                             3. Don't translate, summarize, rename, or invent new index names.
                             4. If no suitable index exists, do not use the tool.
-                            5. You need to use the "recommend_index" tool to select the 5 most relevant index.
+                            5. If and only if you can confidently select 5 different index names, use the "recommend_index" tool. Otherwise, do not use any tool.
 
                         Candidate Index Library:
-                        ${JSON.stringify(relevantIndex)}
-
-                        If the request is unrelated to geographic indexs, do not use the tool.
-                            `
+                        ${JSON.stringify(relevantIndex)}`
                 }]
             },
             {
@@ -61,6 +58,7 @@ export class LlmAgentService {
 
         try {
             const response = await this.genAIService.generateContent(contents, indexRecommendationTool);
+            console.log(response);
 
             // 检查LLM是否决定使用工具，即推荐了模型
             if (response.functionCalls && response.functionCalls.length > 0) {
@@ -83,6 +81,7 @@ export class LlmAgentService {
             }
             return null;
         } catch (error) {
+            console.log("推荐指标信息错误：", error);
             return null;
         }
     }
@@ -101,6 +100,7 @@ export class LlmAgentService {
 
         // 如果没有推荐结果，直接返回
         if (!indexRecommendation || !indexRecommendation.recommendations) {
+            console.log("未获取到推荐指标信息！");
             return null;
         }
         console.log("指标信息:", JSON.stringify(indexRecommendation.recommendations));
@@ -226,6 +226,7 @@ export class LlmAgentService {
 
                         return {
                             name: finalModel.name,
+                            description: finalModel.description,
                             reason: recommendModelReason,
                             workflow: workflowSteps
                         }
@@ -234,6 +235,7 @@ export class LlmAgentService {
             }
             return null;
         } catch (error) {
+            console.log("推荐模型信息错误：", error);
             return null;
         }
     }

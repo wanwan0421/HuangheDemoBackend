@@ -1,0 +1,8 @@
+# 可选依赖：langgraph 及任意 LLM 客户端
+# 安装示例（仅在你想用 langgraph 可视化/调度时）：
+langgraph>=0.1.0
+# 你的 LLM 客户端，例如 openai / google genai / 或自定义 SDK
+# openai>=0.27.0
+# google-genai==你所需版本
+# 如使用 asyncio-friendly HTTP 客户端：httpx
+httpx>=0.24.0

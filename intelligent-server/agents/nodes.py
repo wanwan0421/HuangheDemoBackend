@@ -1,67 +1,90 @@
-from state import AgentState
 from . import tools
-from pymongo import MongoClient
-from typing_extensions import List
+from typing import TypedDict, List, Dict, Any, Literal, Annotated
+from langchain.messages import ToolMessage, HumanMessage, SystemMessage, AnyMessage
+from langgraph.graph import StateGraph, START, END
+import operator
 
-# 连接配置
-MONGO_URI = "mongodb://localhost:27017/"
-DB_NAME = "huanghe-demo"
+class AgentState(TypedDict):
+    messages: Annotated[list[AnyMessage], operator.add]
+    llm_calls: int
 
-# 初始化模型
-# embedding_model = OpenAIEmbeddings(model="text-embedding-ada-002")
-
-# 连接到 MongoDB 数据库
-def get_db():
-    client = MongoClient(MONGO_URI)
-    db = client[DB_NAME]
-    return db
-
-def find_relevantIndices(user_query_vector: List[float]):
+def llm_node(state: AgentState) -> Dict[str, Any]:
     """
-    findRelevantIndices：根据用户需求，从向量数据库中检索相关指标
-
-    :param user_query_vector: 用户查询向量
-    :type user_query_vector: List[float]
-    """
-    db = get_db()
-    indexCollection = db["indexSystem"]
-
-    all_indicators = list(indexCollection.find({}, {"categories": 1, "_id": 0}))
-    flattened_indicators = []
-
-    # 展平嵌套的 categories 列表
-    for sphere in all_indicators:
-        for category in sphere.get("categories", []):
-            for indicator in category.get("indicators", []):
-                if (indicator.get("embedding") and len(indicator["embedding"]) > 0):
-                    score = tools.cosine_similarity(user_query_vector, indicator["embedding"])
-                    flattened_indicators.append({
-                        "name_en": indicator.get("name_en", ""),
-                        "name_cn": indicator.get("name_cn", ""),
-                        "score": score
-                    })
-
-    flattened_indicators.sort(key=lambda x: x["score"], reverse=True)
-    return flattened_indicators[:10]
-
-def recommendIndex(state: AgentState):
-    """
-    recommendIndex：分析用户需求，从指标库中查找数据
+    负责根据当前消息历史决定下一步
+    调用已绑定工具的模型，返回模型产生的新消息
+    如果需要调用工具，则返回工具调用指令
     
-    :param state: 说明
-    :type state: AgentState
+    Args:
+        state (AgentState): 当前代理状态，包含消息历史等信息
+    Returns:
+        Dict[str, Any]: 更新后的状态，包含新消息
     """
-    query = state["prompt"]
+    # 可在此加入 SystemMessage 以约束模型行为（可选）
+    system = SystemMessage(content=(
+        "你是一个专业的地理模型推荐专家。请按以下逻辑操作：\n"
+        "1. 使用 `search_relevant_indices` 寻找与用户需求（如：降水预测）相关的指标。\n"
+        "2. 从指标结果中提取指标关联的模型 `models_Id` (MD5列表)，并使用 `search_relevant_models` 进行模型精选。\n"
+        "3. 调用 `get_model_details` 确定最适合的模型并获取最终模型的详细工作流。\n"
+        "不要凭空想象模型，必须基于工具返回的数据。"
+    ))
+    messages = [system] + state["messages"]
+
+    response = tools.model_with_tools.invoke(messages)
+
+    return {
+        "messages": [response],
+        "llm_calls": state.get("llm_calls", 0) + 1
+    }
+
+def tool_node(state: AgentState) -> Dict[str, Any]:
+    """
+    读取最后一条消息的 tool_calls，按顺序执行对应工具并返回 ToolMessage 列表
     
-    # 将用户需求转化为向量
-    queryEmbedding = tools.embedding_model.embed_query(query)
-    print(f"\n[1. 向量检索] 正在根据用户需求检索相关指标：{query}")
+    Agrs:
+        state (AgentState): 当前代理状态，包含消息历史等信息
+    Returns:
+        Dict[str, Any]: 更新后的状态，包含工具调用结果消息列表
+    """
 
-    # 使用向量检索从指标库中查找相关指标
-    relevantIndices = find_relevantIndices(queryEmbedding)
+    last_message = state["messages"][-1]
+    tool_results = []
 
-    # AI从相关指标中再进行筛选
+    # 防御性判断：如果没有 tool_calls，直接返回空消息
+    tool_calls = getattr(last_message, "tool_calls", []) or []
 
+    for tool_call in tool_calls:
+        tool = tools.TOOLS_BY_NAME[tool_call["name"]]
+        observation = tool.invoke(tool_call["args"])
+        tool_results.append(ToolMessage(
+            content=observation,
+            tool_call_id=tool_call["id"]
+        ))
 
+    return {"messages": tool_results}
 
-# 如果LLM决定调用工具，响应会包含tool_calls属性
+def should_continue(state: AgentState) -> Any:
+    """
+    判断是否需要继续迭代（即 LLM 是否还需要调用工具）
+    
+    Args:
+        state (AgentState): 当前代理状态，包含消息历史等信息
+    Returns:
+        Literal["tool_node", END]: 如果需要调用工具则返回 "tool_node"，否则返回 END
+    """
+    last_message = state["messages"][-1]
+    if last_message.tool_calls:
+        return "tool_node"
+    
+    return END
+
+agent_builder = StateGraph(AgentState)
+agent_builder.add_node("llm_node", llm_node)
+agent_builder.add_node("tool_node", tool_node)
+agent_builder.add_edge(START, "llm_node")
+agent_builder.add_conditional_edges(
+    "llm_node",
+    should_continue,
+    ["tool_node", END]
+)
+agent_builder.add_edge("tool_node", "llm_node")
+agent = agent_builder.compile()

@@ -1,13 +1,64 @@
 from typing import List, Dict, Any, Optional
-from langchain_core.tools import tool
+from langchain.tools import tool
+from langchain_openai import OpenAIEmbeddings,ChatOpenAI
+from langchain.chat_models import init_chat_model
 from langchain_core.embeddings import Embeddings
-from langchain_core import OpenAIEmbeddings,ChatOpenAI
 from pymongo import MongoClient
 import math
+import requests
 
 # 初始化模型
-embedding_model = OpenAIEmbeddings(model="text-embedding-ada-002")
-recommendation_model = ChatOpenAI(model="gpt-4", temperature=0)
+# 自定义Embeddings
+class CustomHTTPEmbeddings(Embeddings):
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        model: str
+    ):
+        self.api_key = api_key
+        self.base_url = base_url
+        self.model = model
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return [self.embed_query(t) for t in texts]
+
+    def embed_query(self, text: str) -> List:
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "model": self.model,
+            "input": text,
+        }
+
+        resp = requests.post(
+            self.base_url,
+            json=payload,
+            headers=headers,
+            timeout=30
+        )
+
+        resp.raise_for_status()
+
+        data = resp.json()
+
+        return data["data"][0]["embedding"]     
+
+embedding_model = CustomHTTPEmbeddings(
+    model="gemini-embedding-001",
+    api_key="sk-OLJJMLD2vl2fG5H1F7A4A13a0115491e85B6Ce777eE628Ba",
+    base_url="https://aihubmix.com/v1/embeddings",
+    )
+
+recommendation_model = init_chat_model(
+    model="gpt-4",
+    temperature=0,
+    base_url="https://aihubmix.com/v1",
+    api_key="sk-OLJJMLD2vl2fG5H1F7A4A13a0115491e85B6Ce777eE628Ba",
+    )
 
 # 连接配置
 MONGO_URI = "mongodb://localhost:27017/"
@@ -40,7 +91,8 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
 @tool
 def search_relevant_indices(user_query_text: str, top_k: int = 10) -> Dict[str, Any]:
     """
-    根据用户输入文本，从指标数据库中检索相关指标
+    如果用户提出一个关于地理方面的问题，
+    则可以根据用户输入文本，从指标数据库中检索相关指标，以辅助后续的模型推荐和决策。
     Args:
         user_query_text: 用户查询文本
         top_k: 返回的最相关指标数（默认 10）
@@ -49,6 +101,8 @@ def search_relevant_indices(user_query_text: str, top_k: int = 10) -> Dict[str, 
     """
     try:
         query_vector = embedding_model.embed_query(user_query_text)
+        print("query_vector len:", len(query_vector))
+        print("query_vector sample:", query_vector[:5])
 
         db = get_db()
         index_collection = db["indexSystem"]
@@ -61,11 +115,26 @@ def search_relevant_indices(user_query_text: str, top_k: int = 10) -> Dict[str, 
             for category in sphere.get("categories", []):
                 for indicator in category.get("indicators", []):
                     if indicator.get("embedding") and len(indicator.get("embedding", [])) > 0:
-                        score = cosine_similarity(query_vector, indicator["embedding"])
+                        embedding = indicator.get("embedding")
+                        if not embedding or not isinstance(embedding, list) or len(embedding) == 0:
+                            print("指标嵌入无效，跳过该指标")
+                            continue
+
+                        score = cosine_similarity(query_vector, embedding)
+                        print(f"指标 '{indicator.get('name_en', '')}' 相似度得分: {score}")
+
+                        model_ids = []
+                        for model in indicator.get("models", []):
+                            model_id = model.get("model_id")
+                            if not model_id or not isinstance(model_id, str) or not model_id.strip():
+                                print("模型ID无效，跳过该模型")
+                                continue
+                            model_ids.append(model_id)
+
                         flattened_indicators.append({
                             "name_en": indicator.get("name_en", ""),
                             "name_cn": indicator.get("name_cn", ""),
-                            "models": indicator.get("models", []),
+                            "models_Id": model_ids,
                             "score": score
                         })
 

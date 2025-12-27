@@ -51,28 +51,24 @@ def serialize_message(msg: Any) -> Dict[str, Any]:
 def serialize_messages(msgs: List[Any]) -> List[Dict[str, Any]]:
     return [serialize_message(m) for m in msgs]
 
-def map_agent_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def map_agent_event(event: Dict[str, Any], root_started_ref, root_finished_ref) -> Optional[Dict[str, Any]]:
     """
     将LangGraph原始事件映射为“可解释事件”
     """
     etype = event.get("event")
-    print(f"Mapping event: {etype}")
+    tool_type = event.get("type")
+    parent_run_id = event.get("parent_run_id")
+    is_root = parent_run_id is None
 
-    # Agent 开始
-    if etype == "on_chain_start":
+    # Agent开始分析问题，只在整个Graph的根节点开始时触发一次
+    if etype == "on_chain_start" and is_root and not root_started_ref:
+        root_started_ref = True
         return {
             "type": "status",
-            "message": "🧠 Agent 正在分析问题"
+            "message": "Agent正在分析问题"
         }
 
-    # LLM 开始生成
-    if etype == "on_chat_model_start":
-        return {
-            "type": "status",
-            "message": "✍️ Agent 正在生成回答"
-        }
-
-    # LLM token 流
+    # LLM token流
     if etype == "on_chat_model_stream":
         chunk = event.get("data", {}).get("chunk")
         content = getattr(chunk, "content", "")
@@ -82,7 +78,7 @@ def map_agent_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "message": content
             }
 
-    # Tool 调用开始
+    # Tool开始调用工具
     if etype == "on_tool_start":
         name = event.get('name')
         friendly_names = {
@@ -93,26 +89,83 @@ def map_agent_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         msg = friendly_names.get(name, f"正在执行工具: {name}")
         return {
             "type": "tool",
-            "message": f"🔧 {msg}",
+            "message": f"{msg}",
             "data": event.get("data")
         }
 
-    # Tool 调用结束
+    # Tool结束调用工具
     if etype == "on_tool_end":
         return {
             "type": "tool",
-            "message": "📊 工具已返回结果",
+            "message": "工具已返回结果",
             "data": event.get("data")
         }
 
-    # Agent 完成
-    if etype == "on_chain_end":
+    # Agent完成分析
+    if etype == "on_chain_end" and is_root and not root_finished_ref:
+        root_finished_ref = True
         return {
             "type": "final",
-            "message": "✅ Agent 已得出结论"
+            "message": "Agent已得出结论"
+        }
+    
+    if tool_type == "partial_result":
+        return {
+            "type": "partial_result",
+            "event": event["event"],
+            "data": event["data"]
         }
 
     return None
+
+def final_decision_node(state):
+    final_json = {
+        "model_name": state["name"],
+        "model_md5": state["md5"],
+        "model_description": state["description"],
+        "model_workflow": state["workflow"]
+    }
+
+    yield {
+        "type": "recommend_model",
+        "data": final_json
+    }
+
+    return state
+
+@app.get("/api/agent/stream")
+async def stream_agent(query: str):
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+
+    async def event_generator():
+        init_input = {
+            "messages": [HumanMessage(content=query)]
+        }
+
+        root_started = {"value": False}
+        root_finished = {"value": False}
+
+        try:
+            async for event in agent.astream_events(
+                init_input,
+                version="v1"
+            ):
+                mapped = map_agent_event(
+                    event,
+                    root_started_ref = root_started,
+                    root_finished_ref = root_finished
+                )
+                if mapped:
+                    yield f"data: {json.dumps(mapped, ensure_ascii=False)}\n\n"
+                await asyncio.sleep(0)
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream"
+    )
 
 @app.post("/api/agent/run")
 async def run_agent(body: Dict[str, Any]):
@@ -139,30 +192,3 @@ async def run_agent(body: Dict[str, Any]):
         "messages": serialize_messages(final_state.get("messages", [])), 
         "llm_calls": final_state.get("llm_calls", 0)
     }
-
-@app.get("/api/agent/stream")
-async def stream_agent(query: str):
-    if not query:
-        raise HTTPException(status_code=400, detail="query is required")
-
-    async def event_generator():
-        init_input = {
-            "messages": [HumanMessage(content=query)]
-        }
-
-        try:
-            async for event in agent.astream_events(
-                init_input,
-                version="v1"
-            ):
-                mapped = map_agent_event(event)
-                if mapped:
-                    yield f"data: {json.dumps(mapped, ensure_ascii=False)}\n\n"
-                await asyncio.sleep(0)
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream"
-    )

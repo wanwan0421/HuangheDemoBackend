@@ -47,20 +47,56 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     """
 
     last_message = state["messages"][-1]
-    tool_results = []
-
     # 防御性判断：如果没有 tool_calls，直接返回空消息
     tool_calls = getattr(last_message, "tool_calls", []) or []
+
+    tool_messages = []
+    states = [] # 用于前端展示的事件列表
 
     for tool_call in tool_calls:
         tool = tools.TOOLS_BY_NAME[tool_call["name"]]
         observation = tool.invoke(tool_call["args"])
-        tool_results.append(ToolMessage(
+
+        tool_messages.append(ToolMessage(
             content=observation,
             tool_call_id=tool_call["id"]
         ))
 
-    return {"messages": tool_results}
+    # 定义指标检索的返回结果事件
+    if tool_call["name"] == "search_relevant_indices" and observation["status"] == "success":
+        states.append({
+            "type": "partial_result",
+            "event": "search_index",
+            "data": {
+                "count": observation["count"],
+                "indices": observation["indices"]
+            }
+        })
+
+    # 定义模型检索的返回结果事件
+    if tool_call["name"] == "search_relevant_models" and observation["status"] == "success":
+        states.append({
+            "type": "partial_result",
+            "event": "search_model",
+            "data": {
+                "count": observation["count"],
+                "models": observation["models"]
+            }
+        })
+
+    return {
+        "messages": tool_messages,
+        "states": states
+    }
+
+async def wrapped_tool_node(state: AgentState):
+    result = tool_node(state)
+
+    # 把tool产生的中间结果抛给事件流
+    for state in result.get("states", []):
+        yield state
+
+    return result
 
 def should_continue(state: AgentState) -> Any:
     """
@@ -79,7 +115,7 @@ def should_continue(state: AgentState) -> Any:
 
 agent_builder = StateGraph(AgentState)
 agent_builder.add_node("llm_node", llm_node)
-agent_builder.add_node("tool_node", tool_node)
+agent_builder.add_node("tool_node", wrapped_tool_node)
 agent_builder.add_edge(START, "llm_node")
 agent_builder.add_conditional_edges(
     "llm_node",

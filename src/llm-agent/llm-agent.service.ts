@@ -1,5 +1,4 @@
 import { Injectable } from '@nestjs/common';
-import { GoogleGenAI, Type } from '@google/genai';
 import { LlmRecommendationResponse } from './interfaces/llmRecommendationResponse.interface';
 import { InputNode } from './interfaces/modelResponse.interface';
 import { indexRecommendationTool, modelRecommendationTool } from './schemas/llmTools.schema';
@@ -7,13 +6,36 @@ import { GenAIService } from '../genai/genai.service';
 import { IndexService } from 'src/index/index.service';
 import { ResourceService } from 'src/resource/resource.service';
 import { ModelResource } from 'src/resource/schemas/modelResource.schema';
+import { Observable } from 'rxjs';
+import { HttpService } from '@nestjs/axios';
+import { response } from 'express';
 
 @Injectable()
 export class LlmAgentService {
     constructor(private readonly indexService: IndexService,
         private readonly genAIService: GenAIService,
         private readonly resourceService: ResourceService,
+        private readonly httpsService: HttpService
     ) {}
+
+    /**
+     * 调用Agent 负责与Python后端进行通信
+     * @param prompt 用户输入
+     * @param userQueryVector 用户输入转换为的向量
+     * @returns 
+     */
+    getSystemErrorName(query: string): Observable<MessageEvent> {
+        return new Observable((observer) => {
+            // 调用Python FastAPI后端接口
+            this.httpsService.axiosRef({
+                url: `${process.env.agentUrl}/stream?query=${encodeURIComponent(query)}`,
+                method: 'GET',
+                responseType: 'stream',
+            }).then((response) => {
+                
+            })
+        })
+    }
 
     /**
      * 调用LLM API，使用结构化输出获取5个指标推荐

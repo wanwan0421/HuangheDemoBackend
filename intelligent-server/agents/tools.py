@@ -7,7 +7,6 @@ from pymongo import MongoClient
 import math
 import requests
 
-# 初始化模型
 # 自定义Embeddings
 class CustomHTTPEmbeddings(Embeddings):
     def __init__(
@@ -53,6 +52,7 @@ embedding_model = CustomHTTPEmbeddings(
     base_url="https://aihubmix.com/v1/embeddings",
     )
 
+# 初始化模型
 recommendation_model = init_chat_model(
     model="gpt-4",
     temperature=0,
@@ -175,7 +175,7 @@ def search_relevant_models(user_query_text: str, model_ids: List[str], top_k: in
         query_vector = embedding_model.embed_query(user_query_text)
         
         db = get_db()
-        model_embeddings_collection = db["modelEmbedding"]
+        model_embeddings_collection = db["modelembeddings"]
 
         # 查询指定MD5的所有模型
         all_models = list(
@@ -271,13 +271,10 @@ def get_model_details(model_md5: str) -> Dict[str, Any]:
 
         return {
             "status": "success",
-            "model": {
-                "name": model.get("name", ""),
-                "md5": model.get("md5", ""),
-                "description": model.get("description", ""),
-                "mdl": model.get("mdl", ""),
-                "workflow": workflow_steps
-            }
+            "name": model.get("name", ""),
+            "md5": model.get("md5", ""),
+            "description": model.get("description", ""),
+            "workflow": workflow_steps
         }
     except Exception as e:
         return {

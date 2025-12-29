@@ -6,11 +6,12 @@ import { ModelResource, ModelResourceSchema } from 'src/resource/schemas/modelRe
 import { IndexModule } from 'src/index/index.module';
 import { ResourceModule } from 'src/resource/resource.module';
 import { GenAIModule } from 'src/genai/genai.module';
+import { HttpModule } from '@nestjs/axios';
 
 @Module({
   imports: [
   MongooseModule.forFeature([{name: ModelResource.name, schema: ModelResourceSchema}]),
-  IndexModule, ResourceModule, GenAIModule],
+  IndexModule, ResourceModule, GenAIModule, HttpModule],
   providers: [LlmAgentService],
   controllers: [LlmAgentController]
 })

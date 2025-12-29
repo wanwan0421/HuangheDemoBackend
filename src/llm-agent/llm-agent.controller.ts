@@ -1,5 +1,6 @@
-import { Body, Controller, HttpException, HttpStatus, Post } from '@nestjs/common';
+import { Body, Controller, HttpException, HttpStatus, Post, Sse, Query } from '@nestjs/common';
 import { LlmAgentService } from './llm-agent.service';
+import { Observable } from 'rxjs';
 
 @Controller('api/llm-agent')
 export class LlmAgentController {
@@ -30,5 +31,10 @@ export class LlmAgentController {
         } catch(error) {
             throw new HttpException(`Agent Error: ${error.message}`, HttpStatus.INTERNAL_SERVER_ERROR);
         }
+    }
+
+    @Sse('chat')
+    stream(@Query('query') query: string): Observable<{ data: any }> {
+        return this.llmAgentService.getSystemErrorName(query);
     }
 }

@@ -1,11 +1,15 @@
+import os
 from typing import List, Dict, Any, Optional
 from langchain.tools import tool
 from langchain_openai import OpenAIEmbeddings,ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chat_models import init_chat_model
 from langchain_core.embeddings import Embeddings
 from pymongo import MongoClient
 import math
 import requests
+from dotenv import load_dotenv
+from google import genai
 
 # 自定义Embeddings
 class CustomHTTPEmbeddings(Embeddings):
@@ -46,19 +50,23 @@ class CustomHTTPEmbeddings(Embeddings):
 
         return data["data"][0]["embedding"]     
 
-embedding_model = CustomHTTPEmbeddings(
-    model="gemini-embedding-001",
-    api_key="sk-OLJJMLD2vl2fG5H1F7A4A13a0115491e85B6Ce777eE628Ba",
-    base_url="https://aihubmix.com/v1/embeddings",
-    )
+# embedding_model = CustomHTTPEmbeddings(
+#     model="gemini-embedding-001",
+#     api_key="AIzaSyCxGIwvgtl1N6-Fd5ADkn4qOA48diGgfOo",
+#     base_url="https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
+#     )
 
 # 初始化模型
-recommendation_model = init_chat_model(
-    model="gpt-4",
-    temperature=0,
-    base_url="https://aihubmix.com/v1",
-    api_key="sk-OLJJMLD2vl2fG5H1F7A4A13a0115491e85B6Ce777eE628Ba",
-    )
+load_dotenv()
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+client = genai.Client(api_key=GOOGLE_API_KEY )
+
+recommendation_model = ChatGoogleGenerativeAI(
+    model= "gemini-2.5-pro",
+    temperature=1.0,
+    max_retries=2,
+    google_api_key=GOOGLE_API_KEY ,
+)
 
 # 连接配置
 MONGO_URI = "mongodb://localhost:27017/"
@@ -100,9 +108,14 @@ def search_relevant_indices(user_query_text: str, top_k: int = 10) -> Dict[str, 
         包含相关指标列表的字典
     """
     try:
-        query_vector = embedding_model.embed_query(user_query_text)
-        print("query_vector len:", len(query_vector))
-        print("query_vector sample:", query_vector[:5])
+        print("user_query_text:",user_query_text)
+        # query_vector = embedding_model.embed_query(user_query_text)
+        query_vector = client.models.embed_content(
+            model="gemini-embedding-001",
+            content=user_query_text
+        ).embeddings[0]
+
+        print("query_vector:",query_vector)
 
         db = get_db()
         index_collection = db["indexSystem"]
@@ -121,7 +134,6 @@ def search_relevant_indices(user_query_text: str, top_k: int = 10) -> Dict[str, 
                             continue
 
                         score = cosine_similarity(query_vector, embedding)
-                        print(f"指标 '{indicator.get('name_en', '')}' 相似度得分: {score}")
 
                         model_ids = []
                         for model in indicator.get("models", []):
@@ -172,8 +184,12 @@ def search_relevant_models(user_query_text: str, model_ids: List[str], top_k: in
                 "message": "模型 ID 列表为空"
             }
         
-        query_vector = embedding_model.embed_query(user_query_text)
-        
+        # query_vector = embedding_model.embed_query(user_query_text)
+        query_vector = client.models.embed_content(
+            model="gemini-embedding-001",
+            content=user_query_text
+        ).embeddings[0]
+
         db = get_db()
         model_embeddings_collection = db["modelembeddings"]
 

@@ -21,10 +21,10 @@ export class LlmAgentService {
     /**
      * 调用Agent 负责与Python后端进行通信
      * @param prompt 用户输入
-     * @param userQueryVector 用户输入转换为的向量
      * @returns 
      */
-    getSystemErrorName(query: string): Observable<MessageEvent> {
+    getSystemErrorName(query: string): Observable<{ data: any}> {
+        // 每一次observer.next()就推送一个SSE事件
         return new Observable((observer) => {
             // 调用Python FastAPI后端接口
             this.httpsService.axiosRef({
@@ -32,9 +32,51 @@ export class LlmAgentService {
                 method: 'GET',
                 responseType: 'stream',
             }).then((response) => {
-                
-            })
-        })
+                let buffer = '';
+
+                // 心跳保活，每20s发一次
+                const heartbeat = setInterval(() => {
+                    observer.next({ data: { type: "heartbeat", message: "keep-alive"} });
+                }, 20000);
+
+                // 处理SSE chunk
+                response.data.on('data', (chunk: Buffer) => {
+                    buffer += chunk.toString();
+                    let index;
+                    while ((index = buffer.indexOf('\n\n')) >= 0) {
+                        const block = buffer.slice(0, index);
+                        buffer = buffer.slice(index + 2);
+
+                        block.split('\n').forEach((line) => {
+                            if (line.startsWith('data: ')) {
+                                try {
+                                    const jsonStr = line.replace(/^data: /, '');
+                                    if (jsonStr.trim()) {
+                                        const data = JSON.parse(jsonStr);
+                                        observer.next({ data });
+                                    }
+                                } catch (err) {
+                                    console.warn('SSE JSON parse error:', err);
+                                }
+                            }
+                        });
+                    }
+                });
+
+                response.data.on('end', () => {
+                    clearInterval(heartbeat);
+                    observer.complete();
+                });
+
+                response.data.on('error', (err) => {
+                    clearInterval(heartbeat);
+                    observer.next({ data: { type: "error", message: err.message} });
+                });
+            }).catch((err) => {
+                observer.next({ data: { type: "error", message: err.message} });
+                observer.complete;
+            });
+        });
     }
 
     /**

@@ -56,7 +56,6 @@ def map_agent_event(event: Dict[str, Any], root_started_ref, root_finished_ref) 
     将LangGraph原始事件映射为“可解释事件”
     """
     etype = event.get("event")
-    tool_type = event.get("type")
     parent_run_id = event.get("parent_run_id")
     is_root = parent_run_id is None
 
@@ -80,6 +79,7 @@ def map_agent_event(event: Dict[str, Any], root_started_ref, root_finished_ref) 
 
     # Tool开始调用工具
     if etype == "on_tool_start":
+        print("Tool开始调用工具")
         name = event.get('name')
         friendly_names = {
             "search_relevant_indices": "正在检索地理指标库...",
@@ -95,11 +95,31 @@ def map_agent_event(event: Dict[str, Any], root_started_ref, root_finished_ref) 
 
     # Tool结束调用工具
     if etype == "on_tool_end":
-        return {
-            "type": "tool",
-            "message": "工具已返回结果",
-            "data": event.get("data")
-        }
+        name = event.get('name')
+        data = event.get("data", {})
+        output = data.get("output", {})
+
+        # 指标库返回结果
+        if name == "search_relevant_indices":
+            return {
+                "type": "search_index",
+                "message": "工具已返回相关地理指标",
+                "data": output
+            }
+        # 模型库返回结果
+        if name == "search_relevant_models":
+            return {
+                "type": "search_model",
+                "message": "工具已返回相关地理模型",
+                "data": output
+            }
+        # 模型详情返回结果
+        if name == "get_model_details":
+            return {
+                "type": "model_details",
+                "message": "工具已返回模型工作流详情",
+                "data": output
+            }
 
     # Agent完成分析
     if etype == "on_chain_end" and is_root and not root_finished_ref:
@@ -108,33 +128,12 @@ def map_agent_event(event: Dict[str, Any], root_started_ref, root_finished_ref) 
             "type": "final",
             "message": "Agent已得出结论"
         }
-    
-    if tool_type == "partial_result":
-        return {
-            "type": "partial_result",
-            "event": event["event"],
-            "data": event["data"]
-        }
 
     return None
 
-def final_decision_node(state):
-    final_json = {
-        "model_name": state["name"],
-        "model_md5": state["md5"],
-        "model_description": state["description"],
-        "model_workflow": state["workflow"]
-    }
-
-    yield {
-        "type": "recommend_model",
-        "data": final_json
-    }
-
-    return state
-
 @app.get("/api/agent/stream")
 async def stream_agent(query: str):
+    print("Received stream query:", query)
     if not query:
         raise HTTPException(status_code=400, detail="query is required")
 
@@ -151,6 +150,7 @@ async def stream_agent(query: str):
                 init_input,
                 version="v1"
             ):
+                print("Agent event:", event)
                 mapped = map_agent_event(
                     event,
                     root_started_ref = root_started,

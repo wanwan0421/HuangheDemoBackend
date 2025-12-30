@@ -55,13 +55,14 @@ def map_agent_event(event: Dict[str, Any], root_started_ref, root_finished_ref) 
     """
     将LangGraph原始事件映射为“可解释事件”
     """
+    print("event:", event)
     etype = event.get("event")
     parent_run_id = event.get("parent_run_id")
     is_root = parent_run_id is None
 
     # Agent开始分析问题，只在整个Graph的根节点开始时触发一次
-    if etype == "on_chain_start" and is_root and not root_started_ref:
-        root_started_ref = True
+    if etype == "on_chain_start" and is_root and not root_started_ref["value"]:
+        root_started_ref["value"] = True
         return {
             "type": "status",
             "message": "Agent正在分析问题"
@@ -71,6 +72,17 @@ def map_agent_event(event: Dict[str, Any], root_started_ref, root_finished_ref) 
     if etype == "on_chat_model_stream":
         chunk = event.get("data", {}).get("chunk")
         content = getattr(chunk, "content", "")
+
+        if isinstance(content, list):
+            texts = []
+            for c in content:
+                if isinstance(c, dict) and 'text' in c:
+                    texts.append(c['text'])
+                elif isinstance(c, str):
+                    texts.append(c)
+            content = "".join(texts)
+            print("content:", content)
+
         if content:
             return {
                 "type": "token",
@@ -81,17 +93,27 @@ def map_agent_event(event: Dict[str, Any], root_started_ref, root_finished_ref) 
     if etype == "on_tool_start":
         print("Tool开始调用工具")
         name = event.get('name')
-        friendly_names = {
-            "search_relevant_indices": "正在检索地理指标库...",
-            "search_relevant_models": "正在匹配最优地理模型...",
-            "get_model_details": "正在读取模型工作流详情..."
-        }
-        msg = friendly_names.get(name, f"正在执行工具: {name}")
-        return {
-            "type": "tool",
-            "message": f"{msg}",
-            "data": event.get("data")
-        }
+        # 开始检索指标库
+        if name == "search_relevant_indices":
+            return {
+                "type": "search_index",
+                "message": "正在检索地理指标库...",
+                "data": event.get("data")
+            }
+        # 开始检索模型库
+        if name == "search_relevant_models":
+            return {
+                "type": "search_model",
+                "message": "正在检索地理模型库...",
+                "data": event.get("data")
+            }
+        # 开始获取模型详情
+        if name == "get_model_details":
+            return {
+                "type": "model_details",
+                "message": "正在读取模型工作流详情...",
+                "data": event.get("data")
+            }
 
     # Tool结束调用工具
     if etype == "on_tool_end":
@@ -102,28 +124,28 @@ def map_agent_event(event: Dict[str, Any], root_started_ref, root_finished_ref) 
         # 指标库返回结果
         if name == "search_relevant_indices":
             return {
-                "type": "search_index",
+                "type": "search_index_end",
                 "message": "工具已返回相关地理指标",
                 "data": output
             }
         # 模型库返回结果
         if name == "search_relevant_models":
             return {
-                "type": "search_model",
+                "type": "search_model_end",
                 "message": "工具已返回相关地理模型",
                 "data": output
             }
         # 模型详情返回结果
         if name == "get_model_details":
             return {
-                "type": "model_details",
+                "type": "model_details_end",
                 "message": "工具已返回模型工作流详情",
                 "data": output
             }
 
     # Agent完成分析
-    if etype == "on_chain_end" and is_root and not root_finished_ref:
-        root_finished_ref = True
+    if etype == "on_chain_end" and is_root and not root_finished_ref["value"]:
+        root_finished_ref["value"] = True
         return {
             "type": "final",
             "message": "Agent已得出结论"
@@ -148,9 +170,9 @@ async def stream_agent(query: str):
         try:
             async for event in agent.astream_events(
                 init_input,
-                version="v1"
+                version="v2"
             ):
-                print("Agent event:", event)
+                # print("Agent event:", event)
                 mapped = map_agent_event(
                     event,
                     root_started_ref = root_started,

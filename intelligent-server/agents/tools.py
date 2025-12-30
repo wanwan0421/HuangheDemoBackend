@@ -62,9 +62,10 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 client = genai.Client(api_key=GOOGLE_API_KEY )
 
 recommendation_model = ChatGoogleGenerativeAI(
-    model= "gemini-2.5-pro",
+    model= "gemini-2.5-flash",
     temperature=1.0,
     max_retries=2,
+    streaming=True,
     google_api_key=GOOGLE_API_KEY ,
 )
 
@@ -108,14 +109,11 @@ def search_relevant_indices(user_query_text: str, top_k: int = 10) -> Dict[str, 
         包含相关指标列表的字典
     """
     try:
-        print("user_query_text:",user_query_text)
         # query_vector = embedding_model.embed_query(user_query_text)
         query_vector = client.models.embed_content(
             model="gemini-embedding-001",
-            content=user_query_text
-        ).embeddings[0]
-
-        print("query_vector:",query_vector)
+            contents=user_query_text
+        ).embeddings[0].values
 
         db = get_db()
         index_collection = db["indexSystem"]
@@ -187,8 +185,8 @@ def search_relevant_models(user_query_text: str, model_ids: List[str], top_k: in
         # query_vector = embedding_model.embed_query(user_query_text)
         query_vector = client.models.embed_content(
             model="gemini-embedding-001",
-            content=user_query_text
-        ).embeddings[0]
+            contents=user_query_text
+        ).embeddings[0].values
 
         db = get_db()
         model_embeddings_collection = db["modelembeddings"]

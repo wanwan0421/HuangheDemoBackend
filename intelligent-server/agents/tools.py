@@ -98,13 +98,13 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     return dot_product / (magnitude1 * magnitude2)
 
 @tool
-def search_relevant_indices(user_query_text: str, top_k: int = 10) -> Dict[str, Any]:
+def search_relevant_indices(user_query_text: str, top_k: int = 5) -> Dict[str, Any]:
     """
     如果用户提出一个关于地理方面的问题，
     则可以根据用户输入文本，从指标数据库中检索相关指标，以辅助后续的模型推荐和决策。
     Args:
         user_query_text: 用户查询文本
-        top_k: 返回的最相关指标数（默认 10）
+        top_k: 返回的最相关指标数（默认5）
     Returns:
         包含相关指标列表的字典
     """
@@ -164,14 +164,14 @@ def search_relevant_indices(user_query_text: str, top_k: int = 10) -> Dict[str, 
         }
 
 @tool
-def search_relevant_models(user_query_text: str, model_ids: List[str], top_k: int = 5) -> Dict[str, Any]:
+def search_relevant_models(user_query_text: str, model_ids: List[str], top_k: int = 10) -> Dict[str, Any]:
     """
     在给定的候选模型范围内，根据用户需求进行语义筛选。
     当指标关联的模型太多时，使用此工具找出最符合用户具体意图的模型。
     Args:
         user_query_text: 用户查询文本
         model_ids: 候选模型MD5值列表
-        top_k: 返回的最相关模型数（默认 5）
+        top_k: 返回的最相关模型数（默认 10）
     Returns:
         包含相关模型列表的字典
     """

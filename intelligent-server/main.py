@@ -2,7 +2,7 @@ from fastapi import FastAPI, WebSocket, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from agents.nodes import agent
-from langchain.messages import HumanMessage
+from langchain.messages import HumanMessage, AIMessageChunk
 from typing import Any, Dict, List, Optional
 import uuid
 import json
@@ -164,22 +164,106 @@ async def stream_agent(query: str):
             "messages": [HumanMessage(content=query)]
         }
 
-        root_started = {"value": False}
-        root_finished = {"value": False}
-
         try:
-            async for event in agent.astream_events(
+            def extract_text(content):
+                if isinstance(content, str):
+                    return content
+                elif isinstance(content, dict) and "text" in content:
+                    return content["text"]
+                elif isinstance(content, list):
+                    return "".join(extract_text(c) for c in content)
+                else:
+                    return ""
+
+            async for mode, chunk in agent.astream(
                 init_input,
-                version="v2"
+                stream_mode=["messages", "updates", "custom"]
             ):
-                # print("Agent event:", event)
-                mapped = map_agent_event(
-                    event,
-                    root_started_ref = root_started,
-                    root_finished_ref = root_finished
-                )
-                if mapped:
-                    yield f"data: {json.dumps(mapped, ensure_ascii=False)}\n\n"
+                if mode == "messages":
+                    if isinstance(chunk, tuple):
+                        message_chunk = chunk[0]
+                    else:
+                        message_chunk = chunk
+                    
+                    if isinstance(message_chunk, AIMessageChunk):
+                        content = message_chunk.content
+                        content = extract_text(content)
+
+                        if content and content.strip(): 
+                            print("content:", content) # 调试用
+                            
+                            yield f"data: {json.dumps({'type': 'token', 'message': content}, ensure_ascii=False)}\n\n"
+
+                elif mode == "updates":
+                    # 一般是节点名+小更新内容
+                    if isinstance(chunk, dict):
+                        for node_name, node_output in chunk.items():
+                            if node_name == "llm_node":
+                                # 获取messages列表
+                                llm_messages = node_output.get("messages", [])
+
+                                # 处理LLM产生的text内容
+                                for msg in llm_messages:
+                                    content = msg.content
+                                    if isinstance(content, list):
+                                        texts = []
+                                        for part in content:
+                                            if isinstance(part, dict) and "text" in part:
+                                                texts.append(part["text"])
+                                        text_str = "".join(texts)
+                                    else:
+                                        text_str = content or ""
+
+                                    if text_str.strip():
+                                        # 发送一个 LLM text 片段事件
+                                        yield f"data: {json.dumps({'type': 'llm_end', 'message': text_str}, ensure_ascii=False)}\n\n"
+
+                                # 处理LLM调用工具
+                                last_msg = llm_messages[-1] if llm_messages else None
+                                tool_calls = getattr(last_msg, "tool_calls", []) or []
+
+                                if tool_calls:
+                                    for tool_call in tool_calls:
+                                        yield f"data: {json.dumps({'type': tool_call['name'], 'message': tool_call['name']}, ensure_ascii=False)}\n\n"
+                                continue
+
+                            if node_name == "tool_node":
+                                # node_output is like {"messages": [ToolMessage,...]}
+                                tool_msgs = node_output.get("messages", [])
+
+                                for tmsg in tool_msgs:
+                                    try:
+                                        tool_result = json.loads(tmsg.content)
+                                    except Exception:
+                                        tool_result = tmsg.content
+                                    # get tool_name from tmsg if exists (fallback to id if not)
+
+                                    tool_name = getattr(tmsg, "tool_name", None)
+                                    event_type = {
+                                        "search_relevant_indices":"search_index_end",
+                                        "search_relevant_models":"search_model_end",
+                                        "get_model_details":"model_details_end"
+                                    }.get(tool_name, "tool_complete")
+
+                                    yield f"data: {json.dumps({
+                                        "type": event_type,
+                                        "tool": tool_name,
+                                        "data": tool_result
+                                    }, ensure_ascii=False)}\n\n"
+
+                                continue
+
+                            # fallback
+                            yield f"data: {json.dumps({
+                                "type": "update",
+                                "node": node_name,
+                                "data": node_output
+                            }, ensure_ascii=False)}\n\n"
+
+                elif mode == "custom":
+                    # 工具内部通过 StreamWriter 发出的数据
+                    yield f"data: {json.dumps({'type': 'custom', 'data': chunk}, ensure_ascii=False)}\n\n"
+
                 await asyncio.sleep(0)
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"

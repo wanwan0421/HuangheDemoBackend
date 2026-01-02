@@ -10,8 +10,14 @@ import { HttpModule } from '@nestjs/axios';
 
 @Module({
   imports: [
-  MongooseModule.forFeature([{name: ModelResource.name, schema: ModelResourceSchema}]),
-  IndexModule, ResourceModule, GenAIModule, HttpModule],
+    MongooseModule.forFeature([
+      { name: ModelResource.name, schema: ModelResourceSchema },
+    ]),
+    IndexModule, 
+    ResourceModule, 
+    GenAIModule, 
+    HttpModule
+  ],
   providers: [LlmAgentService],
   controllers: [LlmAgentController]
 })

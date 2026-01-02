@@ -191,7 +191,7 @@ async def stream_agent(query: str):
 
                         if content and content.strip(): 
                             print("content:", content) # 调试用
-                            
+                            # 发送命名事件 + data
                             yield f"data: {json.dumps({'type': 'token', 'message': content}, ensure_ascii=False)}\n\n"
 
                 elif mode == "updates":
@@ -202,29 +202,14 @@ async def stream_agent(query: str):
                                 # 获取messages列表
                                 llm_messages = node_output.get("messages", [])
 
-                                # 处理LLM产生的text内容
-                                for msg in llm_messages:
-                                    content = msg.content
-                                    if isinstance(content, list):
-                                        texts = []
-                                        for part in content:
-                                            if isinstance(part, dict) and "text" in part:
-                                                texts.append(part["text"])
-                                        text_str = "".join(texts)
-                                    else:
-                                        text_str = content or ""
-
-                                    if text_str.strip():
-                                        # 发送一个 LLM text 片段事件
-                                        yield f"data: {json.dumps({'type': 'llm_end', 'message': text_str}, ensure_ascii=False)}\n\n"
-
                                 # 处理LLM调用工具
                                 last_msg = llm_messages[-1] if llm_messages else None
                                 tool_calls = getattr(last_msg, "tool_calls", []) or []
 
                                 if tool_calls:
                                     for tool_call in tool_calls:
-                                        yield f"data: {json.dumps({'type': tool_call['name'], 'message': tool_call['name']}, ensure_ascii=False)}\n\n"
+                                        event_name = tool_call.get('name') if isinstance(tool_call, dict) else str(tool_call)
+                                        yield f"data: {json.dumps({'type': event_name, 'message': event_name}, ensure_ascii=False)}\n\n"
                                 continue
 
                             if node_name == "tool_node":
@@ -245,20 +230,12 @@ async def stream_agent(query: str):
                                         "get_model_details":"model_details_end"
                                     }.get(tool_name, "tool_complete")
 
-                                    yield f"data: {json.dumps({
-                                        "type": event_type,
-                                        "tool": tool_name,
-                                        "data": tool_result
-                                    }, ensure_ascii=False)}\n\n"
+                                    yield f"data: {json.dumps({"type": event_type, "tool": tool_name, "data": tool_result}, ensure_ascii=False)}\n\n"
 
                                 continue
 
                             # fallback
-                            yield f"data: {json.dumps({
-                                "type": "update",
-                                "node": node_name,
-                                "data": node_output
-                            }, ensure_ascii=False)}\n\n"
+                            yield f"data: {json.dumps({"type": "update", "node": node_name, "data": node_output}, ensure_ascii=False)}\n\n"
 
                 elif mode == "custom":
                     # 工具内部通过 StreamWriter 发出的数据

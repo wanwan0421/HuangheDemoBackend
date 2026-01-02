@@ -8,6 +8,7 @@ import { ScheduleModule } from '@nestjs/schedule';
 import { LlmAgentModule } from './llm-agent/llm-agent.module';
 import { IndexModule } from './index/index.module';
 import { GenAIModule } from './genai/genai.module';
+import { ChatModule } from './chat/chat.module';
 
 @Module({
   imports: [
@@ -26,7 +27,8 @@ import { GenAIModule } from './genai/genai.module';
     ResourceModule,
     LlmAgentModule,
     IndexModule,
-    GenAIModule],
+    GenAIModule,
+    ChatModule],
   controllers: [AppController],
   providers: [AppService],
 })

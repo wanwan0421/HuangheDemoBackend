@@ -1,6 +1,6 @@
-import { Body, Controller, HttpException, HttpStatus, Post, Sse, Query } from '@nestjs/common';
+import { Body, Controller, HttpException, HttpStatus, Post, Get, Query, Res } from '@nestjs/common';
 import { LlmAgentService } from './llm-agent.service';
-import { Observable } from 'rxjs';
+import type { Response } from 'express';
 
 @Controller('api/llm-agent')
 export class LlmAgentController {
@@ -33,8 +33,18 @@ export class LlmAgentController {
         }
     }
 
-    @Sse('chat')
-    stream(@Query('query') query: string): Observable<{ data: any }> {
-        return this.llmAgentService.getSystemErrorName(query);
+    @Get('chat')
+    async stream(@Query('query') query: string, @Res() res: Response) {
+        if (!query) {
+            res.status(400).end('Query parameter is required');
+            return;
+        }
+
+        // SSE headers
+        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+
+        await this.llmAgentService.pipePythonSSE(query, res);
     }
 }

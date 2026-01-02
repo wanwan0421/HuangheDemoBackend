@@ -8,14 +8,16 @@ import { ResourceService } from 'src/resource/resource.service';
 import { ModelResource } from 'src/resource/schemas/modelResource.schema';
 import { Observable } from 'rxjs';
 import { HttpService } from '@nestjs/axios';
-import { response } from 'express';
+import { Response } from 'express';
+import axios from 'axios';
 
 @Injectable()
 export class LlmAgentService {
-    constructor(private readonly indexService: IndexService,
+    constructor(
+        private readonly indexService: IndexService,
         private readonly genAIService: GenAIService,
         private readonly resourceService: ResourceService,
-        private readonly httpsService: HttpService
+        private readonly httpsService: HttpService,
     ) {}
 
     /**
@@ -23,7 +25,7 @@ export class LlmAgentService {
      * @param prompt 用户输入
      * @returns 
      */
-    getSystemErrorName(query: string): Observable<{ data: any}> {
+    getSystemErrorName(query: string): Observable<{ event?: string; data: any}> {
         // 每一次observer.next()就推送一个SSE事件
         return new Observable((observer) => {
             // 调用Python FastAPI后端接口
@@ -39,27 +41,54 @@ export class LlmAgentService {
                     observer.next({ data: { type: "heartbeat", message: "keep-alive"} });
                 }, 20000);
 
-                // 处理SSE chunk
+                // 处理SSE chunk（保留 event 行，避免被丢弃 token 等命名事件）
                 response.data.on('data', (chunk: Buffer) => {
                     buffer += chunk.toString();
-                    let index;
-                    while ((index = buffer.indexOf('\n\n')) >= 0) {
-                        const block = buffer.slice(0, index);
-                        buffer = buffer.slice(index + 2);
+                    let sepIndex = -1;
 
-                        block.split('\n').forEach((line) => {
-                            if (line.startsWith('data: ')) {
-                                try {
-                                    const jsonStr = line.replace(/^data: /, '');
-                                    if (jsonStr.trim()) {
-                                        const data = JSON.parse(jsonStr);
-                                        observer.next({ data });
-                                    }
-                                } catch (err) {
-                                    console.warn('SSE JSON parse error:', err);
-                                }
+                    // 兼容 \n\n 与 \r\n\r\n
+                    while (true) {
+                        const nn = buffer.indexOf('\n\n');
+                        const rrnn = buffer.indexOf('\r\n\r\n');
+                        if (nn === -1 && rrnn === -1) {
+                            sepIndex = -1;
+                        } else if (nn === -1) {
+                            sepIndex = rrnn;
+                        } else if (rrnn === -1) {
+                            sepIndex = nn;
+                        } else {
+                            sepIndex = Math.min(nn, rrnn);
+                        }
+
+                        if (sepIndex < 0) break;
+
+                        const block = buffer.slice(0, sepIndex);
+                        // 跳过分隔符长度
+                        const sepLen = buffer.startsWith('\r\n', sepIndex) ? 4 : 2;
+                        buffer = buffer.slice(sepIndex + sepLen);
+
+                        let eventName: string | undefined;
+                        const dataLines: string[] = [];
+
+                        block.split(/\r?\n/).forEach((rawLine) => {
+                            const line = rawLine.trim();
+                            if (!line) return;
+                            if (line.startsWith('event:')) {
+                                eventName = line.replace(/^event:\s*/, '');
+                            } else if (line.startsWith('data:')) {
+                                dataLines.push(line.replace(/^data:\s*/, ''));
                             }
                         });
+
+                        if (dataLines.length) {
+                            const jsonStr = dataLines.join('\n');
+                            try {
+                                const data = JSON.parse(jsonStr);
+                                observer.next(eventName ? { event: eventName, data } : { data });
+                            } catch (err) {
+                                console.warn('SSE JSON parse error:', err);
+                            }
+                        }
                     }
                 });
 
@@ -74,8 +103,45 @@ export class LlmAgentService {
                 });
             }).catch((err) => {
                 observer.next({ data: { type: "error", message: err.message} });
-                observer.complete;
+                observer.complete();
             });
+        });
+    }
+
+    async pipePythonSSE(query: string, res: any) {
+        const pythonUrl = `${process.env.agentUrl}/stream?query=${encodeURIComponent(query)}`;
+
+        const pythonRes = await axios({
+            method: 'GET',
+            url: pythonUrl,
+            responseType: 'stream',
+            headers: {
+                Accept: 'text/event-stream',
+            },
+        });
+
+        // 管道传输数据到客户端
+        pythonRes.data.on('data', (chunk: Buffer) => {
+            res.write(chunk);
+        });
+
+        pythonRes.data.on('end', () => {
+            res.end();
+        });
+
+        pythonRes.data.on('error', (err: any) => {
+            res.write(
+                `event: error\ndata: ${JSON.stringify({
+                    type: 'error',
+                    message: err.message,
+                })}\n\n`,
+            );
+            res.end();
+        });
+
+        // 浏览器断开时，关闭 Python 流
+        res.on('close', () => {
+            pythonRes.data.destroy();
         });
     }
 
@@ -303,4 +369,5 @@ export class LlmAgentService {
             return null;
         }
     }
+
 }

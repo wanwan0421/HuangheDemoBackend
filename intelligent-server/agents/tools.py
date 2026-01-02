@@ -48,13 +48,7 @@ class CustomHTTPEmbeddings(Embeddings):
 
         data = resp.json()
 
-        return data["data"][0]["embedding"]     
-
-# embedding_model = CustomHTTPEmbeddings(
-#     model="gemini-embedding-001",
-#     api_key="AIzaSyCxGIwvgtl1N6-Fd5ADkn4qOA48diGgfOo",
-#     base_url="https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
-#     )
+        return data["data"][0]["embedding"]
 
 # 初始化模型
 load_dotenv()

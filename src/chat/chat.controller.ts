@@ -51,9 +51,9 @@ export class ChatController {
   }
 
   // 带记忆的 SSE
-  @Sse('sessions/:id/chat')
+  @Sse('sessions/:sessionId/chat')
   chatWithSession(
-    @Param('id') sessionId: string,
+    @Param('sessionId') sessionId: string,
     @Query('query') query: string,
   ): Observable<{ event?: string; data: any }> {
     if (!query) {

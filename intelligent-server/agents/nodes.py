@@ -4,6 +4,12 @@ from langchain.messages import ToolMessage, HumanMessage, SystemMessage, AnyMess
 from langgraph.graph import StateGraph, START, END
 import operator
 import json
+from pymongo import MongoClient
+from langgraph.checkpoint.mongodb import MongoDBSaver
+
+# 连接配置
+MONGO_URI = "mongodb://localhost:27017/"
+DB_NAME = "huanghe-demo"
 
 class AgentState(TypedDict):
     messages: Annotated[list[AnyMessage], operator.add]
@@ -92,4 +98,8 @@ agent_builder.add_conditional_edges(
     ["tool_node", END]
 )
 agent_builder.add_edge("tool_node", "llm_node")
-agent = agent_builder.compile()
+
+mongo_client = MongoClient(MONGO_URI)
+checkpointer = MongoDBSaver(mongo_client)
+
+agent = agent_builder.compile(checkpointer=checkpointer)

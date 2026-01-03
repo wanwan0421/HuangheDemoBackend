@@ -154,10 +154,13 @@ def map_agent_event(event: Dict[str, Any], root_started_ref, root_finished_ref) 
     return None
 
 @app.get("/api/agent/stream")
-async def stream_agent(query: str):
-    print("Received stream query:", query)
+async def stream_agent(query: str, sessionId: Optional[str] = None):
+    print("Received stream query:", query, "sessionId:", sessionId)
     if not query:
         raise HTTPException(status_code=400, detail="query is required")
+
+    # 使用 LangGraph checkpointer 的 thread_id
+    thread_id = sessionId or str(uuid.uuid4())
 
     async def event_generator():
         init_input = {
@@ -177,7 +180,12 @@ async def stream_agent(query: str):
 
             async for mode, chunk in agent.astream(
                 init_input,
-                stream_mode=["messages", "updates", "custom"]
+                stream_mode=["messages", "updates", "custom"],
+                config={
+                    "configurable": {
+                        "thread_id": thread_id
+                    }
+                }
             ):
                 if mode == "messages":
                     if isinstance(chunk, tuple):

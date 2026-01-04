@@ -177,45 +177,57 @@ export class ChatService {
             this.getSystemStream(query, sessionId).subscribe({
                 next: (event) => {
                     observer.next(event);
-                    if (event.data?.type === 'token') {
-                        aiResponse += event.data.message || '';
+                    const payload = event.data;
+                    console.log('Received payload:', payload);
+                    if (payload?.type === 'token') {
+                        aiResponse += payload.message || '';
                     }
-                    if (event.data?.tool) {
-                        tools.push(event.data);
+                    if (payload?.tool) {
+                        tools.push(payload);
                     }
-                    if (event.data?.type === 'model_details_end') {
-                        finalModelData = event.data.data;
+                    if (payload.type === 'model_details_end' && payload.data) {
+                        finalModelData = payload.data;
+                        this.sessionModel.findByIdAndUpdate(sessionId, {
+                            recommendedModel: {
+                                name: finalModelData.name,
+                                description: finalModelData.description,
+                                workflow: finalModelData.workflow,
+                            },
+                            updatedAt: new Date(),
+                        }).exec().then(() => console.log('Model details pre-saved.')).catch(err => console.error('Pre-save error:', err));
                     }
                 },
                 complete: async () => {
-                    try {
-                        // 并行执行：保存AI消息和更新模型详情
-                        const tasks: Promise<any>[] = [];
-
-                        if (aiResponse) {
-                            tasks.push(this.saveMessage(sessionId, 'AI', aiResponse, tools.length ? tools : undefined).catch(() => undefined));
-                        }
-
-                        if (finalModelData) {
-                            tasks.push(
-                                this.sessionModel.findByIdAndUpdate(sessionId, {
-                                    recommendedModel: {
-                                        name: finalModelData.name,
-                                        description: finalModelData.description,
-                                        workflow: finalModelData.workflow,
-                                    },
-                                    updatedAt: new Date(),
-                                }).exec()
-                            );
-                        }
-                        await Promise.all(tasks);
-                    } catch (err) {
-                        console.error('Error saving AI message or updating model details:', err);
-                    }
+                    await this.persistFinalData(sessionId, aiResponse, tools, finalModelData);
                     observer.complete();
                 },
-                error: (err) => observer.error(err),
+                error: async (err) => {
+                    console.error('SSE Stream Interrupted:', err.message);
+                    // 即便断开了，也要把已经拿到的部分 AI 回答存入数据库
+                    await this.persistFinalData(sessionId, aiResponse, tools, finalModelData);
+                    observer.error(err);
+                },
             });
         });
+    }
+
+    // 提取公共保存逻辑
+    private async persistFinalData(sessionId: string, aiResponse: string, tools: any[], modelData: any) {
+        try {
+            const tasks: Promise<any>[] = [];
+            if (aiResponse || tools.length > 0) {
+                tasks.push(this.saveMessage(sessionId, 'AI', aiResponse, tools.length ? tools : undefined));
+            }
+            // 如果 next 中没存成功，这里作为兜底
+            if (modelData) {
+                tasks.push(this.sessionModel.findByIdAndUpdate(sessionId, {
+                    recommendedModel: modelData,
+                    updatedAt: new Date(),
+                }).exec());
+            }
+            await Promise.all(tasks);
+        } catch (e) {
+            console.error('Final persistence failed:', e);
+        }
     }
 }

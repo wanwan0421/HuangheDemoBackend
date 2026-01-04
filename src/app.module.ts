@@ -9,6 +9,7 @@ import { LlmAgentModule } from './llm-agent/llm-agent.module';
 import { IndexModule } from './index/index.module';
 import { GenAIModule } from './genai/genai.module';
 import { ChatModule } from './chat/chat.module';
+import { ModelRunnerModule } from './model/model.module';
 
 @Module({
   imports: [
@@ -28,7 +29,8 @@ import { ChatModule } from './chat/chat.module';
     LlmAgentModule,
     IndexModule,
     GenAIModule,
-    ChatModule],
+    ChatModule,
+    ModelRunnerModule],
   controllers: [AppController],
   providers: [AppService],
 })

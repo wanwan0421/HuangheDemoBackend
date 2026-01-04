@@ -3,6 +3,8 @@
 /node_modules
 /build
 /intelligent-server/intelligent-server
+/model-scripts/json-scripts
+/model-scripts/uploads
 
 # Logs
 logs
@@ -42,6 +44,11 @@ lerna-debug.log*
 .env.test.local
 .env.production.local
 .env.local
+
+# Configuration files (sensitive data)
+config.ini
+config.*.ini
+*.config.json
 
 # temp directory
 .temp

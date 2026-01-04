@@ -21,13 +21,6 @@ export class Message {
 
     @Prop({ default: Date.now })
     timestamp: Date;
-
-    @Prop({ type: Object })
-    recommendedModel?: {
-        name: string;
-        description: string;
-        workflow: any[];
-    };
 }
 
 export const MessageSchema = SchemaFactory.createForClass(Message);

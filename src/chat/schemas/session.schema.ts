@@ -5,23 +5,30 @@ export type SessionDocument = HydratedDocument<Session>;
 
 @Schema({ timestamps: true })
 export class Session {
-  @Prop({ required: true })
-  title: string;
+    @Prop({ required: true })
+    title: string;
 
-  @Prop()
-  userId?: string;
+    @Prop()
+    userId?: string;
 
-  @Prop({ default: 0 })
-  messageCount: number;
+    @Prop({ default: 0 })
+    messageCount: number;
 
-  @Prop()
-  lastMessage?: string;
+    @Prop()
+    lastMessage?: string;
 
-  @Prop({ default: Date.now })
-  createdAt: Date;
+    @Prop({ default: Date.now })
+    createdAt: Date;
 
-  @Prop({ default: Date.now })
-  updatedAt: Date;
+    @Prop({ default: Date.now })
+    updatedAt: Date;
+
+    @Prop({ type: Object })
+    recommendedModel?: {
+        name: string;
+        description: string;
+        workflow: any[];
+    };
 }
 
 export const SessionSchema = SchemaFactory.createForClass(Session);

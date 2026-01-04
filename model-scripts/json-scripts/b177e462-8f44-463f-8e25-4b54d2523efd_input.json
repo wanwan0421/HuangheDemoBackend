@@ -1,0 +1,30 @@
+{
+  "modelName": "UrbanM2M计算模型",
+  "lists": [
+    {
+      "StateName": "run",
+      "EventName": "st_year",
+      "Data": "2006"
+    },
+    {
+      "StateName": "run",
+      "EventName": "first_sim_year",
+      "Data": "2012"
+    },
+    {
+      "StateName": "run",
+      "EventName": "out_len",
+      "Data": "6"
+    },
+    {
+      "StateName": "run",
+      "EventName": "land_demands",
+      "Data": "129085,166343,81777,68116,54796,45709"
+    },
+    {
+      "StateName": "run",
+      "EventName": "Years_zip",
+      "Data": "G:\\LWH\\model\\huanghe-demo-back\\model-scripts\\uploads\\1767534980438-990555497-sz.zip"
+    }
+  ]
+}

@@ -29,14 +29,13 @@ def run():
         # 运行模型
         taskServer = openModel.OGMSTaskAccess(modelName=modelName)
         result = taskServer.createTaskWithURL(params_with_url=lists)
-        # result = taskServer.createTask(params=lists)
+        print("result:", result)
 
         # 下载结果
-        download_result = taskServer.downloadAllData()
+        # download_result = taskServer.downloadAllData()
         final_output = {
             "status": "success",
-            "download_result": download_result,
-            "task_result": result
+            "result": getattr(result, "data", result),
         }
         print(json.dumps(final_output))
 

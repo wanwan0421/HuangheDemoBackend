@@ -412,6 +412,46 @@ class OGMSTask(Service):
             print("数据上传失败！请稍后重试！")
             sys.exit(0)
 
+    def normalizeInputData(self, params: dict) -> dict:
+        """
+        支持三种输入：
+        - { value: xxx }
+        - { path: /local/file }
+        - { url: http://xxx }
+        统一转换成 mergeData 可识别的结构
+        """
+        normalized_params = {}
+
+        for state, events in params.items():
+            normalized_params[state] = {}
+            for event, event_data in events.items():
+                if "value" in event_data:
+                    # 直接使用 value
+                    normalized_params[state][event] = {
+                        "value": event_data["value"]
+                    }
+                elif "path" in event_data:
+                    # 上传本地文件并获取 URL
+                    file_path = event_data["path"]
+                    file_name = os.path.basename(file_path)
+                    file_url = self.getUploadData(file_path)
+                    normalized_params[state][event] = {
+                        "name": file_name,
+                        "url": file_url,
+                    }
+                elif "url" in event_data:
+                    # 直接使用提供的 URL
+                    normalized_params[state][event] = {
+                        "name": event_data.get("name", ""),
+                        "url": event_data["url"],
+                    }
+                else:
+                    print(
+                        f"Invalid input format for state '{state}', event '{event}'."
+                    )
+                    sys.exit(1)
+        return normalized_params
+
     # ! download result by state and event
     def downloadResultByStateEvent(self, state: str, event: str, path: str) -> bool:
         pass
@@ -693,6 +733,32 @@ class OGMSTaskAccess(Service):
         self.subscribeTask(task)
         result = task.wait4Finish()
         self.outputs = json.loads(result.data)["outputs"]
+        return ResultUtils.success(data=self.outputs)
+    
+    def createTaskAuto(self, params: dict) -> ResultUtils:
+        # create task
+        task = OGMSTask()
+
+        # resolving MDL
+        r = task.resolvingMDL(self.mdlData)
+        if r.code != 1:
+            return r
+        
+        normalized_params = task.normalizeInputData(params)
+
+        lists = {
+            "inputs": normalized_params,
+            "username": task.username,
+        }
+
+        # 直接构造符合 mergeData 期望的输入格式
+        c = task.mergeData(lists)
+        if c.code != 1:
+            return c
+        self.subscribeTask(task)
+        result = task.wait4Finish()
+        self.outputs = json.loads(result.data)["outputs"]
+        print(self.outputs)
         return ResultUtils.success(data=self.outputs)
 
 class OGMSDownload:

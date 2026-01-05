@@ -50,19 +50,20 @@ export class ModelRunnerController {
       Object.keys(body).forEach(key => {
         if (key === 'info') return;
         if (key.includes('@@@')) {
-          const [stateName, eventName, inputName] = key.split('@@@');
+          const [stateName, eventName, inputName, inputType] = key.split('@@@');
           this.ensureStructure(formattedRequest.states, stateName);
           formattedRequest.states[stateName][eventName] = {
             name: inputName,
+            type: inputType,
             value: body[key],
           };
         }
       });
 
-      // 处理文件字段（来自 files）
+      // 处理文件字段（来自files）
       if (files) {
         files.forEach(file => {
-          const [stateName, eventName, inputName] = file.fieldname.split('@@@');
+          const [stateName, eventName, inputName, inputType] = file.fieldname.split('@@@');
           this.ensureStructure(formattedRequest.states, stateName);
           // 将本地存储路径存入，供后续Python驱动读取
           formattedRequest.states[stateName][eventName] = {

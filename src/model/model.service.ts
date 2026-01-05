@@ -3,10 +3,11 @@ import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import * as fs from 'fs';
 import * as path from 'path';
+import FormData from 'form-data';
+import fetch from 'node-fetch';
 import { spawn } from 'child_process';
 import { CreateModelRunRequest } from './dto/create-model-run.dto';
 import { ModelRunRecord, ModelRunRecordDocument } from './schemas/model-run-record.schema';
-import { generateTaskId } from './utils/task-id.util';
 
 @Injectable()
 export class ModelRunnerService {
@@ -101,7 +102,7 @@ export class ModelRunnerService {
     * @returns JSON文件路径
   */
   private async generateInputJson(taskId: string, request: CreateModelRunRequest): Promise<string> {
-    const lists = this.buildRunLists(request.states);
+    const lists = await this.buildRunLists(request.states);
 
     // 构造传递给Python的完整数据包
     const inputData = {
@@ -119,32 +120,95 @@ export class ModelRunnerService {
     * @param states 状态及其事件数据
     * @returns 构建好的run对象
   */
-  private buildRunLists(states: Record<string, Record<string, any>>): Record<string, any> {
+  private async buildRunLists(states: Record<string, Record<string, any>>): Promise<Record<string, any>> {
     const run: Record<string, any> = {};
 
     for (const [stateName, events] of Object.entries(states)) {
       run[stateName] = {};
 
       for (const [eventName, eventData] of Object.entries(events)) {
-        // 文件型参数
-        if (eventData.url || eventData.filePath) {
-          const filePath = eventData.url ?? eventData.filePath;
+        // 本地文件型参数，需要先上传至数据中转服务器
+        if (eventData.filePath) {
+
+          const filePath = eventData.filePath;
+          const fileUrl = await this.uploadFileToDataServer(filePath);
 
           run[stateName][eventName] = {
             name: eventData.name ?? path.basename(filePath),
-            url: filePath,
+            url: fileUrl,
+          };
+        }
+        // 已经有url的文件直接使用
+        else if (eventData.url) {
+          run[stateName][eventName] = {
+            name: eventData.name,
+            url: eventData.url,
           };
         }
         // 数值 / 字符串参数
         else if (eventData.value !== undefined) {
+          const xmlFileUrl = await this.uploadValueAsXml(eventName, 'String', eventData.value);
           run[stateName][eventName] = {
-            value: String(eventData.value),
+            name: eventData.name,
+            url: xmlFileUrl,
+            value: eventData.value,
           };
         }
       }
     }
 
     return run;
+  }
+
+  /**
+   * 上传文件到数据中转服务器
+   * @param filePath 本地文件路径
+   * @returns 远程文件URL
+   */
+  private async uploadFileToDataServer(filePath: string): Promise<string> {
+    try {
+      const form = new FormData();
+      form.append('datafile', fs.createReadStream(filePath));
+
+      const response = await fetch(`http://${process.env.dataServer}:${process.env.dataPort}/data`, {
+        method: 'POST',
+        body: form,
+        headers: form.getHeaders(),
+      });
+
+      const responseData = await response.json() as any;
+      console.log('上传文件响应:', responseData);
+
+      if (responseData.code === 1 && responseData.data?.id) {
+        return `http://geomodeling.njnu.edu.cn/dataTransferServer/data/${responseData.data.id}`;
+      } else {
+        throw new Error(`上传文件失败: ${responseData.data.message || '未知错误'}`);
+      }
+    } catch (error) {
+      throw new Error(`上传文件异常: ${error.message}`);
+    }
+  }
+
+  /**
+   * 将数值或字符串参数生成XML文件并上传
+   * @param eventName 事件名称
+   * @param type 参数类型
+   * @param value 参数值
+   * @returns XML文件URL
+   */
+  private async uploadValueAsXml(eventName: string, type: string, value: string): Promise<string> {
+    // 生成临时xml文件
+    const tmpXmlPath = path.join(this.jsonScriptsDir, `${crypto.randomUUID()}_${eventName}.xml`);
+    const xmlContent = `<Dataset>\n  <XDO name="${eventName}" kernelType="${type}" value="${value}" />\n</Dataset>`;
+    await fs.promises.writeFile(tmpXmlPath, xmlContent, 'utf-8');
+
+    // 上传至数据服务器
+    const fileUrl = await this.uploadFileToDataServer(tmpXmlPath);
+
+    // 删除临时文件
+    fs.unlinkSync(tmpXmlPath);
+
+    return fileUrl;
   }
 
   /**
@@ -191,12 +255,15 @@ export class ModelRunnerService {
           throw new Error(result.message || '模型执行出错');
         }
 
-        // 更新状态为完成
+        // 规范化结果结构，方便后续查询和展示
+        const taskResult = result.result;
+
+        // 更新状态为完成，存储结构化字段
         await this.modelRunRecordModel.updateOne(
           { _id: recordId },
           {
             status: 'Finished',
-            result: result,
+            result: taskResult,
             FinishedAt: new Date(),
           },
         );

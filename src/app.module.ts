@@ -10,6 +10,7 @@ import { IndexModule } from './index/index.module';
 import { GenAIModule } from './genai/genai.module';
 import { ChatModule } from './chat/chat.module';
 import { ModelRunnerModule } from './model/model.module';
+import { DataMappingModule } from './data-mapping/data-mapping.module';
 
 @Module({
   imports: [
@@ -30,7 +31,8 @@ import { ModelRunnerModule } from './model/model.module';
     IndexModule,
     GenAIModule,
     ChatModule,
-    ModelRunnerModule],
+    ModelRunnerModule,
+    DataMappingModule],
   controllers: [AppController],
   providers: [AppService],
 })

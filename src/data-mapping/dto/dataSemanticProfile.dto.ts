@@ -7,7 +7,8 @@ import { ParameterProfile } from './parameterProfile.dto';
 export interface DataSemanticProfile {
   // 第一层：最小通用语义内核
   id: string
-  form: 'Raster' | 'Vector' | 'Table' | 'Timeseries' | 'Parameter'
+  format: string
+  form: 'Raster' | 'Vector' | 'Table' | 'Timeseries' | 'Parameter' | 'Unknown'
   spatial?: {
     crs?: string
     extent?: [number, number, number, number]
@@ -27,4 +28,10 @@ export interface DataSemanticProfile {
 
   // 第三层：领域语义扩展
   domain?: string
+}
+
+export interface DatasetPackage {
+    rootPath: string;
+    files: string[];
+    primaryFile?: string;
 }

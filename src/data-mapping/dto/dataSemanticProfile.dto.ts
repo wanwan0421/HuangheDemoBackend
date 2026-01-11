@@ -35,3 +35,9 @@ export interface DatasetPackage {
     files: string[];
     primaryFile?: string;
 }
+
+export interface DataFormCandidate {
+    form: 'Raster' | 'Vector' | 'Table' | 'Timeseries' | 'Parameter' | 'Unknown';
+    primaryFile: string;
+    confidence: number;
+}

@@ -1,12 +1,22 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { DataSemanticProfile, DatasetPackage } from './dto/dataSemanticProfile.dto';
+import { DataFormCandidate, DataSemanticProfile, DatasetPackage } from './dto/dataSemanticProfile.dto';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as unzipper from 'unzipper';
+import { spawn } from 'child_process';
 
 @Injectable()
 export class DataMappingService {
     private readonly logger = new Logger(DataMappingService.name);
+    private readonly pythonInspectorScript = path.join(__dirname, 'data-inspector.py');
+    private readonly pythonExe = path.join(__dirname, '..', '..', '..', 'venv', 'Scripts', 'python.exe');
+
+    /**
+     * 生成数据ID
+     */
+    private generateDataId(seed: string) {
+        return `data_${Date.now()}_${seed}`;
+    }
 
     /**
      * 分析上传的数据文件并生成语义描述协议
@@ -16,8 +26,8 @@ export class DataMappingService {
     async analyzeUploadedData(filePath: string): Promise<DataSemanticProfile> {
         try {
             const pkg = await this.buildDatasetPackage(filePath);
-            // 判断数据类型
-            const { form, primaryFile } = this.inferDataForm(pkg);
+            // 判断数据类型（第一阶段扩展名推断 + 第二阶段内容细化）
+            const { form, primaryFile, confidence } = await this.inferDataForm(pkg);
 
             // 构建基础语义画像
             const profile: DataSemanticProfile = {
@@ -45,7 +55,7 @@ export class DataMappingService {
                     break;
             }
 
-            this.logger.log(`成功分析数据文件: ${primaryFile}, 类型: ${form}`);
+            this.logger.log(`成功分析数据文件: ${primaryFile}, 类型: ${form} (置信度: ${confidence.toFixed(2)})`);
             return profile;
         } catch (error) {
             this.logger.error(`分析数据文件失败: ${error.message}`, error.stack);
@@ -112,213 +122,410 @@ export class DataMappingService {
     }
 
     /**
-     * 推断数据形式
+     * 推断数据形式 - 整合两个阶段
+     * @param pkg 数据包信息
+     * @return 数据形式及置信度
      */
-    private inferDataForm(pkg: DatasetPackage): {form: 'Raster' | 'Vector' | 'Table' | 'Timeseries' | 'Parameter' | 'Unknown'; primaryFile?: string} {
-        const extensions = pkg.files.map(f => path.extname(f).toLowerCase());
-
-        // Parameter 优先级最高
-        if (extensions.includes('.xml')) {
-            return {
-                form: 'Parameter',
-                primaryFile: pkg.files.find(f => f.endsWith('.xml'))
-            };
+    private async inferDataForm(pkg: DatasetPackage): Promise<DataFormCandidate> {
+        // 第一阶段：基于扩展名推断
+        const { candidates, primaryFile } = this.inferDataFormByExtension(pkg);
+        
+        if (!primaryFile) {
+            return this.confirmDataForm(candidates);
         }
 
-        // Vector: Shapefile
-        if (['.shp', '.shx', '.dbf'].every(ext => extensions.includes(ext))) {
-            return {
-                form: 'Vector',
-                primaryFile: pkg.files.find(f => f.endsWith('.shp'))
-            };
-        }
-
-        // Vector: 单文件
-        const vectorExtensions = ['.geojson', '.json', '.kml', '.gml'];
-        const vector = pkg.files.find(f => vectorExtensions.includes(path.extname(f).toLowerCase()));
-        if (vector) {
-            return {
-                form: 'Vector',
-                primaryFile: vector
-            };
-        }
-
-        // Raster
-        const rasterExtensions = ['.tif', '.tiff', '.geotiff', '.img', '.hdf', '.asc', 'vrt'];
-        const raster = pkg.files.find(f => rasterExtensions.includes(path.extname(f).toLowerCase()));
-        if (raster) {
-            return {
-                form: 'Raster',
-                primaryFile: raster
-            };
-        }
-            
-        // Table
-        const tableExtensions = ['.csv', '.xlsx', '.xls'];
-        const table = pkg.files.find(f => tableExtensions.includes(path.extname(f).toLowerCase()));
-        if (table) {
-            return {
-                form: 'Table',
-                primaryFile: table
-            };
-        }
-
-        // Timeseries
-        const timeseriesExtensions = ['.nc', '.txt', '.dat'];
-        const timeseries = pkg.files.find(f => timeseriesExtensions.includes(path.extname(f).toLowerCase()));
-        if (timeseries) {
-            return {
-                form: 'Timeseries',
-                primaryFile: timeseries
-            };
-        }
-
-        return {
-            form: 'Unknown',
-            primaryFile: ''
-        };
+        // 第二阶段：基于内容细化判断
+        const refinedCandidates = await this.refineDataFormByContent(primaryFile, candidates);
+        
+        // 合并结果
+        return this.confirmDataForm(refinedCandidates);
     }
 
     /**
-     * 生成数据ID
+     * 第一阶段：基于扩展名推断数据形式
+     * @param pkg 数据包信息
+     * @return 候选数据形式列表及主要文件
      */
-    private generateDataId(seed: string) {
-        return `data_${Date.now()}_${seed}`;
+    private inferDataFormByExtension(pkg: DatasetPackage): {candidates: DataFormCandidate[]; primaryFile?: string;} {
+        const candidates: DataFormCandidate[] = [];
+        const extensions = pkg.files.map(f => path.extname(f).toLowerCase());
+
+        // Parameter (XML 文件 - 最高优先级)
+        const xmlFile = pkg.files.find(f => f.endsWith('.xml'));
+        if (xmlFile) {
+            candidates.push({
+                form: 'Parameter',
+                primaryFile: xmlFile,
+                confidence: 0.95
+            });
+            return { candidates, primaryFile: xmlFile };
+        }
+
+        // Vector: Shapefile (多文件组合)
+        if (['.shp', '.shx', '.dbf'].every(ext => extensions.includes(ext))) {
+            candidates.push({
+                form: 'Vector',
+                primaryFile: pkg.files.find(f => f.endsWith('.shp')) || '',
+                confidence: 0.95
+            });
+            return { candidates, primaryFile: pkg.files.find(f => f.endsWith('.shp')) };
+        }
+
+        // Vector: KML, GML
+        const kmlGmlFile = pkg.files.find(f => {
+            const ext = path.extname(f).toLowerCase();
+            return ['.kml', '.gml'].includes(ext);
+        });
+        if (kmlGmlFile) {
+            candidates.push({
+                form: 'Vector',
+                primaryFile: kmlGmlFile,
+                confidence: 0.9
+            });
+            return { candidates, primaryFile: kmlGmlFile };
+        }
+
+        // GeoJSON (可能是Vector，需要第二阶段确认)
+        const geojsonFile = pkg.files.find(f => f.endsWith('.geojson'));
+        if (geojsonFile) {
+            candidates.push({
+                form: 'Vector',
+                primaryFile: geojsonFile,
+                confidence: 0.9
+            });
+            return { candidates, primaryFile: geojsonFile };
+        }
+
+        // 歧义文件：.json可能是Vector或Table
+        const jsonFile = pkg.files.find(f => f.endsWith('.json'));
+        if (jsonFile) {
+            candidates.push(
+                { form: 'Vector', primaryFile: jsonFile, confidence: 0.5 },
+                { form: 'Table', primaryFile: jsonFile, confidence: 0.3 }
+            );
+            return { candidates, primaryFile: jsonFile };
+        }
+
+        // 明确的Raster文件
+        const rasterExtensions = ['.tif', '.tiff', '.geotiff', '.img', '.asc', '.vrt'];
+        const rasterFile = pkg.files.find(f => rasterExtensions.includes(path.extname(f).toLowerCase()));
+        if (rasterFile) {
+            candidates.push({
+                form: 'Raster',
+                primaryFile: rasterFile,
+                confidence: 0.9
+            });
+            return { candidates, primaryFile: rasterFile };
+        }
+
+        // 歧义文件：.hdf可能是 Raster或Timeseries
+        const hdfFile = pkg.files.find(f => f.endsWith('.hdf'));
+        if (hdfFile) {
+            candidates.push(
+                { form: 'Raster', primaryFile: hdfFile, confidence: 0.5 },
+                { form: 'Timeseries', primaryFile: hdfFile, confidence: 0.5 }
+            );
+            return { candidates, primaryFile: hdfFile };
+        }
+
+        // 表格数据
+        const tableExtensions = ['.csv', '.xlsx', '.xls'];
+        const tableFile = pkg.files.find(f => tableExtensions.includes(path.extname(f).toLowerCase()));
+        if (tableFile) {
+            candidates.push({
+                form: 'Table',
+                primaryFile: tableFile,
+                confidence: 0.85
+            });
+            // CSV可能包含地理坐标，需要第二阶段确认
+            if (tableFile.endsWith('.csv')) {
+                candidates.push({
+                    form: 'Vector',
+                    primaryFile: tableFile,
+                    confidence: 0.3
+                });
+            }
+            return { candidates, primaryFile: tableFile };
+        }
+
+        // 歧义文件：.nc可能是Timeseries或Raster
+        const ncFile = pkg.files.find(f => f.endsWith('.nc'));
+        if (ncFile) {
+            candidates.push(
+                { form: 'Timeseries', primaryFile: ncFile, confidence: 0.55 },
+                { form: 'Raster', primaryFile: ncFile, confidence: 0.55 }
+            );
+            return { candidates, primaryFile: ncFile };
+        }
+
+        // 其他时序格式
+        const timeseriesExtensions = ['.txt', '.dat'];
+        const timeseriesFile = pkg.files.find(f => timeseriesExtensions.includes(path.extname(f).toLowerCase()));
+        if (timeseriesFile) {
+            candidates.push({
+                form: 'Timeseries',
+                primaryFile: timeseriesFile,
+                confidence: 0.7
+            });
+            return { candidates, primaryFile: timeseriesFile };
+        }
+
+        return { candidates: [{ form: 'Unknown', primaryFile: '', confidence: 0 }] };
+    }
+
+    /**
+     * 第二阶段：基于文件内容细化判断，根据内容特征提高置信度或改变分类
+     * @param filePath 主要文件路径
+     * @param candidates 第一阶段候选结果
+     * @return 细化后的候选结果
+     */
+    private async refineDataFormByContent(filePath: string, candidates: DataFormCandidate[]): Promise<DataFormCandidate[]> {
+        try {
+            const inspectorResult = await this.executePythonInspector('detect', filePath);
+
+            // 根据Python驱动的输出调整置信度
+            if (!inspectorResult?.detected_form) {
+                return candidates;
+            }
+
+            return candidates.map(candidate => {
+                if (candidate.form === inspectorResult.detected_form) {
+                    return {
+                        ...candidate,
+                        confidence: Math.max(candidate.confidence, inspectorResult.confidence)
+                    };
+                }
+
+                return {
+                    ...candidate,
+                    confidence: Math.min(candidate.confidence, 0.2)
+                }
+            })
+        } catch (error) {
+            this.logger.warn(`第二阶段内容分析失败: ${error.message}`);
+            return candidates;
+        }
+    }
+
+    /**
+     * 执行Python驱动脚本
+     * @param jsonPath 输入JSON文件路径
+     * @returns 脚本执行结果
+    */
+    private async executePythonInspector(command: string, filePath: string, extraArgs: string[] = []): Promise<any> {
+        return new Promise((resolve, reject) => {
+            // 运行python：ogms_driver.py
+            const python = spawn(this.pythonExe, [this.pythonInspectorScript, command, filePath, ...extraArgs]);
+
+            let stdoutData = '';
+            let stderrData = '';
+
+            python.stdout.on('data', (data) => {
+                stdoutData += data.toString();
+            });
+
+            python.stderr.on('data', (data) => {
+                stderrData += data.toString();
+                this.logger.debug(`[Python Log]: ${data.toString().trim()}`);
+            });
+
+            python.on('close', (code) => {
+                if (code !== 0) {
+                    reject(new Error(`Python驱动脚本执行失败，退出码: ${code}, 错误: ${stderrData}`));
+                } else {
+                    try {
+                        const lines = stdoutData.trim().split('\n');
+                        const lastLine = lines[lines.length - 1];
+                        const result = JSON.parse(lastLine);
+                        resolve(result);
+                    } catch (error) {
+                        this.logger.error(`解析Python输出时出错: ${error.message}`);
+                        resolve({ rawOutput: stdoutData });
+                    }
+                }
+            });
+
+            python.on('error', (error) => {
+                reject(new Error(`执行Python驱动脚本时出错: ${error.message}`));
+            })
+        })
+    }
+
+    /**
+     * 合并两个阶段的结果，选出最可能的数据类型
+     */
+    private confirmDataForm(candidates: DataFormCandidate[]): DataFormCandidate {
+        if (candidates.length === 0) {
+            return { form: 'Unknown', primaryFile: '', confidence: 0 };
+        }
+
+        // 按置信度排序
+        const sorted = [...candidates].sort((a, b) => b.confidence - a.confidence);
+        const topCandidate = sorted[0];
+
+        // 如果置信度足够高，直接返回
+        if (topCandidate.confidence >= 0.8) {
+            return {
+                form: topCandidate.form as 'Raster' | 'Vector' | 'Table' | 'Timeseries' | 'Parameter' | 'Unknown',
+                primaryFile: topCandidate.primaryFile,
+                confidence: topCandidate.confidence
+            };
+        }
+
+        // 如果多个候选置信度接近，需要更多启发式规则
+        const topConfidence = topCandidate.confidence;
+        const similarCandidates = sorted.filter(c => Math.abs(c.confidence - topConfidence) < 0.1);
+
+        if (similarCandidates.length > 1) {
+            this.logger.warn(`多个类型候选置信度接近: ${similarCandidates.map(c => `${c.form}(${c.confidence})`).join(', ')}`);
+        }
+
+        return {
+            form: topCandidate.form as 'Raster' | 'Vector' | 'Table' | 'Timeseries' | 'Parameter' | 'Unknown',
+            primaryFile: topCandidate.primaryFile,
+            confidence: topCandidate.confidence
+        };
     }
 
     /**
      * 分析栅格数据
+     * @param filePath 文件路径
+     * @param profile 语义画像对象
      */
-    private async analyzeRasterData(
-        filePath: string,
-        profile: DataSemanticProfile,
-    ): Promise<void> {
-        // TODO: 使用 GDAL 或其他库读取栅格元数据
-        // 这里先设置基本结构，实际实现需要相应的库
-        profile.raster = {
-            // 以下字段需要从实际栅格文件中读取
-            // bands: undefined,
-            // resolution: undefined,
-            // nodata_value: undefined,
-            // color_interpretation: undefined,
-        };
+    private async analyzeRasterData(filePath: string, profile: DataSemanticProfile): Promise<void> {
+        // 调用Python脚本获取栅格详细信息
+        const inspectorResult = await this.executePythonInspector('extract', filePath, ['Raster']);
 
-        // 空间信息（待实现）
-        profile.spatial = {
-            // crs: undefined,
-            // extent: undefined,
-        };
-
-        // 语义描述（待LLM分析）
-        profile.semantic = '栅格数据 - 需要进一步语义分析';
+        // 映射结果到DataSemanticProfile
+        if (!inspectorResult.error) {
+            profile.raster = {
+                resolution: inspectorResult.resolution,
+                unit: inspectorResult.unit,
+                value_range: inspectorResult.value_range,
+                nodata: inspectorResult.nodata,
+                band_count: inspectorResult.band_count
+            };
+        }
     }
 
     /**
      * 分析矢量数据
+     * @param filePath 文件路径
+     * @param profile 语义画像对象
      */
-    private async analyzeVectorData(
-        filePath: string,
-        profile: DataSemanticProfile,
-    ): Promise<void> {
-        // TODO: 使用 GDAL/OGR 或 geojson 库读取矢量数据
-        const extension = path.extname(filePath).toLowerCase();
+    private async analyzeVectorData(filePath: string, profile: DataSemanticProfile): Promise<void> {
+        // 调用Python脚本获取矢量详细信息
+        const inspectorResult = await this.executePythonInspector('extract', filePath, ['Vector']);
 
-        if (extension === '.geojson' || extension === '.json') {
-            try {
-                const content = fs.readFileSync(filePath, 'utf-8');
-                const geoJson = JSON.parse(content);
-
-                profile.vector = {
-                    geometry_type: geoJson.features?.[0]?.geometry?.type || undefined,
-                    // fields: undefined, // 需要从 properties 中提取
-                    // feature_count: geoJson.features?.length,
-                };
-
-                // 尝试提取空间范围
-                // profile.spatial = this.extractSpatialInfoFromGeoJSON(geoJson);
-            } catch (error) {
-                this.logger.warn(`解析GeoJSON文件失败: ${error.message}`);
-            }
+        // 映射结果到DataSemanticProfile
+        if (!inspectorResult.error) {
+            profile.vector = {
+                geometry_type: inspectorResult.geometry_type,
+                topology_valid: inspectorResult.topology_valid,
+                attributes: inspectorResult.attributes
+            };
         }
-
-        profile.vector = profile.vector || {};
-        profile.semantic = '矢量数据 - 需要进一步语义分析';
     }
 
     /**
      * 分析表格数据
+     * @param filePath 文件路径
+     * @param profile 语义画像对象
      */
-    private async analyzeTableData(
-        filePath: string,
-        profile: DataSemanticProfile,
-    ): Promise<void> {
-        const extension = path.extname(filePath).toLowerCase();
+    private async analyzeTableData(filePath: string, profile: DataSemanticProfile): Promise<void> {
+        // 调用Python脚本获取表格详细信息
+        const inspectorResult = await this.executePythonInspector('extract', filePath, ['Table']);
 
-        if (extension === '.csv') {
-            try {
-                const content = fs.readFileSync(filePath, 'utf-8');
-                const lines = content.split('\n').filter((line) => line.trim());
-
-                if (lines.length > 0) {
-                    const headers = lines[0].split(',').map((h) => h.trim());
-
-                    profile.table = {
-                        // columns: headers.map(name => ({ name, type: undefined })),
-                        // row_count: lines.length - 1,
-                    };
-
-                    // 检查是否包含时间字段
-                    const hasTimeColumn = headers.some((h) =>
-                        /time|date|datetime|timestamp/i.test(h),
-                    );
-                    profile.temporal = {
-                        has_time: hasTimeColumn,
-                    };
-                }
-            } catch (error) {
-                this.logger.warn(`解析CSV文件失败: ${error.message}`);
-            }
+        // 映射结果到DataSemanticProfile
+        if (!inspectorResult.error) {
+            profile.table = {
+                primary_key: inspectorResult.primary_key,
+                time_field: inspectorResult.time_field
+            };
         }
-
-        profile.table = profile.table || {};
-        profile.semantic = '表格数据 - 需要进一步语义分析';
     }
 
     /**
      * 分析时序数据
+     * @param filePath 文件路径
+     * @param profile 语义画像对象
      */
-    private async analyzeTimeseriesData(
-        filePath: string,
-        profile: DataSemanticProfile,
-    ): Promise<void> {
-        // TODO: 分析时序数据结构
-        profile.timeseries = {
-            // time_column: undefined,
-            // value_columns: undefined,
-            // frequency: undefined,
-        };
+    private async analyzeTimeseriesData(filePath: string, profile: DataSemanticProfile): Promise<void> {
+        // 调用Python脚本获取时序详细信息
+        const inspectorResult = await this.executePythonInspector('extract', filePath, ['Timeseries']);
 
-        profile.temporal = {
-            has_time: true,
-            // time_range: undefined, // 需要从数据中提取
-        };
-
-        profile.semantic = '时序数据 - 需要进一步语义分析';
+        // 映射结果到DataSemanticProfile
+        if (!inspectorResult.error) {
+            profile.timeseries = {
+                time_step: inspectorResult.time_step,
+                aggregation: inspectorResult.aggregation,
+            };
+        }
     }
 
     /**
      * 分析参数数据
+     * @param filePath 文件路径
+     * @param profile 语义画像对象
      */
-    private async analyzeParameterData(
-        filePath: string,
-        profile: DataSemanticProfile,
-    ): Promise<void> {
-        // TODO: 解析参数文件
-        profile.parameter = {
-            // parameters: undefined,
-        };
+    private async analyzeParameterData(filePath: string, profile: DataSemanticProfile): Promise<void> {
+        try {
+            const content = fs.readFileSync(filePath, 'utf-8');
+            const xdoMatch =
+                content.match(/<XDO\s+([^\/>]+?)\s*\/>/i);
 
-        profile.semantic = '参数数据 - 需要进一步语义分析';
+            if (!xdoMatch) {
+                throw new Error('未找到 XDO 节点');
+            }
+            const attrText = xdoMatch[1];
+            const attrRegex = /(\w+)\s*=\s*"([^"]*)"/g;
+            const attrs: Record<string, string> = {};
+
+            let attrMatch;
+            while ((attrMatch = attrRegex.exec(attrText)) !== null) {
+                attrs[attrMatch[1]] = attrMatch[2];
+            }
+
+            // kernelType → value_type
+            const valueType = this.normalizeKernelType(attrs.kernelType);
+
+            profile.parameter = {
+                value_type: valueType,
+                unit: attrs.unit, // 如果 XML 中没有 unit，这里就是 undefined
+            };
+
+            profile.semantic = '模型参数定义（Parameter），用于模型运行配置';
+        } catch (error) {
+            this.logger.warn(`解析参数文件失败: ${error.message}`);
+            profile.parameter = undefined;
+            profile.semantic = '参数数据（解析失败）';
+        }
+    }
+
+    /**
+     * 规范化参数类型
+     * @param kernelType 原始类型字符串
+     * @returns 规范化后的类型
+     */
+    private normalizeKernelType(kernelType?: string,): 'int' | 'float' | 'string' | 'boolean' {
+        switch (kernelType?.toLowerCase()) {
+            case 'int':
+            case 'integer':
+                return 'int';
+
+            case 'float':
+            case 'double':
+            case 'number':
+                return 'float';
+
+            case 'bool':
+            case 'boolean':
+                return 'boolean';
+
+            case 'string':
+            default:
+                return 'string';
+        }
     }
 
     /**

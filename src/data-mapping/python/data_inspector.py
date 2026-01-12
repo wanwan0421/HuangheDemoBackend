@@ -118,6 +118,11 @@ def extract_raster(path):
             # value, range（采样计算）
             min_val, max_val = 0, 0
             try:
+                bounds = src.bounds
+                spatial = {
+                    "crs": str(src.crs) if src.crs else "Unknown",
+                    "extent": [bounds.left, bounds.bottom, bounds.right, bounds.top]
+                }
                 # 只读取概览或小块以提高速度
                 arr = src.read(1, out_shape=(1, int(src.height/10), int(src.width/10)))
                 # 排除nodata
@@ -129,6 +134,7 @@ def extract_raster(path):
                 pass
 
             return {
+                "spatial": spatial,
                 "resolution": {"x": abs(src.res[0]), "y": abs(src.res[1])},
                 "unit": src.units[0] if src.units and src.units[0] else "Unknown",
                 "value_range": [min_val,  max_val],
@@ -141,6 +147,11 @@ def extract_raster(path):
 def extract_vector(path):
     try:
         gdf = gpd.read_file(path)
+        bounds = gdf.total_bounds.tolist()
+        spatial = {
+            "crs": str(gdf.crs) if gdf.crs else "Unknown",
+            "extent": bounds
+        }
         
         # 映射Pandas类型到Node定义的类型
         type_map = {
@@ -167,6 +178,7 @@ def extract_vector(path):
             elif 'Polygon' in g_type: geom_type = 'Polygon'
 
         return {
+            "spatial": spatial,
             "geometry_type": geom_type,
             "topology_valid": bool(is_valid),
             "attributes": attrs

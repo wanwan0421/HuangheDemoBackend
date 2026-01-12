@@ -40,4 +40,5 @@ export interface DataFormCandidate {
     form: 'Raster' | 'Vector' | 'Table' | 'Timeseries' | 'Parameter' | 'Unknown';
     primaryFile: string;
     confidence: number;
+    llmDetails?: any;  // LLM补全的元数据
 }

@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as unzipper from 'unzipper';
 import { spawn } from 'child_process';
+import axios from 'axios';
 
 @Injectable()
 export class DataMappingService {
@@ -26,37 +27,33 @@ export class DataMappingService {
     async analyzeUploadedData(filePath: string): Promise<DataSemanticProfile> {
         try {
             const pkg = await this.buildDatasetPackage(filePath);
-            // 判断数据类型（第一阶段扩展名推断 + 第二阶段内容细化）
-            const { form, primaryFile, confidence } = await this.inferDataForm(pkg);
-
+            // 判断数据类型（第一阶段扩展名推断 + 第二阶段内容细化 + 第三阶段LLM辅助）
+            
+            // 第一阶段：基于扩展名推断
+            const { candidates, primaryFile } = this.inferDataFormByExtension(pkg);
+            
+            // 第二阶段：基于内容细化判断（使用Python inspector）
+            if (!primaryFile) {
+                throw new Error('无法确定主要数据文件');
+            }
+            const refinedCandidates = await this.refineDataFormByContent(primaryFile, candidates);
+            const initialFormResult = this.confirmDataForm(refinedCandidates);
+            
             // 构建基础语义画像
             const profile: DataSemanticProfile = {
-                id: this.generateDataId(primaryFile || 'unknown'),
+                id: this.generateDataId(primaryFile || 'Unknown'),
                 format: path.extname(primaryFile || '').toLowerCase(),
-                form: form,
+                form: initialFormResult.form,
             };
 
-            // 根据数据类型进行详细分析
-            switch (form) {
-                case 'Raster':
-                    await this.analyzeRasterData(filePath, profile);
-                    break;
-                case 'Vector':
-                    await this.analyzeVectorData(filePath, profile);
-                    break;
-                case 'Table':
-                    await this.analyzeTableData(filePath, profile);
-                    break;
-                case 'Timeseries':
-                    await this.analyzeTimeseriesData(filePath, profile);
-                    break;
-                case 'Parameter':
-                    await this.analyzeParameterData(filePath, profile);
-                    break;
-            }
+            // 第三阶段：深度元数据提取（使用Python inspector extract）
+            await this.executeDetailedAnalysis(initialFormResult.form, primaryFile || filePath, profile);
 
-            this.logger.log(`成功分析数据文件: ${primaryFile}, 类型: ${form} (置信度: ${confidence.toFixed(2)})`);
-            return profile;
+            // 第四阶段：LLM 语义精炼与补全
+            const finalProfile = await this.refineProfileWithLLM(profile, primaryFile || filePath);
+
+            this.logger.log(`成功分析数据: ${profile.id}, 最终类型: ${finalProfile.form}`);
+            return finalProfile;
         } catch (error) {
             this.logger.error(`分析数据文件失败: ${error.message}`, error.stack);
             throw error;
@@ -119,26 +116,6 @@ export class DataMappingService {
 
         scanDirectory(dirPath);
         return { rootPath: dirPath, files };
-    }
-
-    /**
-     * 推断数据形式 - 整合两个阶段
-     * @param pkg 数据包信息
-     * @return 数据形式及置信度
-     */
-    private async inferDataForm(pkg: DatasetPackage): Promise<DataFormCandidate> {
-        // 第一阶段：基于扩展名推断
-        const { candidates, primaryFile } = this.inferDataFormByExtension(pkg);
-        
-        if (!primaryFile) {
-            return this.confirmDataForm(candidates);
-        }
-
-        // 第二阶段：基于内容细化判断
-        const refinedCandidates = await this.refineDataFormByContent(primaryFile, candidates);
-        
-        // 合并结果
-        return this.confirmDataForm(refinedCandidates);
     }
 
     /**
@@ -388,6 +365,19 @@ export class DataMappingService {
     }
 
     /**
+     * 统一执行详细分析的封装
+     */
+    private async executeDetailedAnalysis(form: string, filePath: string, profile: DataSemanticProfile) {
+        switch (form) {
+            case 'Raster': await this.analyzeRasterData(filePath, profile); break;
+            case 'Vector': await this.analyzeVectorData(filePath, profile); break;
+            case 'Table': await this.analyzeTableData(filePath, profile); break;
+            case 'Timeseries': await this.analyzeTimeseriesData(filePath, profile); break;
+            case 'Parameter': await this.analyzeParameterData(filePath, profile); break;
+        }
+    }
+
+    /**
      * 分析栅格数据
      * @param filePath 文件路径
      * @param profile 语义画像对象
@@ -398,6 +388,7 @@ export class DataMappingService {
 
         // 映射结果到DataSemanticProfile
         if (!inspectorResult.error) {
+            profile.spatial = inspectorResult.spatial;
             profile.raster = {
                 resolution: inspectorResult.resolution,
                 unit: inspectorResult.unit,
@@ -419,6 +410,7 @@ export class DataMappingService {
 
         // 映射结果到DataSemanticProfile
         if (!inspectorResult.error) {
+            profile.spatial = inspectorResult.spatial;
             profile.vector = {
                 geometry_type: inspectorResult.geometry_type,
                 topology_valid: inspectorResult.topology_valid,
@@ -499,6 +491,54 @@ export class DataMappingService {
             this.logger.warn(`解析参数文件失败: ${error.message}`);
             profile.parameter = undefined;
             profile.semantic = '参数数据（解析失败）';
+        }
+    }
+
+    /**
+     * 第四阶段：使用LLM检验、修正和补全数据分析结果
+     * @param filePath 主要文件路径
+     * @param initialResult 初步分析结果
+     * @param pkg 数据包信息
+     * @returns 修正和补全后的结果
+     */
+    private async refineProfileWithLLM(currentProfile: DataSemanticProfile, filePath: string): Promise<DataSemanticProfile> {
+        const pythonApiUrl = `${process.env.agentUrl}/agents/data-refine`;
+
+        try {
+            this.logger.log(`请求 LLM 进行语义精炼... ID: ${currentProfile.id}`);
+
+            // 构造请求体，匹配 Python 端 DataRefineRequest
+            const payload = {
+                file_path: filePath,
+                profile: currentProfile, // 整个对象传过去
+            };
+
+            const response = await axios.post(pythonApiUrl, payload);
+            const data = response.data;
+
+            if (data.status === 'ok' && data.profile) {
+                const refined = data.profile as DataSemanticProfile;
+                
+                // 记录 LLM 做了什么修正
+                if (data.corrections?.length) {
+                    this.logger.log(`[LLM 修正]: ${data.corrections.join('; ')}`);
+                }
+                if (data.completions?.length) {
+                    this.logger.log(`[LLM 补全]: ${data.completions.join('; ')}`);
+                }
+
+                // 确保 ID 不被 LLM 篡改
+                refined.id = currentProfile.id;
+                return refined;
+            } else {
+                this.logger.warn(`LLM 返回状态非 OK: ${data.message}`);
+                return currentProfile;
+            }
+
+        } catch (error) {
+            // 容错处理：如果 LLM 服务挂了，返回原始 Profile，不要阻断上传流程
+            this.logger.error(`LLM 精炼服务调用失败: ${error.message}`);
+            return currentProfile;
         }
     }
 

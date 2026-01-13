@@ -1,8 +1,8 @@
 from fastapi import FastAPI, WebSocket, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from agents.model_recommend.nodes import agent
-from agents.data_scan.graph import data_scan_agent
+from agents.model_recommend.graph import agent
+from agents.data_scan.graph import DataScanState, data_scan_agent
 from agents.supervisor import supervisor, SupervisorState
 from agents.registry import list_agents, get_agent_info
 from langchain.messages import HumanMessage, AIMessageChunk, AnyMessage
@@ -12,6 +12,7 @@ import json
 import asyncio
 from pydantic import BaseModel
 import operator
+from pathlib import Path
 
 app = FastAPI()
 # 允许任何来源的跨域请求
@@ -267,77 +268,188 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
 
 # ============= 数据分析辅助路由 =============
 
-class DataRefineRequest(BaseModel):
-    """
-    数据分析LLM辅助请求体：包含NestJS的初步分析结果
-    """
-    # 输入
+class DataScanRequest(BaseModel):
+    """数据扫描请求体"""
     file_path: str
-    profile: Dict[str, Any]
-    # LLM 对话
-    messages: Annotated[List[AnyMessage], operator.add]
+    session_id: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
 
-    # 输出
-    final_profile: Dict[str, Any]
-    corrections: List[str]
-    completions: List[str]
 
-@app.post("/api/agents/data-refine")
-async def data_refine_endpoint(request: DataRefineRequest):
+class DataScanStreamRequest(BaseModel):
+    """流式数据扫描请求体"""
+    file_path: str
+    session_id: Optional[str] = None
+    include_samples: Optional[bool] = True  # 是否包含样本数据
+
+
+@app.post("/api/agents/data-scan")
+async def data_scan_endpoint(request: DataScanRequest):
     """
-    使用LLM检验、修正和补全数据分析结果
-    
-    工作流程：
-    1. NestJS先进行基础分析（扩展名 + Python inspector）
-    2. 生成初步的结构化描述
-    3. 调用此端点，LLM进行检验、修正和补全
-    4. 返回最终的完整分析结果
+    数据扫描端点：同步调用 LangGraph Agent 分析数据
+    用于 NestJS 后端直接调用，一次性获取完整结果
     
     Args:
-        request: DataRefineRequest - 包含初步分析结果和提取的数据信息
+        request: 包含文件路径和会话ID
+        
     Returns:
         {
-            "status": "ok",
-            "form": str,              # 修正后的数据形式
-            "confidence": float,      # 修正后的置信度
-            "details": dict,          # 补全后的完整元数据
-            "corrections": list,      # 修正说明
-            "completions": list       # 补全说明
+            "status": "ok" | "error",
+            "profile": {...完整的 DataSemanticProfile...},
+            "agent_logs": ["工作流日志1", "工作流日志2"],
+            "session_id": "会话ID"
         }
     """
     try:
-        # 1. 构造初始状态
-        initial_state = {
-            "file_path": request.file_path,
-            "profile": request.profile, # 直接透传 NestJS 的 Profile 对象
+        session_id = request.session_id or str(uuid.uuid4())
+        
+        # 初始化 LangGraph 状态
+        initial_state: DataScanState = {
             "messages": [],
-            "corrections": [],
-            "completions": []
+            "file_path": request.file_path,
+            "tool_results": {},
+            "profile": {},
+            "status": "processing"
         }
         
-        # 2. 调用 LangGraph (异步)
-        # 这里的 result 是最终的 State 字典
-        final_state = await data_scan_agent.ainvoke(initial_state)
+        # 同步调用 LangGraph Agent
+        final_state = await asyncio.to_thread(
+            lambda: data_scan_agent.invoke(initial_state)
+        )
         
-        # 3. 提取结果
-        final_profile = final_state.get("profile", request.profile)
+        profile = final_state.get("profile", {})
+        
+        # 添加基础字段
+        if "id" not in profile:
+            profile["id"] = f"data_{Path(request.file_path).stem}_{session_id[:8]}"
+        
+        if "format" not in profile:
+            profile["format"] = Path(request.file_path).suffix.lower()
         
         return {
             "status": "ok",
-            "profile": final_profile, # 返回给 NestJS 的是完整的、修好的 Profile
-            "corrections": final_state.get("corrections", []),
-            "completions": final_state.get("completions", [])
+            "profile": profile,
+            "agent_logs": ["Agent 分析完成"],
+            "session_id": session_id
         }
         
     except Exception as e:
-        print(f"Error in data refine: {e}")
-        # 发生错误时，返回原始数据，保证流程不中断（降级处理）
-        return {
-            "status": "error",
-            "message": str(e),
-            "profile": request['profile'] 
-        }
+        raise HTTPException(status_code=500, detail=f"Data scan failed: {str(e)}")
 
+
+@app.get("/api/agents/data-scan/stream")
+async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = None):
+    """
+    流式数据扫描端点：实时返回分析过程
+    用于React前端实时展示分析进度
+    
+    特点：
+    1. 服务器发送事件（SSE）流式响应
+    2. 实时显示 Agent 工作流程
+    3. 支持进度跟踪和日志展示
+    
+    Args:
+        file_path: 待分析的文件路径
+        session_id: 会话ID（可选）
+        
+    Returns:
+        SSE 流，包含以下事件类型：
+        - status: Agent 状态更新
+        - tool_call: 工具调用开始
+        - tool_result: 工具调用完成
+        - progress: 进度更新
+        - error: 错误信息
+        - final: 最终结果
+    """
+    session_id = session_id or str(uuid.uuid4())
+    
+    async def event_generator():
+        try:
+            # 发送初始化事件
+            yield f"data: {json.dumps({'type': 'status', 'message': '初始化数据扫描', 'session_id': session_id}, ensure_ascii=False)}\n\n"
+            
+            # 初始化 LangGraph 状态
+            initial_state: DataScanState = {
+                "messages": [],
+                "file_path": file_path,
+                "tool_results": {},
+                "profile": {},
+                "status": "processing"
+            }
+            
+            # 流式调用 LangGraph Agent
+            current_tool = None
+            
+            async for event in data_scan_agent.astream(initial_state):
+                # 处理不同类型的事件
+                if isinstance(event, dict):
+                    for node_name, node_output in event.items():
+                        
+                        # LLM 节点事件
+                        if node_name == "llm_node":
+                            messages = node_output.get("messages", [])
+                            if messages:
+                                last_msg = messages[-1]
+                                
+                                # 检查是否有工具调用
+                                if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
+                                    for tool_call in last_msg.tool_calls:
+                                        current_tool = tool_call.get("name", "unknown")
+                                        
+                                        yield f"data: {json.dumps({
+                                            'type': 'tool_call',
+                                            'tool': current_tool,
+                                            'message': f'工具开始执行: {current_tool}'
+                                        }, ensure_ascii=False)}\n\n"
+                                else:
+                                    # LLM 生成了最终结果
+                                    yield f"data: {json.dumps({
+                                        'type': 'status',
+                                        'message': 'LLM 生成分析结果'
+                                    }, ensure_ascii=False)}\n\n"
+                        
+                        # 工具执行节点事件
+                        elif node_name == "tool_node":
+                            tool_results = node_output.get("messages", [])
+
+                            for tmsg in tool_results:
+                                try:
+                                    tool_result = json.loads(tmsg.content)
+                                except Exception:
+                                    tool_result = tmsg.content
+                                
+                                tool_name = getattr(tmsg, "tool_name", "unknown")
+                                
+                                yield f"data: {json.dumps({
+                                    'type': 'tool_result',
+                                    'tool': tool_name,
+                                    'data': tool_result,
+                                    'message': f'工具执行完成: {tool_name}'
+                                }, ensure_ascii=False)}\n\n"
+                        
+                        # 进度更新
+                        yield f"data: {json.dumps({
+                            'type': 'progress',
+                            'node': node_name
+                        }, ensure_ascii=False)}\n\n"
+                
+                await asyncio.sleep(0)
+            
+        except Exception as e:
+            yield f"data: {json.dumps({
+                'type': 'error',
+                'message': f'分析失败: {str(e)}',
+                'session_id': session_id
+            }, ensure_ascii=False)}\n\n"
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive"
+        }
+    )
 
 # ============= 智能体协调者路由（暂时保留框架） =============
 
@@ -419,77 +531,3 @@ async def get_agent_endpoint(agent_name: str):
         "status": "ok",
         "agent": agent_info
     }
-
-# ============= 多智能体数据修正路由 =============
-
-class MultiAgentRefineRequest(BaseModel):
-    """Request body for multi-agent data refinement"""
-    file_path: str
-    extension: str
-    current_form: str
-    current_confidence: float
-    headers: Optional[List[str]] = None
-    sample_rows: Optional[List[Dict[str, Any]]] = None
-    coords_detected: Optional[bool] = False
-    time_detected: Optional[bool] = False
-    dimensions: Optional[Dict[str, Any]] = None
-    file_size: Optional[int] = 0
-
-@app.post("/api/analyze/multi-agent-refine")
-async def multi_agent_refine_endpoint(request: MultiAgentRefineRequest):
-    """
-    Use multi-agent LangGraph workflow to collaboratively refine data classification.
-    Three specialized agents (type expert, geo expert, timeseries expert) analyze in parallel,
-    then a coordinator makes the final decision.
-    
-    Args:
-        request: MultiAgentRefineRequest containing file context
-        
-    Returns:
-        JSON with final form, confidence, details, and agent reasoning
-    """
-    try:
-        # Build initial state for the multi-agent workflow
-        initial_state: DataAnalysisState = {
-            "messages": [],
-            "file_path": request.file_path,
-            "extension": request.extension,
-            "current_form": request.current_form,
-            "current_confidence": request.current_confidence,
-            "headers": request.headers or [],
-            "sample_rows": request.sample_rows or [],
-            "coords_detected": request.coords_detected or False,
-            "time_detected": request.time_detected or False,
-            "dimensions": request.dimensions or {},
-            "file_size": request.file_size or 0,
-            "type_expert_analysis": {},
-            "geo_expert_analysis": {},
-            "timeseries_expert_analysis": {},
-            "coordinator_decision": {},
-            "final_form": request.current_form,
-            "final_confidence": request.current_confidence,
-            "final_details": {}
-        }
-        
-        # Run the multi-agent workflow
-        final_state = await asyncio.to_thread(
-            lambda: data_refine_agent.invoke(initial_state)
-        )
-        
-        return {
-            "status": "ok",
-            "form": final_state.get("final_form", request.current_form),
-            "confidence": final_state.get("final_confidence", request.current_confidence),
-            "details": final_state.get("final_details", {}),
-            "source": "multi-agent",
-            "agents_analysis": {
-                "type_expert": final_state.get("type_expert_analysis", {}),
-                "geo_expert": final_state.get("geo_expert_analysis", {}),
-                "timeseries_expert": final_state.get("timeseries_expert_analysis", {}),
-                "coordinator_decision": final_state.get("coordinator_decision", {})
-            },
-            "messages": [msg.content if hasattr(msg, 'content') else str(msg) for msg in final_state.get("messages", [])]
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Multi-agent refinement failed: {str(e)}")

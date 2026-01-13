@@ -495,6 +495,67 @@ export class DataMappingService {
     }
 
     /**
+     * 管道传输 Agent 数据扫描 SSE 流（推荐用于实时展示）
+     * 直接将 Python Agent 的 SSE 流转发给前端，无需中间处理
+     * @param filePath 待分析的文件路径
+     * @param res Response 对象
+     * @param sessionId 可选的会话ID
+     */
+    async pipeAgentDataScanSSE(filePath: string, res: any, sessionId?: string): Promise<void> {
+        const agentApiUrl = `${process.env.agentUrl}/api/agents/data-scan/stream`;
+        
+        try {
+            const params = new URLSearchParams();
+            params.append('file_path', filePath);
+            if (sessionId) {
+                params.append('session_id', sessionId);
+            }
+
+            const pythonRes = await axios({
+                method: 'GET',
+                url: `${agentApiUrl}?${params.toString()}`,
+                responseType: 'stream',
+                headers: {
+                    Accept: 'text/event-stream',
+                }
+            });
+
+            // 管道传输数据到客户端
+            pythonRes.data.on('data', (chunk: Buffer) => {
+                res.write(chunk);
+            });
+
+            pythonRes.data.on('end', () => {
+                res.end();
+            });
+
+            pythonRes.data.on('error', (err: any) => {
+                res.write(
+                    `data: ${JSON.stringify({
+                        type: 'error',
+                        message: `Agent 流传输失败: ${err.message}`,
+                    })}\n\n`,
+                );
+                res.end();
+            });
+
+            // 浏览器断开时，关闭Python流
+            res.on('close', () => {
+                pythonRes.data.destroy();
+            });
+
+        } catch (error) {
+            res.write(
+                `data: ${JSON.stringify({
+                    type: 'error',
+                    message: `无法连接到 Agent 服务: ${error.message}`,
+                })}\n\n`,
+            );
+            res.end();
+        }
+    }
+
+    /**
      * 第四阶段：使用LLM检验、修正和补全数据分析结果
      * @param filePath 主要文件路径
      * @param initialResult 初步分析结果

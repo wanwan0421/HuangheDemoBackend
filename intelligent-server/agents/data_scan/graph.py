@@ -7,102 +7,141 @@ from langgraph.graph import StateGraph, START, END
 from dotenv import load_dotenv
 import operator
 from google import genai
+from . import tools
 
-# 初始化模型
-load_dotenv()
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-client = genai.Client(api_key=GOOGLE_API_KEY )
-
-class DataRefineState(TypedDict):
+class DataScanState(TypedDict):
     """
-    数据分析LLM辅助请求体：包含NestJS的初步分析结果
+    数据分析LLM辅助状态体
     """
-    # 输入
-    file_path: str
-    profile: Dict[str, Any]
     # LLM 对话
     messages: Annotated[List[AnyMessage], operator.add]
+    tool_results: Dict[str, Any]
+
+    # 输入
+    file_path: str
 
     # 输出
-    final_profile: Dict[str, Any]
-    corrections: List[str]
-    completions: List[str]
+    profile: Dict[str, Any]
+    status: str
 
-
-def refine_node(state: DataRefineState) -> Dict[str, Any]:
+def llm_node(state: DataScanState) -> Dict[str, Any]:
     """
-    检验、修正和补全节点：使用LLM分析初步结果
+    负责根据当前用户上传的文件路径和已有工具结果，生成数据画像
+    通过调用绑定工具的模型，返回模型产生的新消息和数据画像
+    Args:
+        state (DataScanState): 当前代理状态，包含消息历史等信息
+    Returns:
+        Dict[str, Any]: 更新后的状态，包含新消息和数据画像
     """
-    system_prompt = """你是地理空间数据分析专家。你的任务是：
-1. **检验**：检查初步分析是否合理
-2. **修正**：如果发现错误，修正数据形式和元数据
-3. **补全**：补全缺失的关键信息
+    system_message = f"""你是一个专业的地理空间数据分析专家。请根据用户上传的文件路径，生成该数据的语义画像。\n"
+        
+        **工作流程**:
+        1.首先调用`tool_prepare_profile`工具，传入文件路径，准备数据。
+        2.根据准备的数据，调用`tool_detect_format`工具，检测数据类型。
+        3.根据数据类型的检测结果，调用专项分析工具，包括`tool_analyze_raster`, `tool_analyze_vector`, `tool_analyze_table`, `tool_analyze_timeseries`, `tool_analyze_parameter`，提取元数据。
+        4.综合所有工具的结果，生成最终的数据画像，包含数据形式、领域信息、语义摘要等。
 
-数据形式分类：
-- Raster: 栅格/影像数据（网格结构，通常有lat/lon维度）
-- Vector: 矢量地理数据（点、线、面几何，包含坐标）
-- Table: 纯表格数据（无地理参考）
-- Timeseries: 时间序列数据（强调时间维度）
-- Parameter: 配置参数文件
+        **重要规则**：
+        1.必须先调用`tool_prepare_profile`
+        2.其中有些难以根据后缀名判断的数据类型，需要调用其他工具来读取数据进行详细判断
+        3.所有工具调用完成后，才生成最终profile
 
-请直接返回符合 DataSemanticProfile 结构的 JSON 对象。"""
+        **关键元数据**
+        第一层：最小通用语义内核
+        1.form：数据形式（Raster, Vector, Table, Timeseries, Parameter）
+        2.spatial：空间域信息，包括crs：空间参考系统（如EPSG:4326）和extent：空间范围（如 [minX, minY, maxX, maxY]）
+        3.temporal：时间域信息，包括has_time：是否包含时间维度，time_range：时间范围（如[start, end]）
+        4.semantic：语义摘要，描述数据内容和用途
 
-    # 构建上下文：只给 LLM 看它需要的“证据”
-    context = {
-        "file_path": state['file_path'],
-        "current_profile": state['profile']
+        第二层：类型化语义描述
+        详细数据画像，依据数据形式包含不同字段
+        1.Raster：
+            -resolution：分辨率
+            -band_count：波段数量
+            -value_range：数值范围（如[min, max]）
+            -nodata：无效值
+        2.Vector：
+            -feature_count：要素数量
+            -geometry_type：几何类型（Point, Line, Polygon）
+            -attributes：属性列表，每属性包含name, type, semantic
+        3.Table：
+            -row_count：行数
+            -columns：列名
+            -column_types：列类型映射（如name, type, semantic等）
+            -sample_rows：样本数据行
+        4.Timeseries：
+            -dimensions：维度信息
+            -variables：变量列表（如name, type, semantic等）
+        5.Parameter：
+            -value_type：值类型（int, float, string, boolean）
+            -unit：单位
+
+        第三层：领域语义扩展
+        1.domain：领域信息（具体数据在某个学科中意味着什么）
+        """
+
+    user_message = f"""请根据以下信息，生成数据画像：
+    文件路径: {state['file_path']}"""
+
+    messages = [
+        SystemMessage(content=system_message),
+        HumanMessage(content=user_message)
+    ] + state["messages"]
+
+    response = tools.model_with_tools.invoke(messages)
+
+    return {
+        "messages": [response],
+        # "profile": json.loads(response.content),
+        "status": "success"
     }
 
-    user_input = f"""请对以下数据画像进行【语义精炼】和【逻辑校验】：
-{json.dumps(context, ensure_ascii=False, indent=2)}
+def tool_node(state: DataScanState) -> Dict[str, Any]:
+    """
+    工具调用节点：根据当前状态调用相应工具
+    Args:
+        state (DataScanState): 当前代理状态，包含消息历史等信息
+    Returns:
+        Dict[str, Any]: 更新后的状态，包含新消息和工具结果
+    """
+    last_message = state["messages"][-1]
+    tool_calls = getattr(last_message, "tool_calls", []) or []
 
-注意：请保留原有物理参数，仅修正 form 并补全 domain, semantic 以及相关的 profile 细节。"""
-    
-    # 调用LLM
-    model = ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash-exp",
-        temperature=0.1,
-        google_api_key=GOOGLE_API_KEY,
-    )
-    
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=user_input)
-    ]
-    
-    response = model.invoke(messages)
-    
-    # 解析LLM响应
-    try:
-        content = response.content
-        # 清洗 Markdown 代码块
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        
-        refined_data = json.loads(content)
+    tool_messages = []
 
-        # 提取 LLM 的变更点作为记录
-        corrections = []
-        if refined_data.get('form') != state['profile'].get('form'):
-            corrections.append(f"Form 从 {state['profile'].get('form')} 修正为 {refined_data.get('form')}")
-        
-        return {
-            "messages": [response],
-            "profile": refined_data, # 更新后的 profile
-            "corrections": corrections,
-            "completions": ["已补全 domain 和 semantic 摘要"]
-        }
+    for tool_call in tool_calls:
+        tool = tools.TOOLS_BY_NAME[tool_call["name"]]
+        observation = tool.invoke(tool_call["args"])
 
-    except Exception as e:
-        return {
-            "messages": [response],
-            "error": f"解析失败: {str(e)}"
-        }
+        tool_messages.append(tools.ToolMessage(
+            content=json.dumps(observation, ensure_ascii=False),
+            tool_call_id=tool_call["id"],
+            tool_name=tool_call["name"]
+        ))
 
-"""构建数据修正工作流图"""
-agent_builder = StateGraph(DataRefineState)
-agent_builder.add_node("refine", refine_node)
-agent_builder.add_edge(START, "refine")
-agent_builder.add_edge("refine", END)
+    return {
+        "messages": tool_messages
+    }
+
+def should_continue(state: DataScanState) -> Any:
+    """
+    判断是否需要继续调用工具
+    Args:
+        state (DataScanState): 当前代理状态
+    Returns:
+        Literal["tool_node", END]: 如果需要调用工具则返回 "tool_node"，否则返回 END
+    """
+    last_message = state["messages"][-1]
+    if last_message.tool_calls:
+        return "tool_node"
     
-data_scan_agent = agent_builder.compile()
+    return END
+
+agent_builder = StateGraph(DataScanState)
+agent_builder.add_node("llm_node", llm_node)
+agent_builder.add_node("tool_node", tool_node)
+agent_builder.add_edge(START, "llm_node")
+agent_builder.add_conditional_edges("llm_node", should_continue, ["tool_node"], [END])
+agent_builder.add_edge("tool_node", "llm_node")
+
+agent = agent_builder.compile()

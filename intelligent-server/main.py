@@ -5,7 +5,7 @@ from agents.model_recommend.graph import agent
 from agents.data_scan.graph import DataScanState, data_scan_agent
 from agents.supervisor import supervisor, SupervisorState
 from agents.registry import list_agents, get_agent_info
-from langchain.messages import HumanMessage, AIMessageChunk, AnyMessage
+from langchain.messages import HumanMessage, AIMessageChunk, AnyMessage, ToolMessage
 from typing import Any, Dict, List, Optional,TypedDict, Annotated
 import uuid
 import json
@@ -282,7 +282,7 @@ class DataScanStreamRequest(BaseModel):
     include_samples: Optional[bool] = True  # 是否包含样本数据
 
 
-@app.post("/api/agents/data-scan")
+@app.post("/api/agent/data-scan")
 async def data_scan_endpoint(request: DataScanRequest):
     """
     数据扫描端点：同步调用 LangGraph Agent 分析数据
@@ -336,7 +336,7 @@ async def data_scan_endpoint(request: DataScanRequest):
         raise HTTPException(status_code=500, detail=f"Data scan failed: {str(e)}")
 
 
-@app.get("/api/agents/data-scan/stream")
+@app.get("/api/agent/data-scan/stream")
 async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = None):
     """
     流式数据扫描端点：实时返回分析过程
@@ -379,7 +379,10 @@ async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = 
             # 流式调用 LangGraph Agent
             current_tool = None
             
-            async for event in data_scan_agent.astream(initial_state):
+            async for event in data_scan_agent.astream(
+                initial_state,
+                stream_mode="updates",
+            ):
                 # 处理不同类型的事件
                 if isinstance(event, dict):
                     for node_name, node_output in event.items():
@@ -387,7 +390,7 @@ async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = 
                         # LLM 节点事件
                         if node_name == "llm_node":
                             messages = node_output.get("messages", [])
-                            if messages:
+                            if messages and len(messages) > 0:
                                 last_msg = messages[-1]
                                 
                                 # 检查是否有工具调用

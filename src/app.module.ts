@@ -11,6 +11,7 @@ import { GenAIModule } from './genai/genai.module';
 import { ChatModule } from './chat/chat.module';
 import { ModelRunnerModule } from './model/model.module';
 import { DataMappingModule } from './data-mapping/data-mapping.module';
+import { DataModule } from './data/data.module';
 
 @Module({
   imports: [
@@ -32,7 +33,9 @@ import { DataMappingModule } from './data-mapping/data-mapping.module';
     GenAIModule,
     ChatModule,
     ModelRunnerModule,
-    DataMappingModule],
+    DataMappingModule,
+    DataModule,
+  ],
   controllers: [AppController],
   providers: [AppService],
 })

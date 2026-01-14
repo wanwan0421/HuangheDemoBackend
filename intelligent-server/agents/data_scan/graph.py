@@ -2,7 +2,7 @@ import os
 import json
 from typing import TypedDict, Dict, Any, List, Optional, Annotated
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.messages import HumanMessage, SystemMessage, AnyMessage
+from langchain.messages import HumanMessage, SystemMessage, AnyMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END
 from dotenv import load_dotenv
 import operator
@@ -36,15 +36,16 @@ def llm_node(state: DataScanState) -> Dict[str, Any]:
     system_message = f"""你是一个专业的地理空间数据分析专家。请根据用户上传的文件路径，生成该数据的语义画像。\n"
         
         **工作流程**:
-        1.首先调用`tool_prepare_profile`工具，传入文件路径，准备数据。
+        1.首先调用`tool_prepare_file`工具，传入文件路径，准备数据。
         2.根据准备的数据，调用`tool_detect_format`工具，检测数据类型。
         3.根据数据类型的检测结果，调用专项分析工具，包括`tool_analyze_raster`, `tool_analyze_vector`, `tool_analyze_table`, `tool_analyze_timeseries`, `tool_analyze_parameter`，提取元数据。
-        4.综合所有工具的结果，生成最终的数据画像，包含数据形式、领域信息、语义摘要等。
+        4.最终，调用`tool_generate_profile`工具，综合所有工具的结果，生成最终的数据画像，包含数据形式、领域信息、语义摘要等。
 
         **重要规则**：
-        1.必须先调用`tool_prepare_profile`
+        1.必须先调用`tool_prepare_file`
         2.其中有些难以根据后缀名判断的数据类型，需要调用其他工具来读取数据进行详细判断
-        3.所有工具调用完成后，才生成最终profile
+        3.所有工具调用完成后，基于已有的工具结果生成最终完整的profile
+        4.最终返回的profile必须整合所有工具的分析结果
 
         **关键元数据**
         第一层：最小通用语义内核
@@ -78,6 +79,9 @@ def llm_node(state: DataScanState) -> Dict[str, Any]:
 
         第三层：领域语义扩展
         1.domain：领域信息（具体数据在某个学科中意味着什么）
+
+        注意：当你完成所有工具调用并准备生成最终画像时，必须且只能输出一个合法的 JSON 字符串，不要包含任何前导说明文字或 Markdown 格式。
+        JSON 结构必须严格符合{DataScanState}的profile定义。
         """
 
     user_message = f"""请根据以下信息，生成数据画像：
@@ -90,15 +94,43 @@ def llm_node(state: DataScanState) -> Dict[str, Any]:
 
     response = tools.model_with_tools.invoke(messages)
 
-    return {
-        "messages": [response],
-        # "profile": json.loads(response.content),
-        "status": "success"
-    }
+    if not response.tool_calls:
+        try:
+            content = extract_text_content(response.content)
+            # 找到字符串中的 JSON 部分 (处理可能的文本前缀)
+            json_start = content.find('{')
+            json_end = content.rfind('}') + 1
+            final_profile = json.loads(content[json_start:json_end])
+            
+            return {
+                "messages": [response],
+                "profile": final_profile,
+                "status": "success"
+            }
+        except:
+            # 如果解析失败，回退处理
+            return {"messages": [response], "status": "final_text"}
+    return {"messages": [response], "status": "processing"}
+
+def extract_text_content(content: Any) -> str:
+    """
+    兼容处理字符串格式和列表格式的 AIMessage content
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text_parts.append(part.get("text", ""))
+            elif isinstance(part, str):
+                text_parts.append(part)
+        return "".join(text_parts)
+    return ""
 
 def tool_node(state: DataScanState) -> Dict[str, Any]:
     """
-    工具调用节点：根据当前状态调用相应工具
+    工具调用节点：根据当前状态调用相应工具，并累积结果
     Args:
         state (DataScanState): 当前代理状态，包含消息历史等信息
     Returns:
@@ -113,7 +145,7 @@ def tool_node(state: DataScanState) -> Dict[str, Any]:
         tool = tools.TOOLS_BY_NAME[tool_call["name"]]
         observation = tool.invoke(tool_call["args"])
 
-        tool_messages.append(tools.ToolMessage(
+        tool_messages.append(ToolMessage(
             content=json.dumps(observation, ensure_ascii=False),
             tool_call_id=tool_call["id"],
             tool_name=tool_call["name"]
@@ -141,7 +173,7 @@ agent_builder = StateGraph(DataScanState)
 agent_builder.add_node("llm_node", llm_node)
 agent_builder.add_node("tool_node", tool_node)
 agent_builder.add_edge(START, "llm_node")
-agent_builder.add_conditional_edges("llm_node", should_continue, ["tool_node"], [END])
+agent_builder.add_conditional_edges("llm_node", should_continue, ["tool_node", END])
 agent_builder.add_edge("tool_node", "llm_node")
 
-agent = agent_builder.compile()
+data_scan_agent = agent_builder.compile()

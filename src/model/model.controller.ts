@@ -2,16 +2,13 @@ import { Controller, Post, Body, Get, Param, HttpException, HttpStatus, UseInter
 import { ModelRunnerService } from './model.service';
 import { CreateModelRunRequest } from './dto/create-model-run.dto';
 import { AnyFilesInterceptor } from '@nestjs/platform-express';
-import { diskStorage } from 'multer';
 import * as path from 'path';
 import * as fs from 'fs';
 import { Express as ExpressMulter } from 'multer';
+import { createAnyFilesInterceptorConfig } from '../common/upload-config';
 
-// 确保上传目录存在
-const UPLOAD_DIR = './model-scripts/uploads';
-if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-}
+// 模型脚本上传目录
+const MODEL_UPLOAD_DIR = './model-scripts/uploads';
 
 @Controller('api/model')
 export class ModelRunnerController {
@@ -23,16 +20,14 @@ export class ModelRunnerController {
    */
   @Post('run')
   // 使用拦截器处理多文件上传
-  @UseInterceptors(AnyFilesInterceptor({
-    storage: diskStorage({
-      destination: UPLOAD_DIR,
-      filename: (req, file, cb) => {
-        file.originalname = Buffer.from(file.originalname, 'latin1').toString('utf8');
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, uniqueSuffix + '-' + file.originalname);
-      },
-    })
-  }))
+  @UseInterceptors(
+    AnyFilesInterceptor(
+      createAnyFilesInterceptorConfig({
+        destination: MODEL_UPLOAD_DIR,
+        maxFileSize: 500 * 1024 * 1024,
+      })
+    )
+  )
   async runModel(
     @Body() body: any,
     @UploadedFiles() files: Array<ExpressMulter.File>) {

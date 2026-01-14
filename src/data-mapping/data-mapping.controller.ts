@@ -2,7 +2,7 @@ import { Controller, Query, Get, Res } from '@nestjs/common';
 import { DataMappingService } from './data-mapping.service';
 import type { Response } from 'express';
 
-@Controller('data-mapping')
+@Controller('api/data-mapping')
 export class DataMappingController {
     constructor(private readonly dataMappingService: DataMappingService) {}
 

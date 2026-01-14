@@ -502,8 +502,8 @@ export class DataMappingService {
      * @param sessionId 可选的会话ID
      */
     async pipeAgentDataScanSSE(filePath: string, res: any, sessionId?: string): Promise<void> {
-        const agentApiUrl = `${process.env.agentUrl}/api/agents/data-scan/stream`;
-        
+        const agentApiUrl = `${process.env.agentUrl}/data-scan/stream`;
+        console.log(`Connecting to Agent SSE stream: ${agentApiUrl}`);
         try {
             const params = new URLSearchParams();
             params.append('file_path', filePath);

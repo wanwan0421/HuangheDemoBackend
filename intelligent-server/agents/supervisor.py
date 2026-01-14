@@ -108,7 +108,7 @@ def should_route(state: SupervisorState) -> str:
     elif agent == "model_recommend":
         return "model_recommend_wrapper"
     else:
-        return "end"
+        return END
 
 
 def build_supervisor_graph():
@@ -135,10 +135,10 @@ def build_supervisor_graph():
     workflow.add_conditional_edges(
         "router",
         should_route,
-        ["data_scan_wrapper", "model_recommend_wrapper", "end"]
+        ["data_scan_wrapper", "model_recommend_wrapper", END]
     )
-    workflow.add_edge("data_scan_wrapper", "end")
-    workflow.add_edge("model_recommend_wrapper", "end")
+    workflow.add_edge("data_scan_wrapper", END)
+    workflow.add_edge("model_recommend_wrapper", END)
     
     return workflow.compile()
 

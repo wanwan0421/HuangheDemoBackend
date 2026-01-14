@@ -2,13 +2,11 @@ import json
 import os
 from typing import Dict, Any, List, Optional
 from pathlib import Path
-from subprocess import spawn
 import pandas as pd
 import xarray as xr
 import h5py
 import rasterio
 import geopandas as gpd
-import logging
 import zipfile
 import tarfile
 import tempfile
@@ -637,6 +635,94 @@ def normalize_kernel_type(kernel_type: Optional[str]) -> str:
     return 'string'
 
 # ============================================================================
+# 工具7: 整合工具（可选）
+# ============================================================================
+
+@tool
+def tool_generate_profile(
+    file_path: str,
+    form: str,
+    prepare_result: Optional[Dict] = None,
+    detect_result: Optional[Dict] = None,
+    analysis_result: Optional[Dict] = None
+) -> Dict[str, Any]:
+    """
+    整合所有工具的分析结果，生成完整的数据画像。
+    这个工具应该在所有其他分析工具执行完毕后调用。
+    
+    Args:
+        file_path: 文件路径
+        form: 数据形式（Raster, Vector, Table, Timeseries, Parameter）
+        prepare_result: tool_prepare_file 的结果（可选）
+        detect_result: tool_detect_format 的结果（可选）
+        analysis_result: 专项分析工具的结果（可选）
+    
+    Returns:
+        完整的数据画像，包含所有层级的信息
+    """
+    try:
+        profile = {
+            "file_path": file_path,
+            "form": form,
+        }
+        
+        # 整合准备阶段的信息
+        if prepare_result and prepare_result.get("status") == "success":
+            profile["file_type"] = prepare_result.get("file_type", "unknown")
+            if prepare_result.get("primary_file"):
+                profile["primary_file"] = prepare_result["primary_file"]
+        
+        # 整合检测阶段的信息
+        if detect_result and detect_result.get("status") == "success":
+            profile["confidence"] = detect_result.get("confidence", 0.0)
+        
+        # 整合详细分析的信息
+        if analysis_result and analysis_result.get("status") == "success":
+            data = analysis_result.get("data", {})
+            
+            # 第一层：最小通用语义内核
+            profile["spatial"] = data.get("spatial", {})
+            profile["temporal"] = data.get("temporal", {"has_time": False})
+            
+            # 第二层：类型化语义描述
+            if form == "Raster":
+                profile["resolution"] = data.get("resolution")
+                profile["band_count"] = data.get("band_count")
+                profile["value_range"] = data.get("value_range")
+                profile["nodata"] = data.get("nodata")
+            
+            elif form == "Vector":
+                profile["feature_count"] = data.get("feature_count")
+                profile["geometry_type"] = data.get("geometry_type")
+                profile["attributes"] = data.get("attributes", [])
+            
+            elif form == "Table":
+                profile["row_count"] = data.get("row_count")
+                profile["columns"] = data.get("columns", [])
+                profile["column_types"] = data.get("dtypes", {})
+                profile["sample_rows"] = data.get("sample_rows", [])
+            
+            elif form == "Timeseries":
+                profile["dimensions"] = data.get("dimensions", {})
+                profile["variables"] = data.get("variables", [])
+                profile["has_time"] = data.get("has_time", False)
+            
+            elif form == "Parameter":
+                profile["value_type"] = data.get("value_type", "string")
+                profile["unit"] = data.get("unit", "Unknown")
+        
+        return {
+            "status": "success",
+            "profile": profile
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
+# ============================================================================
 # 工具注册（供 LangGraph 调用）
 # ============================================================================
 
@@ -647,7 +733,8 @@ tools = [
     tool_analyze_vector,
     tool_analyze_table,
     tool_analyze_timeseries,
-    tool_analyze_parameter
+    tool_analyze_parameter,
+    tool_generate_profile
 ]
 
 TOOLS_BY_NAME = {tool.name: tool for tool in tools}

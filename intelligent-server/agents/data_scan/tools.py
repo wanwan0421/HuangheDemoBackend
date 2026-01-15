@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Dict, Any, List, Optional
+from typing import Annotated, Dict, Any, List, Optional, TypedDict
 from pathlib import Path
 import pandas as pd
 import xarray as xr
@@ -16,6 +16,8 @@ from langchain.tools import tool
 from dotenv import load_dotenv
 from google import genai
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.messages import AnyMessage
+import operator
 
 # 初始化模型
 load_dotenv()
@@ -29,6 +31,24 @@ data_scan_model = ChatGoogleGenerativeAI(
     streaming=True,
     google_api_key=GOOGLE_API_KEY ,
 )
+
+class DataScanState(TypedDict):
+    """
+    数据分析LLM辅助状态体
+    """
+    # LLM 对话
+    messages: Annotated[List[AnyMessage], operator.add]
+
+    # 输入
+    file_path: str
+
+    # 工具“事实层”
+    facts: Annotated[Dict[str, Any], operator.or_]
+
+    profile: Annotated[Dict[str, Any], operator.or_]
+
+    # 状态
+    status: str
 
 # ============================================================================
 # 工具 0: 文件准备工具（解压、识别主文件）
@@ -206,22 +226,22 @@ def tool_detect_format(file_path: str) -> Dict[str, Any]:
         if ext == '.xml':
             return {
                 "status": "success",
-                "form": "Parameter",
-                "confidence": 0.95
+                "Form": "Parameter",
+                "Confidence": 0.95
             }
         
         if ext in ['.shp', '.geojson', '.kml', '.gml']:
             return {
                 "status": "success",
-                "form": "Vector",
-                "confidence": 0.9
+                "Form": "Vector",
+                "Confidence": 0.9
             }
         
         if ext in ['.tif', '.tiff', '.geotiff', '.img', '.asc', '.vrt']:
             return {
                 "status": "success",
-                "form": "Raster",
-                "confidence": 0.9
+                "Form": "Raster",
+                "Confidence": 0.9
             }
         
         # 2. 需要内容检查的格式
@@ -239,8 +259,8 @@ def tool_detect_format(file_path: str) -> Dict[str, Any]:
         
         return {
             "status": "success",
-            "form": "Unknown",
-            "confidence": 0.3,
+            "Form": "Unknown",
+            "Confidence": 0.3,
         }
         
     except Exception as e:
@@ -268,21 +288,21 @@ def detect_csv(file_path: str) -> Dict[str, Any]:
         if has_lon and has_lat:
             return {
                 "status": "success",
-                "form": "Vector",
-                "confidence": 0.9
+                "Form": "Vector",
+                "Confidence": 0.9
             }
         
         if has_time:
             return {
                 "status": "success",
-                "form": "Timeseries",
-                "confidence": 0.8
+                "Form": "Timeseries",
+                "Confidence": 0.8
             }
         
         return {
             "status": "success",
-            "form": "Table",
-            "confidence": 0.85
+            "Form": "Table",
+            "Confidence": 0.85
         }
     except Exception as e:
         return {
@@ -305,21 +325,21 @@ def detect_json(file_path: str) -> Dict[str, Any]:
         if isinstance(data, dict) and data.get("type") in ["FeatureCollection", "Feature"]:
             return {
                 "status": "success",
-                "form": "Vector",
-                "confidence": 0.95
+                "Form": "Vector",
+                "Confidence": 0.95
             }
         
         if isinstance(data, list) and isinstance(data[0], dict):
             return {
                 "status": "success",
-                "form": "Table",
-                "confidence": 0.85
+                "Form": "Table",
+                "Confidence": 0.85
             }
         
         return {
             "status": "success",
-            "form": "Unknown",
-            "confidence": 0.4
+            "Form": "Unknown",
+            "Confidence": 0.4
         }
     except Exception as e:
         return {
@@ -343,23 +363,23 @@ def detect_netcdf(file_path: str) -> Dict[str, Any]:
             ds.close()
             return {
                 "status": "success",
-                "form": "Raster",
-                "confidence": 0.9
+                "Form": "Raster",
+                "Confidence": 0.9
             }
         
         if "time" in dims:
             ds.close()
             return {
                 "status": "success",
-                "form": "Timeseries",
-                "confidence": 0.9
+                "Form": "Timeseries",
+                "Confidence": 0.9
             }
         
         ds.close()
         return {
             "status": "success",
-            "form": "Unknown",
-            "confidence": 0.5
+            "Form": "Unknown",
+            "Confidence": 0.5
         }
     except Exception as e:
         return {
@@ -382,14 +402,14 @@ def detect_hdf5(file_path: str) -> Dict[str, Any]:
         if any("lat" in k.lower() or "lon" in k.lower() for k in keys):
             return {
                 "status": "success",
-                "form": "Raster",
-                "confidence": 0.85
+                "Form": "Raster",
+                "Confidence": 0.85
             }
         
         return {
             "status": "success",
-            "form": "Timeseries",
-            "confidence": 0.7
+            "Form": "Timeseries",
+            "Confidence": 0.7
         }
     except Exception as e:
         return {
@@ -410,29 +430,30 @@ def tool_analyze_raster(file_path: str) -> Dict[str, Any]:
     Returns:
         status: "success" | "error",
         data: {
-            spatial: {
-                crs: "坐标参考系",
-                extent: [minX, minY, maxX, maxY]
+            Spatial: {
+                Crs: "坐标参考系",
+                Extent: [minX, minY, maxX, maxY]
             },
-            resolution: {x: 像素大小X, y: 像素大小Y},
-            band_count: 波段数,
-            nodata: "无效值"
+            Resolution: {x: 像素大小X, y: 像素大小Y},
+            Band_count: 波段数,
+            Nodata: "无效值"
         }
     """
     try:
         with rasterio.open(file_path) as src:
             bounds = src.bounds
+            raw_crs = str(src.crs)
             return {
                 "status": "success",
                 "data": {
-                    "spatial": {
-                        "crs": str(src.crs),
-                        "extent": [bounds.left, bounds.bottom, bounds.right, bounds.top]
+                    "Spatial": {
+                        "Crs": parse_wkt_to_dict(raw_crs),
+                        "Extent": [bounds.left, bounds.bottom, bounds.right, bounds.top]
                     },
-                    "resolution": {"x": abs(src.res[0]), "y": abs(src.res[1])},
-                    "value_range": [src.read().min().item(), src.read().max().item()],
-                    "band_count": src.count,
-                    "nodata": src.nodata
+                    "Resolution": {"x": abs(src.res[0]), "y": abs(src.res[1])},
+                    "Value_range": [src.read().min().item(), src.read().max().item()],
+                    "Band_count": src.count,
+                    "Nodata": src.nodata
                 }
             }
     except Exception as e:
@@ -447,18 +468,19 @@ def tool_analyze_vector(file_path: str) -> Dict[str, Any]:
     Returns:
         status: "success" | "error",
         data: {
-            spatial: {
-                crs: "坐标参考系",
-                extent: [minX, minY, maxX, maxY]
+            Spatial: {
+                Crs: "坐标参考系",
+                Extent: [minX, minY, maxX, maxY]
             },
-            geometry_type: "几何类型",
-            feature_count: 要素数量,
-            attributes: [{name: 属性名, type: 属性类型}]
+            Geometry_type: "几何类型",
+            Feature_count: 要素数量,
+            Attributes: [{name: 属性名, type: 属性类型}]
         }
     """
     try:
         gdf = gpd.read_file(file_path)
         bounds = gdf.total_bounds.tolist()
+        raw_crs = str(gdf.crs)
         
         geom_type = "Unknown"
         if not gdf.empty:
@@ -470,13 +492,13 @@ def tool_analyze_vector(file_path: str) -> Dict[str, Any]:
         return {
             "status": "success",
             "data": {
-                "spatial": {
-                    "crs": str(gdf.crs),
-                    "extent": bounds
+                "Spatial": {
+                    "Crs": parse_wkt_to_dict(raw_crs),
+                    "Extent": bounds
                 },
-                "geometry_type": geom_type,
-                "feature_count": len(gdf),
-                "attributes": [
+                "Geometry_type": geom_type,
+                "Feature_count": len(gdf),
+                "Attributes": [
                     {"name": col, "type": str(gdf[col].dtype)}
                     for col in gdf.columns if col != 'geometry'
                 ]
@@ -494,10 +516,10 @@ def tool_analyze_table(file_path: str) -> Dict[str, Any]:
     Returns:
         status: "success" | "error",
         data: {
-            row_count: 行数,
-            columns: [列名],
-            dtypes: {列名: 数据类型},
-            sample_rows: [样本行]
+            Row_count: 行数,
+            Columns: [列名],
+            Dtypes: {列名: 数据类型},
+            Sample_rows: [样本行]
         }
     """
     try:
@@ -509,10 +531,10 @@ def tool_analyze_table(file_path: str) -> Dict[str, Any]:
         return {
             "status": "success",
             "data": {
-                "row_count": len(df),
-                "columns": list(df.columns),
-                "dtypes": df.dtypes.astype(str).to_dict(),
-                "sample_rows": df.head(3).to_dict(orient='records')
+                "Row_count": len(df),
+                "Columns": list(df.columns),
+                "Dtypes": df.dtypes.astype(str).to_dict(),
+                "Sample_rows": df.head(3).to_dict(orient='records')
             }
         }
     except Exception as e:
@@ -527,9 +549,9 @@ def tool_analyze_timeseries(file_path: str) -> Dict[str, Any]:
     Returns:
         status: "success" | "error",
         data: {
-            dimensions: {维度名: 大小},
-            variables: [变量名],
-            has_time: 是否包含时间维度
+            Dimensions: {维度名: 大小},
+            Variables: [变量名],
+            Has_time: 是否包含时间维度
         }
     """
     try:
@@ -538,9 +560,9 @@ def tool_analyze_timeseries(file_path: str) -> Dict[str, Any]:
             return {
                 "status": "success",
                 "data": {
-                    "dimensions": dict(ds.dims),
-                    "variables": list(ds.data_vars),
-                    "has_time": "time" in ds.dims
+                    "Dimensions": dict(ds.dims),
+                    "Variables": list(ds.data_vars),
+                    "Has_time": "time" in ds.dims
                 }
             }
         else:
@@ -548,8 +570,8 @@ def tool_analyze_timeseries(file_path: str) -> Dict[str, Any]:
             return {
                 "status": "success",
                 "data": {
-                    "columns": list(df.columns),
-                    "row_count": len(df)
+                    "Columns": list(df.columns),
+                    "Row_count": len(df)
                 }
             }
     except Exception as e:
@@ -564,8 +586,8 @@ def tool_analyze_parameter(file_path: str) -> Dict[str, Any]:
     Returns:
         status: "success" | "error",
         data: {
-            value_type: "int" | "float" | "string" | "boolean",
-            unit: "单位"
+            Value_type: "int" | "float" | "string" | "boolean",
+            Unit: "单位"
         }
     """
     try:
@@ -601,8 +623,8 @@ def tool_analyze_parameter(file_path: str) -> Dict[str, Any]:
         return {
             "status": "success",
             "data": {
-                "value_type": value_type,
-                "unit": attrs.get('unit') or 'Unknown'
+                "Value_type": value_type,
+                "Unit": attrs.get('unit') or 'Unknown'
             }
         }
     except Exception as e:
@@ -634,93 +656,95 @@ def normalize_kernel_type(kernel_type: Optional[str]) -> str:
     # 默认字符串类型
     return 'string'
 
+def parse_wkt_to_dict(wkt_str: str) -> Dict[str, str]:
+    """
+    解析WKT字符串提取关键坐标系信息
+    """
+    if not wkt_str or len(wkt_str) < 10:
+        return {"raw": wkt_str}
+    
+    # 提取 PROJCS 或 GEOGCS 名称
+    name_match = re.search(r'(?:PROJCS|GEOGCS)\["([^"]+)"', wkt_str)
+    # 提取 基准面 DATUM
+    datum_match = re.search(r'DATUM\["([^"]+)"', wkt_str)
+    # 提取 投影 PROJECTION
+    proj_match = re.search(r'PROJECTION\["([^"]+)"', wkt_str)
+    # 提取 中央经线 central_meridian
+    cm_match = re.search(r'PARAMETER\["central_meridian",([\d\.-]+)\]', wkt_str)
+    # 提取 单位 UNIT
+    unit_match = re.search(r'UNIT\["([^"]+)"', wkt_str)
+
+    return {
+        "Name": name_match.group(1) if name_match else "Unknown",
+        "Datum": datum_match.group(1) if datum_match else "Unknown",
+        "Projection": proj_match.group(1) if proj_match else "Geographic",
+        "Central_meridian": f"{cm_match.group(1)}°E" if cm_match else "N/A",
+        "Unit": unit_match.group(1) if unit_match else "Unknown",
+        "Wkt": wkt_str
+    }
+
 # ============================================================================
 # 工具7: 整合工具（可选）
 # ============================================================================
 
-@tool
-def tool_generate_profile(
-    file_path: str,
-    form: str,
-    prepare_result: Optional[Dict] = None,
-    detect_result: Optional[Dict] = None,
-    analysis_result: Optional[Dict] = None
-) -> Dict[str, Any]:
-    """
-    整合所有工具的分析结果，生成完整的数据画像。
-    这个工具应该在所有其他分析工具执行完毕后调用。
+# @tool
+# def tool_generate_profile(state: DataScanState) -> Dict[str, Any]:
+#     """
+#     整合所有工具的分析结果，生成完整的数据画像。
+#     这个工具应该在所有其他分析工具执行完毕后调用。
     
-    Args:
-        file_path: 文件路径
-        form: 数据形式（Raster, Vector, Table, Timeseries, Parameter）
-        prepare_result: tool_prepare_file 的结果（可选）
-        detect_result: tool_detect_format 的结果（可选）
-        analysis_result: 专项分析工具的结果（可选）
+#     Args:
+#         state: 当前数据扫描状态，包含所有工具结果
     
-    Returns:
-        完整的数据画像，包含所有层级的信息
-    """
-    try:
-        profile = {
-            "file_path": file_path,
-            "form": form,
-        }
+#     Returns:
+#         完整的数据画像，包含所有层级的信息
+#     """
+#     try:
+#         tool_results = state["tool_results"]
+#         profile = dict(state.get("profile", {}))
+
+#         # 文件信息
+#         profile["primary_file"] = tool_results.get("primary_file", "Unknown")
+#         profile["file_type"] = tool_results.get("file_type", "Unknown")
+
+#         # 第一层级分类
+#         profile["Form"] = tool_results.get("Form", "Unknown")
+#         profile["Confidence"] = tool_results.get("Confidence", 0.0)
+
+#         # 第二层级分类
+#         if profile["Form"] == "Raster":
+#             profile["Spatial"] = tool_results.get("Spatial", {})
+#             profile["Resolution"] = tool_results.get("Resolution", {})
+#             profile["Band_count"] = tool_results.get("Band_count", 0)
+#             profile["Nodata"] = tool_results.get("Nodata", None)
+#             profile["Value_range"] = tool_results.get("Value_range", [])
+#         elif profile["Form"] == "Vector":
+#             profile["Spatial"] = tool_results.get("Spatial", {})
+#             profile["Geometry_type"] = tool_results.get("Geometry_type", "Unknown")
+#             profile["Feature_count"] = tool_results.get("Feature_count", 0)
+#             profile["Attributes"] = tool_results.get("Attributes", [])
+#         elif profile["Form"] == "Table":
+#             profile["Row_count"] = tool_results.get("Row_count", 0)
+#             profile["Columns"] = tool_results.get("Columns", [])
+#             profile["Dtypes"] = tool_results.get("Dtypes", {})
+#             profile["Sample_rows"] = tool_results.get("Sample_rows", [])
+#         elif profile["Form"] == "Timeseries":
+#             profile["Dimensions"] = tool_results.get("Dimensions", {})
+#             profile["Variables"] = tool_results.get("Variables", [])
+#         elif profile["Form"] == "Parameter":
+#             profile["Value_type"] = tool_results.get("Value_type", "Unknown")
+#             profile["Unit"] = tool_results.get("Unit", "Unknown")
+
+#         return {
+#             "profile": profile,
+#             "status": "success"
+#         }
         
-        # 整合准备阶段的信息
-        if prepare_result and prepare_result.get("status") == "success":
-            profile["file_type"] = prepare_result.get("file_type", "unknown")
-            if prepare_result.get("primary_file"):
-                profile["primary_file"] = prepare_result["primary_file"]
-        
-        # 整合检测阶段的信息
-        if detect_result and detect_result.get("status") == "success":
-            profile["confidence"] = detect_result.get("confidence", 0.0)
-        
-        # 整合详细分析的信息
-        if analysis_result and analysis_result.get("status") == "success":
-            data = analysis_result.get("data", {})
-            
-            # 第一层：最小通用语义内核
-            profile["spatial"] = data.get("spatial", {})
-            profile["temporal"] = data.get("temporal", {"has_time": False})
-            
-            # 第二层：类型化语义描述
-            if form == "Raster":
-                profile["resolution"] = data.get("resolution")
-                profile["band_count"] = data.get("band_count")
-                profile["value_range"] = data.get("value_range")
-                profile["nodata"] = data.get("nodata")
-            
-            elif form == "Vector":
-                profile["feature_count"] = data.get("feature_count")
-                profile["geometry_type"] = data.get("geometry_type")
-                profile["attributes"] = data.get("attributes", [])
-            
-            elif form == "Table":
-                profile["row_count"] = data.get("row_count")
-                profile["columns"] = data.get("columns", [])
-                profile["column_types"] = data.get("dtypes", {})
-                profile["sample_rows"] = data.get("sample_rows", [])
-            
-            elif form == "Timeseries":
-                profile["dimensions"] = data.get("dimensions", {})
-                profile["variables"] = data.get("variables", [])
-                profile["has_time"] = data.get("has_time", False)
-            
-            elif form == "Parameter":
-                profile["value_type"] = data.get("value_type", "string")
-                profile["unit"] = data.get("unit", "Unknown")
-        
-        return {
-            "status": "success",
-            "profile": profile
-        }
-        
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e)
-        }
+#     except Exception as e:
+#         return {
+#             "status": "error",
+#             "error": str(e)
+#         }
 
 # ============================================================================
 # 工具注册（供 LangGraph 调用）
@@ -733,8 +757,7 @@ tools = [
     tool_analyze_vector,
     tool_analyze_table,
     tool_analyze_timeseries,
-    tool_analyze_parameter,
-    tool_generate_profile
+    tool_analyze_parameter
 ]
 
 TOOLS_BY_NAME = {tool.name: tool for tool in tools}

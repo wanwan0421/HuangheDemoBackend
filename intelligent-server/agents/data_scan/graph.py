@@ -8,21 +8,7 @@ from dotenv import load_dotenv
 import operator
 from google import genai
 from . import tools
-
-class DataScanState(TypedDict):
-    """
-    数据分析LLM辅助状态体
-    """
-    # LLM 对话
-    messages: Annotated[List[AnyMessage], operator.add]
-    tool_results: Dict[str, Any]
-
-    # 输入
-    file_path: str
-
-    # 输出
-    profile: Dict[str, Any]
-    status: str
+from .tools import DataScanState
 
 def llm_node(state: DataScanState) -> Dict[str, Any]:
     """
@@ -94,22 +80,6 @@ def llm_node(state: DataScanState) -> Dict[str, Any]:
 
     response = tools.model_with_tools.invoke(messages)
 
-    if not response.tool_calls:
-        try:
-            content = extract_text_content(response.content)
-            # 找到字符串中的 JSON 部分 (处理可能的文本前缀)
-            json_start = content.find('{')
-            json_end = content.rfind('}') + 1
-            final_profile = json.loads(content[json_start:json_end])
-            
-            return {
-                "messages": [response],
-                "profile": final_profile,
-                "status": "success"
-            }
-        except:
-            # 如果解析失败，回退处理
-            return {"messages": [response], "status": "final_text"}
     return {"messages": [response], "status": "processing"}
 
 def extract_text_content(content: Any) -> str:
@@ -140,19 +110,68 @@ def tool_node(state: DataScanState) -> Dict[str, Any]:
     tool_calls = getattr(last_message, "tool_calls", []) or []
 
     tool_messages = []
+    summary_facts = dict(state.get("tool_results", {}))
+    summary_profile = dict(state.get("profile", {}))
 
     for tool_call in tool_calls:
-        tool = tools.TOOLS_BY_NAME[tool_call["name"]]
-        observation = tool.invoke(tool_call["args"])
+        tool_name = tool_call["name"]
+        tool = tools.TOOLS_BY_NAME[tool_name]
+        result = tool.invoke(tool_call["args"])
+        
+        summary_facts[tool_name] = result
+
+        if result.get("status") =="success":
+            data = result.get("data", {})
+
+            # 语义映射规则
+            if tool_name == "tool_prepare_file":
+                summary_profile["primary_file"] = result.get("primary_file")
+                summary_profile["file_type"] = result.get("file_type")
+
+            elif tool_name == "tool_detect_format":
+                summary_profile["Form"] = result.get("Form")
+                summary_profile["Confidence"] = result.get("Confidence")
+
+            elif tool_name == "tool_analyze_raster":
+                summary_profile["Spatial"] = data.get("Spatial", {})
+                summary_profile["Resolution"] = data.get("Resolution", {})
+                summary_profile["Value_range"] = data.get("Value_range", {})
+                summary_profile["Band_count"] = data.get("Band_count", "Unknown")
+                summary_profile["NoData"] = data.get("NoData", "Unknown")
+
+            elif tool_name == "tool_analyze_vector":
+                summary_profile["Spatial"] = data.get("Spatial", {})
+                summary_profile["Feature_count"] = data.get("Feature_count", "Unknown")
+                summary_profile["Geometry_type"] = data.get("Geometry_type", "Unknown")
+                summary_profile["Attributes"] = data.get("Attributes", [])
+
+            elif tool_name == "tool_analyze_table":
+                summary_profile["Row_count"] = data.get("Row_count", "Unknown")
+                summary_profile["Columns"] = data.get("Columns", [])
+                summary_profile["Dtypes"] = data.get("Dtypes", {})
+                summary_profile["Sample_rows"] = data.get("Sample_rows", [])
+
+            elif tool_name == "tool_analyze_timeseries":
+                summary_profile["Dimensions"] = data.get("Dimensions", {})
+                summary_profile["Variables"] = data.get("Variables", [])
+                summary_profile["Has_time"] = data.get("Has_time", False)
+
+            elif tool_name == "tool_analyze_parameter":
+                summary_profile["Value_type"] = data.get("Value_type", "Unknown")
+                summary_profile["Unit"] = data.get("Unit", "Unknown")
+
+        
 
         tool_messages.append(ToolMessage(
-            content=json.dumps(observation, ensure_ascii=False),
+            content=json.dumps(result, ensure_ascii=False),
             tool_call_id=tool_call["id"],
-            tool_name=tool_call["name"]
+            tool_name=tool_name
         ))
 
     return {
-        "messages": tool_messages
+        "messages": tool_messages,
+        "profile": summary_profile,
+        "staus": "processing"
     }
 
 def should_continue(state: DataScanState) -> Any:

@@ -371,13 +371,14 @@ async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = 
             initial_state: DataScanState = {
                 "messages": [],
                 "file_path": file_path,
-                "tool_results": {},
+                "facts": {},
                 "profile": {},
                 "status": "processing"
             }
             
             # 流式调用 LangGraph Agent
             current_tool = None
+            final_state = None
             
             async for event in data_scan_agent.astream(
                 initial_state,
@@ -385,8 +386,9 @@ async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = 
             ):
                 # 处理不同类型的事件
                 if isinstance(event, dict):
+                    final_state = merge_state(final_state, event)
+
                     for node_name, node_output in event.items():
-                        
                         # LLM 节点事件
                         if node_name == "llm_node":
                             messages = node_output.get("messages", [])
@@ -425,18 +427,19 @@ async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = 
                                 yield f"data: {json.dumps({
                                     'type': 'tool_result',
                                     'tool': tool_name,
-                                    'data': tool_result,
+                                    'profile': final_state.get("profile", {}),
                                     'message': f'工具执行完成: {tool_name}'
                                 }, ensure_ascii=False)}\n\n"
-                        
-                        # 进度更新
-                        yield f"data: {json.dumps({
-                            'type': 'progress',
-                            'node': node_name
-                        }, ensure_ascii=False)}\n\n"
                 
                 await asyncio.sleep(0)
-            
+
+            yield f"data: {json.dumps({
+                'type': 'final',
+                'message': 'data scan completed',
+                'profile': final_state.get("profile", {}),
+                'session_id': session_id
+            }, ensure_ascii=False)}\n\n"
+
         except Exception as e:
             yield f"data: {json.dumps({
                 'type': 'error',
@@ -453,6 +456,13 @@ async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = 
             "Connection": "keep-alive"
         }
     )
+
+def merge_state(old, update):
+    if old is None:
+        return update
+    for _, v in update.items():
+        old.update(v)
+    return old
 
 # ============= 智能体协调者路由（暂时保留框架） =============
 

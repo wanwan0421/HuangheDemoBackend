@@ -503,7 +503,6 @@ export class DataMappingService {
      */
     async pipeAgentDataScanSSE(filePath: string, res: any, sessionId?: string): Promise<void> {
         const agentApiUrl = `${process.env.agentUrl}/data-scan/stream`;
-        console.log(`Connecting to Agent SSE stream: ${agentApiUrl}`);
         try {
             const params = new URLSearchParams();
             params.append('file_path', filePath);

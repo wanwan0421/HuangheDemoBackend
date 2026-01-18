@@ -26,7 +26,7 @@ client = genai.Client(api_key=GOOGLE_API_KEY )
 
 data_scan_model = ChatGoogleGenerativeAI(
     model= "gemini-2.5-flash",
-    temperature=1.0,
+    temperature=0,
     max_retries=2,
     streaming=True,
     google_api_key=GOOGLE_API_KEY ,
@@ -45,7 +45,11 @@ class DataScanState(TypedDict):
     # 工具“事实层”
     facts: Annotated[Dict[str, Any], operator.or_]
 
+    # 结构化数据画像
     profile: Annotated[Dict[str, Any], operator.or_]
+
+    # 解释层 
+    explanation: Annotated[str, operator.add]
 
     # 状态
     status: str

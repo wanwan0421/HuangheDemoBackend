@@ -417,11 +417,6 @@ async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = 
                             tool_results = node_output.get("messages", [])
 
                             for tmsg in tool_results:
-                                try:
-                                    tool_result = json.loads(tmsg.content)
-                                except Exception:
-                                    tool_result = tmsg.content
-                                
                                 tool_name = getattr(tmsg, "tool_name", "unknown")
                                 
                                 yield f"data: {json.dumps({
@@ -437,6 +432,7 @@ async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = 
                 'type': 'final',
                 'message': 'data scan completed',
                 'profile': final_state.get("profile", {}),
+                'explanation': final_state.get("explanation", ""),
                 'session_id': session_id
             }, ensure_ascii=False)}\n\n"
 

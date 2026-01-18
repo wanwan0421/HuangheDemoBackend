@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 import operator
 from google import genai
 from . import tools
-from .tools import DataScanState
+from .tools import DataScanState, data_scan_model
 
 def llm_node(state: DataScanState) -> Dict[str, Any]:
     """
@@ -25,7 +25,7 @@ def llm_node(state: DataScanState) -> Dict[str, Any]:
         1.首先调用`tool_prepare_file`工具，传入文件路径，准备数据。
         2.根据准备的数据，调用`tool_detect_format`工具，检测数据类型。
         3.根据数据类型的检测结果，调用专项分析工具，包括`tool_analyze_raster`, `tool_analyze_vector`, `tool_analyze_table`, `tool_analyze_timeseries`, `tool_analyze_parameter`，提取元数据。
-        4.最终，调用`tool_generate_profile`工具，综合所有工具的结果，生成最终的数据画像，包含数据形式、领域信息、语义摘要等。
+        4.只有当所有信息完整，且你不再需要调用任何工具时，才进行最后的总结。
 
         **重要规则**：
         1.必须先调用`tool_prepare_file`
@@ -63,12 +63,11 @@ def llm_node(state: DataScanState) -> Dict[str, Any]:
             -value_type：值类型（int, float, string, boolean）
             -unit：单位
 
-        第三层：领域语义扩展
-        1.domain：领域信息（具体数据在某个学科中意味着什么）
-
-        注意：当你完成所有工具调用并准备生成最终画像时，必须且只能输出一个合法的 JSON 字符串，不要包含任何前导说明文字或 Markdown 格式。
-        JSON 结构必须严格符合{DataScanState}的profile定义。
-        """
+    当所有工具执行完毕，请基于所有的结果，生成该数据的解释说明，内容包括但不限于：
+    1.数据的基本属性和特征
+    2.数据的潜在用途和应用场景
+    3.有无明显的使用限制或注意事项
+    """
 
     user_message = f"""请根据以下信息，生成数据画像：
     文件路径: {state['file_path']}"""
@@ -79,6 +78,9 @@ def llm_node(state: DataScanState) -> Dict[str, Any]:
     ] + state["messages"]
 
     response = tools.model_with_tools.invoke(messages)
+
+    if not response.tool_calls:
+        return {"messages": [response], "status": "completed", "explanation": extract_text_content(response.content)}
 
     return {"messages": [response], "status": "processing"}
 
@@ -110,15 +112,12 @@ def tool_node(state: DataScanState) -> Dict[str, Any]:
     tool_calls = getattr(last_message, "tool_calls", []) or []
 
     tool_messages = []
-    summary_facts = dict(state.get("tool_results", {}))
     summary_profile = dict(state.get("profile", {}))
 
     for tool_call in tool_calls:
         tool_name = tool_call["name"]
         tool = tools.TOOLS_BY_NAME[tool_name]
         result = tool.invoke(tool_call["args"])
-        
-        summary_facts[tool_name] = result
 
         if result.get("status") =="success":
             data = result.get("data", {})
@@ -160,8 +159,6 @@ def tool_node(state: DataScanState) -> Dict[str, Any]:
                 summary_profile["Value_type"] = data.get("Value_type", "Unknown")
                 summary_profile["Unit"] = data.get("Unit", "Unknown")
 
-        
-
         tool_messages.append(ToolMessage(
             content=json.dumps(result, ensure_ascii=False),
             tool_call_id=tool_call["id"],
@@ -171,7 +168,7 @@ def tool_node(state: DataScanState) -> Dict[str, Any]:
     return {
         "messages": tool_messages,
         "profile": summary_profile,
-        "staus": "processing"
+        "status": "processing"
     }
 
 def should_continue(state: DataScanState) -> Any:
@@ -183,7 +180,7 @@ def should_continue(state: DataScanState) -> Any:
         Literal["tool_node", END]: 如果需要调用工具则返回 "tool_node"，否则返回 END
     """
     last_message = state["messages"][-1]
-    if last_message.tool_calls:
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
         return "tool_node"
     
     return END

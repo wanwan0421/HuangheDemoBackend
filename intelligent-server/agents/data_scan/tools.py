@@ -18,6 +18,7 @@ from google import genai
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.messages import AnyMessage
 import operator
+from pyproj import CRS
 
 # 初始化模型
 load_dotenv()
@@ -445,14 +446,22 @@ def tool_analyze_raster(file_path: str) -> Dict[str, Any]:
     """
     try:
         with rasterio.open(file_path) as src:
-            bounds = src.bounds
-            raw_crs = str(src.crs)
+            crs_info = parse_wkt_to_dict(src.crs.to_wkt())
+
             return {
                 "status": "success",
                 "data": {
                     "Spatial": {
-                        "Crs": parse_wkt_to_dict(raw_crs),
-                        "Extent": [bounds.left, bounds.bottom, bounds.right, bounds.top]
+                        "Crs": crs_info,
+                        "Extent": {
+                            "min_x": src.bounds.left,
+                            "max_x": src.bounds.right,
+                            "min_y": src.bounds.bottom,
+                            "max_y": src.bounds.top,
+                            "unit": crs_info["Unit"],
+                            "label_x": "Easting (X)" if crs_info["Is_Projected"] else "Longitude",
+                            "label_y": "Northing (Y)" if crs_info["Is_Projected"] else "Latitude"
+                        }
                     },
                     "Resolution": {"x": abs(src.res[0]), "y": abs(src.res[1])},
                     "Value_range": [src.read().min().item(), src.read().max().item()],
@@ -483,8 +492,11 @@ def tool_analyze_vector(file_path: str) -> Dict[str, Any]:
     """
     try:
         gdf = gpd.read_file(file_path)
+
+        raw_wkt = gdf.crs.to_wkt() if gdf.crs else ""
+        crs_info = parse_wkt_to_dict(raw_wkt)
+
         bounds = gdf.total_bounds.tolist()
-        raw_crs = str(gdf.crs)
         
         geom_type = "Unknown"
         if not gdf.empty:
@@ -497,8 +509,16 @@ def tool_analyze_vector(file_path: str) -> Dict[str, Any]:
             "status": "success",
             "data": {
                 "Spatial": {
-                    "Crs": parse_wkt_to_dict(raw_crs),
-                    "Extent": bounds
+                    "Crs": crs_info,
+                    "Extent": {
+                        "min_x": bounds[0],
+                        "max_x": bounds[2],
+                        "min_y": bounds[1],
+                        "max_y": bounds[3],
+                        "unit": crs_info["Unit"],
+                        "label_x": "Easting (X)" if crs_info["Is_Projected"] else "Longitude",
+                        "label_y": "Northing (Y)" if crs_info["Is_Projected"] else "Latitude"
+                    }
                 },
                 "Geometry_type": geom_type,
                 "Feature_count": len(gdf),
@@ -662,30 +682,76 @@ def normalize_kernel_type(kernel_type: Optional[str]) -> str:
 
 def parse_wkt_to_dict(wkt_str: str) -> Dict[str, str]:
     """
-    解析WKT字符串提取关键坐标系信息
+    使用 pyproj 优化解析 WKT 字符串
     """
     if not wkt_str or len(wkt_str) < 10:
-        return {"raw": wkt_str}
+        return {"Name": "Unknown", "Wkt": wkt_str}
     
-    # 提取 PROJCS 或 GEOGCS 名称
-    name_match = re.search(r'(?:PROJCS|GEOGCS)\["([^"]+)"', wkt_str)
-    # 提取 基准面 DATUM
-    datum_match = re.search(r'DATUM\["([^"]+)"', wkt_str)
-    # 提取 投影 PROJECTION
-    proj_match = re.search(r'PROJECTION\["([^"]+)"', wkt_str)
-    # 提取 中央经线 central_meridian
-    cm_match = re.search(r'PARAMETER\["central_meridian",([\d\.-]+)\]', wkt_str)
-    # 提取 单位 UNIT
-    unit_match = re.search(r'UNIT\["([^"]+)"', wkt_str)
+    try:
+        # 将 WKT 转换为 CRS 对象
+        crs_obj = CRS.from_wkt(wkt_str)
+        
+        # 提取单位：如果是投影坐标系，优先获取线性单位(如 metre)
+        unit = "Unknown"
+        if crs_obj.is_projected:
+            unit = crs_obj.axis_info[0].unit_name # 准确获取 'metre'
+        else:
+            unit = "degree"
 
-    return {
-        "Name": name_match.group(1) if name_match else "Unknown",
-        "Datum": datum_match.group(1) if datum_match else "Unknown",
-        "Projection": proj_match.group(1) if proj_match else "Geographic",
-        "Central_meridian": f"{cm_match.group(1)}°E" if cm_match else "N/A",
-        "Unit": unit_match.group(1) if unit_match else "Unknown",
-        "Wkt": wkt_str
+        # 提取投影信息
+        proj_name = "Geographic"
+        if crs_obj.coordinate_operation and hasattr(crs_obj.coordinate_operation, 'method_name'):
+            proj_name = crs_obj.coordinate_operation.method_name
+        else:
+            proj_name = "Projected"
+
+        # 提取中央经线
+        cm = "N/A"
+        if crs_obj.is_projected:
+            # 遍历投影参数寻找中央经线
+            for param in crs_obj.coordinate_operation.params:
+                if "central_meridian" in param.name.lower():
+                    cm = f"{param.value}°E"
+                    break
+
+        return {
+            "Name": crs_obj.name,           # 'CGCS2000_3_Degree_GK_CM_113E'
+            "Datum": crs_obj.datum.name if crs_obj.datum else "Unknown",
+            "Projection": proj_name,
+            "Central_meridian": cm,
+            "Unit": unit,                   # 现在会准确返回 'metre'
+            "Is_Projected": crs_obj.is_projected,
+            "Wkt": wkt_str
+        }
+    except Exception as e:
+        # 兜底：如果解析失败，返回基础信息
+        return {"Name": "Parse Error", "Error": str(e), "Wkt": wkt_str}
+
+def build_spatial_info(raw_crs: str, bounds: list) -> Dict[str, Any]:
+    """
+    统一构建 Spatial 语义结构
+    """
+    spatial = {
+        "Crs": parse_wkt_to_dict(raw_crs),
+        "Extent": {
+            "bbox": bounds,
+            "axis": ["X", "Y"],
+            "unit": "unknown",
+            "crs_type": "unknown"
+        }
     }
+
+    if raw_crs:
+        crs = CRS.from_wkt(raw_crs)
+
+        spatial["Extent"]["crs_type"] = (
+            "projected" if crs.is_projected else "geographic"
+        )
+
+        if crs.axis_info:
+            spatial["Extent"]["unit"] = crs.axis_info[0].unit_name
+
+    return spatial
 
 # ============================================================================
 # 工具7: 整合工具（可选）

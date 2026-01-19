@@ -5,7 +5,6 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.messages import HumanMessage, SystemMessage, AnyMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END
 from dotenv import load_dotenv
-import operator
 from google import genai
 from . import tools
 from .tools import DataScanState, data_scan_model
@@ -33,7 +32,7 @@ def llm_node(state: DataScanState) -> Dict[str, Any]:
         3.所有工具调用完成后，基于已有的工具结果生成最终完整的profile
         4.最终返回的profile必须整合所有工具的分析结果
 
-        **关键元数据**
+        **关键元数据解释**
         第一层：最小通用语义内核
         1.form：数据形式（Raster, Vector, Table, Timeseries, Parameter）
         2.spatial：空间域信息，包括crs：空间参考系统（如EPSG:4326）和extent：空间范围（如 [minX, minY, maxX, maxY]）
@@ -63,11 +62,12 @@ def llm_node(state: DataScanState) -> Dict[str, Any]:
             -value_type：值类型（int, float, string, boolean）
             -unit：单位
 
-    当所有工具执行完毕，请基于所有的结果，生成该数据的解释说明，内容包括但不限于：
-    1.数据的基本属性和特征
-    2.数据的潜在用途和应用场景
-    3.有无明显的使用限制或注意事项
-    """
+        **数据解释说明**
+        当所有工具执行完毕，请基于所有的结果，生成该数据的解释说明，内容包括但不限于：
+        1.数据的基本属性和特征
+        2.数据的潜在用途和应用场景
+        3.有无明显的使用限制或注意事项
+        """
 
     user_message = f"""请根据以下信息，生成数据画像：
     文件路径: {state['file_path']}"""

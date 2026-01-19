@@ -2,6 +2,7 @@ from fastapi import FastAPI, WebSocket, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from agents.model_recommend.graph import agent
+from agents.model_requirement.tools import tool_parse_mdl
 from agents.data_scan.graph import DataScanState, data_scan_agent
 from agents.supervisor import supervisor, SupervisorState
 from agents.registry import list_agents, get_agent_info
@@ -280,6 +281,38 @@ class DataScanStreamRequest(BaseModel):
     file_path: str
     session_id: Optional[str] = None
     include_samples: Optional[bool] = True  # 是否包含样本数据
+class ModelRequirementScanRequest(BaseModel):
+    """模型需求扫描请求体（MDL解析）"""
+    mdl: Any  # MDL JSON 对象或字符串
+    session_id: Optional[str] = None
+
+
+@app.post("/api/agent/model-requirement/scan")
+async def model_requirement_scan_endpoint(request: ModelRequirementScanRequest):
+    """
+    模型需求扫描端点：解析 MDL，提取模型输入/输出/参数需求
+
+    输入：MDL JSON（对象或字符串）
+    输出：结构化的需求信息
+    """
+    try:
+        # 直接调用工具以避免引入LLM，确保纯解析
+        mdl_input = request.mdl
+        if isinstance(mdl_input, (dict, list)):
+            result = tool_parse_mdl.invoke({"mdl_data": mdl_input})
+        elif isinstance(mdl_input, str):
+            # 如果是字符串，可能是JSON文本
+            result = tool_parse_mdl.invoke({"mdl_data": mdl_input})
+        else:
+            raise HTTPException(status_code=400, detail="Invalid MDL input type")
+
+        return {
+            "status": result.get("status", "success"),
+            "requirements": result,
+            "session_id": request.session_id
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Model requirement scan failed: {str(e)}")
 
 
 @app.post("/api/agent/data-scan")
@@ -419,12 +452,20 @@ async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = 
                             for tmsg in tool_results:
                                 tool_name = getattr(tmsg, "tool_name", "unknown")
                                 
-                                yield f"data: {json.dumps({
+                                if tool_name == "tool_prepare_file" or tool_name == "tool_detect_format":
+                                    yield f"data: {json.dumps({
                                     'type': 'tool_result',
                                     'tool': tool_name,
-                                    'profile': final_state.get("profile", {}),
                                     'message': f'工具执行完成: {tool_name}'
                                 }, ensure_ascii=False)}\n\n"
+                                    
+                                else:
+                                    yield f"data: {json.dumps({
+                                        'type': 'tool_result',
+                                        'tool': tool_name,
+                                        'profile': final_state.get("profile", {}),
+                                        'message': f'工具执行完成: {tool_name}'
+                                    }, ensure_ascii=False)}\n\n"
                 
                 await asyncio.sleep(0)
 

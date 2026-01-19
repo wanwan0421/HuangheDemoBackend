@@ -1,16 +1,27 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model, Types } from 'mongoose';
+import { Observable } from 'rxjs';
 import { DataFormCandidate, DataSemanticProfile, DatasetPackage } from './dto/dataSemanticProfile.dto';
+import { Session, SessionDocument } from '../chat/schemas/session.schema';
+import { Message, MessageDocument } from '../chat/schemas/message.schema';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as unzipper from 'unzipper';
 import { spawn } from 'child_process';
 import axios from 'axios';
+import type { Response } from 'express';
 
 @Injectable()
 export class DataMappingService {
     private readonly logger = new Logger(DataMappingService.name);
     private readonly pythonInspectorScript = path.join(__dirname, 'data-inspector.py');
     private readonly pythonExe = path.join(__dirname, '..', '..', '..', 'venv', 'Scripts', 'python.exe');
+
+    constructor(
+        @InjectModel(Session.name) private readonly sessionModel: Model<SessionDocument>,
+        @InjectModel(Message.name) private readonly messageModel: Model<MessageDocument>,
+    ) {}
 
     /**
      * 生成数据ID
@@ -554,6 +565,186 @@ export class DataMappingService {
         }
     }
 
+        /**
+         * 流式数据扫描，并保存结果到数据库
+         * @param sessionId Session ID
+         * @param filePath 文件路径
+         */
+        streamDataScanWithMemory(sessionId: string, filePath: string): Observable<{ event?: string; data: any }> {
+            if (!filePath) {
+                throw new Error('File path is required');
+            }
+
+            return new Observable<{ event?: string; data: any }>((observer) => {
+                let scanResult = '';
+                let profileData: any = null;
+                const tools: any[] = [];
+
+                this.getDataScanStream(filePath, sessionId).subscribe({
+                    next: (event) => {
+                        observer.next(event);
+                        const payload = event.data;
+                                        
+                        // 记录工具调用
+                        if (payload?.tool && payload.type === 'tool_result') {
+                            tools.push(payload);
+                        }
+                    
+                        // 捕获完整的profile数据和累积扫描结果文本
+                        if (payload?.type === 'final' && payload.profile) {
+                            profileData = payload.profile;
+                            scanResult += payload.explanation || '';
+                            // 预存到 session 中
+                            this.sessionModel.findByIdAndUpdate(sessionId, {
+                                dataProfile: profileData,
+                                updatedAt: new Date(),
+                            }).exec()
+                                .then(() => this.logger.log('Data profile pre-saved to session'))
+                                .catch(err => this.logger.error('Pre-save error:', err));
+                        }
+                    },
+                    complete: async () => {
+                        await this.persistDataScanResult(sessionId, scanResult, tools, profileData);
+                        observer.complete();
+                    },
+                    error: async (err) => {
+                        this.logger.error('Data scan stream interrupted:', err.message);
+                        // 即使断开，也保存已获取的结果
+                        await this.persistDataScanResult(sessionId, scanResult, tools, profileData);
+                        observer.error(err);
+                    },
+                });
+            });
+        }
+
+        /**
+         * 获取数据扫描流
+         * @param filePath 文件路径
+         * @param sessionId Session ID
+         */
+        private getDataScanStream(filePath: string, sessionId?: string): Observable<{ event?: string; data: any }> {
+            const agentApiUrl = `${process.env.agentUrl}/data-scan/stream`;
+            const params = new URLSearchParams();
+            params.append('file_path', filePath);
+            if (sessionId) {
+                params.append('session_id', sessionId);
+            }
+
+            return new Observable((observer) => {
+                axios({
+                    method: 'GET',
+                    url: `${agentApiUrl}?${params.toString()}`,
+                    responseType: 'stream',
+                    headers: { Accept: 'text/event-stream' },
+                }).then((response) => {
+                    let buffer = '';
+
+                    response.data.on('data', (chunk: Buffer) => {
+                        buffer += chunk.toString();
+                        const lines = buffer.split('\n');
+                        buffer = lines.pop() || '';
+
+                        for (const line of lines) {
+                            if (line.startsWith('data: ')) {
+                                try {
+                                    const data = JSON.parse(line.substring(6));
+                                    observer.next({ data });
+                                } catch (e) {
+                                    this.logger.warn(`Failed to parse SSE data: ${line}`);
+                                }
+                            }
+                        }
+                    });
+
+                    response.data.on('end', () => {
+                        observer.complete();
+                    });
+
+                    response.data.on('error', (err: any) => {
+                        observer.error(err);
+                    });
+                }).catch((err) => {
+                    observer.error(err);
+                });
+            });
+        }
+
+        /**
+         * 保存数据扫描结果到数据库
+         * @param sessionId Session ID
+         * @param scanResult 扫描结果文本
+         * @param tools 工具调用记录
+         * @param profileData 数据 profile
+         */
+        private async persistDataScanResult(
+            sessionId: string,
+            scanResult: string,
+            tools: any[],
+            profileData: any
+        ) {
+            try {
+                const tasks: Promise<any>[] = [];
+            
+                // 保存 AI 扫描结果消息
+                if (scanResult || tools.length > 0) {
+                    tasks.push(
+                        this.saveMessage(
+                            sessionId,
+                            'AI',
+                            scanResult || '数据扫描完成',
+                            tools.length ? tools : undefined
+                        )
+                    );
+                }
+            
+                // 保存 profile 数据到 session（兜底）
+                if (profileData) {
+                    tasks.push(
+                        this.sessionModel.findByIdAndUpdate(sessionId, {
+                            dataProfile: profileData,
+                            updatedAt: new Date(),
+                        }).exec()
+                    );
+                }
+            
+                await Promise.all(tasks);
+                this.logger.log(`Data scan results persisted for session ${sessionId}`);
+            } catch (e) {
+                this.logger.error('Failed to persist data scan results:', e);
+            }
+        }
+
+        /**
+         * 保存消息到数据库
+         * @param sessionId Session ID
+         * @param role 角色
+         * @param content 内容
+         * @param tools 工具调用
+         */
+        async saveMessage(
+            sessionId: string,
+            role: 'user' | 'AI' | 'system',
+            content: string,
+            tools?: any,
+        ): Promise<Message> {
+            const message = new this.messageModel({
+                sessionId: new Types.ObjectId(sessionId),
+                role,
+                content,
+                tools,
+            });
+
+            const saved = await message.save();
+            await this.sessionModel
+                .findByIdAndUpdate(sessionId, {
+                    $inc: { messageCount: 1 },
+                    lastMessage: content.substring(0, 100),
+                    updatedAt: new Date(),
+                })
+                .exec();
+
+            return saved;
+        }
     /**
      * 第四阶段：使用LLM检验、修正和补全数据分析结果
      * @param filePath 主要文件路径

@@ -29,6 +29,9 @@ export class Session {
         description: string;
         workflow: any[];
     };
+
+    @Prop({ type: Object })
+    dataProfile?: any;
 }
 
 export const SessionSchema = SchemaFactory.createForClass(Session);

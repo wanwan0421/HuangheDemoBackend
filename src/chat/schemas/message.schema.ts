@@ -16,6 +16,12 @@ export class Message {
     @Prop({ required: true })
     content: string;
 
+    @Prop({ default: 'text' })
+    type: 'text' | 'tool' | 'data';
+
+    @Prop({ type: Object })
+    profile?: any;
+
     @Prop({ type: Object })
     tools?: ToolDto[];
 

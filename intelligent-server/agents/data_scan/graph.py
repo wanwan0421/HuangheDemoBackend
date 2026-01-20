@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from google import genai
 from . import tools
 from .tools import DataScanState, data_scan_model
+import re
 
 def llm_node(state: DataScanState) -> Dict[str, Any]:
     """
@@ -34,39 +35,44 @@ def llm_node(state: DataScanState) -> Dict[str, Any]:
 
         **关键元数据解释**
         第一层：最小通用语义内核
-        1.form：数据形式（Raster, Vector, Table, Timeseries, Parameter）
-        2.spatial：空间域信息，包括crs：空间参考系统（如EPSG:4326）和extent：空间范围（如 [minX, minY, maxX, maxY]）
-        3.temporal：时间域信息，包括has_time：是否包含时间维度，time_range：时间范围（如[start, end]）
-        4.semantic：语义摘要，描述数据内容和用途
+        1.Form：数据形式（Raster, Vector, Table, Timeseries, Parameter）
+        2.Spatial：空间域信息，包括crs：空间参考系统（如EPSG:4326）和extent：空间范围（如 [minX, minY, maxX, maxY]）
+        3.Temporal：时间域信息，包括has_time：是否包含时间维度，time_range：时间范围（如[start, end]）
 
         第二层：类型化语义描述
         详细数据画像，依据数据形式包含不同字段
         1.Raster：
-            -resolution：分辨率
-            -band_count：波段数量
-            -value_range：数值范围（如[min, max]）
-            -nodata：无效值
+            -Resolution：分辨率
+            -Statistics：统计信息（如min, max, mean, std, nodata_ratio）
+            -Band_count：波段数量
+            -Value_range：数值范围（如[min, max]）
+            -Nodata：无效值
         2.Vector：
-            -feature_count：要素数量
-            -geometry_type：几何类型（Point, Line, Polygon）
-            -attributes：属性列表，每属性包含name, type, semantic
+            -Geometry_type：包括几何类型（如Point, Line, Polygon）、要素数量、是否有效、有效值数量
+            -Attributes：属性列表，每属性包含name、type、null_count、unique_count
         3.Table：
-            -row_count：行数
-            -columns：列名
-            -column_types：列类型映射（如name, type, semantic等）
-            -sample_rows：样本数据行
+            -Row_count：行数
+            -Columns：列名
+            -Column_types：列类型映射（如name, type, semantic等）
+            -Sample_rows：样本数据行
         4.Timeseries：
-            -dimensions：维度信息
-            -variables：变量列表（如name, type, semantic等）
+            -Dimensions：维度信息
+            -Variables：变量列表（如name, type, semantic等）
+            -Has_time：是否包含时间维度
         5.Parameter：
-            -value_type：值类型（int, float, string, boolean）
-            -unit：单位
+            -Value_type：值类型（int, float, string, boolean）
+            -Unit：单位
+        
+        第三层：领域语义扩展
+        1.Semantic:
+            -Abstract: 数据摘要，简要描述数据内容
+            -Applications: 适用场景，列出数据可能的应用领域
+            -Tags: 3-5个关键词标签，帮助快速理解数据主题
 
-        **数据解释说明**
-        当所有工具执行完毕，请基于所有的结果，生成该数据的解释说明，内容包括但不限于：
-        1.数据的基本属性和特征
-        2.数据的潜在用途和应用场景
-        3.有无明显的使用限制或注意事项
+        **输出与结束规则**
+        1. 当所有分析工具执行完毕，你不需要再生成给用户看的“自然语言解释”，而是将所有分析结果总结成一个最终的JSON对象。
+        2. 请发挥你的专家知识，反推数据的“语义信息”。
+        3. 最终将完整的profile结构体通过状态更新返回。
         """
 
     user_message = f"""请根据以下信息，生成数据画像：
@@ -80,7 +86,25 @@ def llm_node(state: DataScanState) -> Dict[str, Any]:
     response = tools.model_with_tools.invoke(messages)
 
     if not response.tool_calls:
-        return {"messages": [response], "status": "completed", "explanation": extract_text_content(response.content)}
+        raw_content = extract_text_content(response.content)
+        
+        # 1. 强力清洗：只提取最外层的 JSON 部分，去除 ```json 这种 Markdown 标签
+        json_str = raw_content
+        if "```" in raw_content:
+            # 匹配 ```json { ... } ``` 格式
+            match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_content, re.DOTALL)
+            if match:
+                json_str = match.group(1)
+        
+        semantic_data = {"Abstract": "未能解析摘要", "Applications": [], "Tags": []}
+
+        try:
+            semantic_profile = json.loads(json_str)
+            semantic_data = semantic_profile.get("Semantic", {})
+        except Exception:
+            semantic_data = {"Abstract": raw_content, "Applications": "N/A", "Tags": []}
+        
+        return {"messages": [response], "status": "completed", "profile": {**state.get("profile", {}), "Semantic": semantic_data}}
 
     return {"messages": [response], "status": "processing"}
 
@@ -134,13 +158,13 @@ def tool_node(state: DataScanState) -> Dict[str, Any]:
             elif tool_name == "tool_analyze_raster":
                 summary_profile["Spatial"] = data.get("Spatial", {})
                 summary_profile["Resolution"] = data.get("Resolution", {})
+                summary_profile["Statistics"] = data.get("Statistics", {})
                 summary_profile["Value_range"] = data.get("Value_range", {})
                 summary_profile["Band_count"] = data.get("Band_count", "Unknown")
                 summary_profile["NoData"] = data.get("NoData", "Unknown")
 
             elif tool_name == "tool_analyze_vector":
                 summary_profile["Spatial"] = data.get("Spatial", {})
-                summary_profile["Feature_count"] = data.get("Feature_count", "Unknown")
                 summary_profile["Geometry_type"] = data.get("Geometry_type", "Unknown")
                 summary_profile["Attributes"] = data.get("Attributes", [])
 

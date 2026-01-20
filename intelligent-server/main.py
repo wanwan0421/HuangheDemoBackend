@@ -463,7 +463,6 @@ async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = 
                                     yield f"data: {json.dumps({
                                         'type': 'tool_result',
                                         'tool': tool_name,
-                                        'profile': final_state.get("profile", {}),
                                         'message': f'工具执行完成: {tool_name}'
                                     }, ensure_ascii=False)}\n\n"
                 
@@ -471,9 +470,8 @@ async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = 
 
             yield f"data: {json.dumps({
                 'type': 'final',
-                'message': 'data scan completed',
+                'message': final_state.get("messages", []),
                 'profile': final_state.get("profile", {}),
-                'explanation': final_state.get("explanation", ""),
                 'session_id': session_id
             }, ensure_ascii=False)}\n\n"
 

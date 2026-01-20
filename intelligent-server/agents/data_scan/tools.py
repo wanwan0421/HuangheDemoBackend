@@ -437,16 +437,40 @@ def tool_analyze_raster(file_path: str) -> Dict[str, Any]:
         data: {
             Spatial: {
                 Crs: "坐标参考系",
-                Extent: [minX, minY, maxX, maxY]
+                Extent: {min_x: 最小X, max_x: 最大X, min_y: 最小Y, max_y: 最大Y, unit: 单位, label_x: "Easting (X)"|"Longitude", label_y: "Northing (Y)"|"Latitude"}
             },
             Resolution: {x: 像素大小X, y: 像素大小Y},
+            Statistics: {min: 最小值, max: 最大值, mean: 平均值, std: 标准差, nodata_ratio: "无效值比例"},
+            Value_range: [最小值, 最大值],
             Band_count: 波段数,
             Nodata: "无效值"
         }
     """
     try:
         with rasterio.open(file_path) as src:
+            # 基础信息
             crs_info = parse_wkt_to_dict(src.crs.to_wkt())
+
+            # 深度统计，计算真实值分布和空值占比（读取第一波段进行分析）
+            ov_level = 0
+            if src.width * src.height > 1000000: # 超过100万像素则抽样
+                ov_level = 2 
+            
+            data = src.read(1, masked=True) # 使用 masked array 自动处理 nodata
+            
+            # 计算有效值
+            valid_data = data.compressed() # 移除 mask(nodata) 后的扁平数组
+            total_pixels = data.size
+            valid_count = len(valid_data)
+            nodata_ratio = (total_pixels - valid_count) / total_pixels if total_pixels > 0 else 0
+
+            stats = {
+                "min": float(valid_data.min()) if valid_count > 0 else 0,
+                "max": float(valid_data.max()) if valid_count > 0 else 0,
+                "mean": float(valid_data.mean()) if valid_count > 0 else 0,
+                "std": float(valid_data.std()) if valid_count > 0 else 0,
+                "nodata_ratio": f"{nodata_ratio:.2%}"
+            }
 
             return {
                 "status": "success",
@@ -464,6 +488,7 @@ def tool_analyze_raster(file_path: str) -> Dict[str, Any]:
                         }
                     },
                     "Resolution": {"x": abs(src.res[0]), "y": abs(src.res[1])},
+                    "Statistics": stats,
                     "Value_range": [src.read().min().item(), src.read().max().item()],
                     "Band_count": src.count,
                     "Nodata": src.nodata
@@ -493,10 +518,39 @@ def tool_analyze_vector(file_path: str) -> Dict[str, Any]:
     try:
         gdf = gpd.read_file(file_path)
 
+        # 基础信息
         raw_wkt = gdf.crs.to_wkt() if gdf.crs else ""
         crs_info = parse_wkt_to_dict(raw_wkt)
-
         bounds = gdf.total_bounds.tolist()
+
+        # 几何质量检查
+        is_all_valid = gdf.is_valid.all()
+        invalid_count = (~gdf.is_valid).sum()
+
+        # 属性统计摘要
+        # 提取数值型列的描述统计
+        desc = gdf.describe().to_dict()
+
+        detailed_attributes = []
+        for col in gdf.columns:
+            if col == 'geometry': continue
+            
+            attr_info = {
+                "name": col,
+                "type": str(gdf[col].dtype),
+                "null_count": int(gdf[col].isna().sum()),
+                "unique_count": int(gdf[col].nunique())
+            }
+            
+            # 如果是数值列，把 summary 合并进去
+            if col in desc:
+                attr_info["stats"] = {
+                    "min": desc[col]["min"],
+                    "max": desc[col]["max"],
+                    "mean": desc[col]["mean"]
+                }
+            
+            detailed_attributes.append(attr_info)
         
         geom_type = "Unknown"
         if not gdf.empty:
@@ -520,12 +574,13 @@ def tool_analyze_vector(file_path: str) -> Dict[str, Any]:
                         "label_y": "Northing (Y)" if crs_info["Is_Projected"] else "Latitude"
                     }
                 },
-                "Geometry_type": geom_type,
-                "Feature_count": len(gdf),
-                "Attributes": [
-                    {"name": col, "type": str(gdf[col].dtype)}
-                    for col in gdf.columns if col != 'geometry'
-                ]
+                "Geometry_type": {
+                    "Type": geom_type,
+                    "Feature_count": len(gdf),
+                    "Is_all_valid": bool(is_all_valid),
+                    "Invalid_count": int(invalid_count)
+                },
+                "Attributes": detailed_attributes
             }
         }
     except Exception as e:
@@ -752,69 +807,6 @@ def build_spatial_info(raw_crs: str, bounds: list) -> Dict[str, Any]:
             spatial["Extent"]["unit"] = crs.axis_info[0].unit_name
 
     return spatial
-
-# ============================================================================
-# 工具7: 整合工具（可选）
-# ============================================================================
-
-# @tool
-# def tool_generate_profile(state: DataScanState) -> Dict[str, Any]:
-#     """
-#     整合所有工具的分析结果，生成完整的数据画像。
-#     这个工具应该在所有其他分析工具执行完毕后调用。
-    
-#     Args:
-#         state: 当前数据扫描状态，包含所有工具结果
-    
-#     Returns:
-#         完整的数据画像，包含所有层级的信息
-#     """
-#     try:
-#         tool_results = state["tool_results"]
-#         profile = dict(state.get("profile", {}))
-
-#         # 文件信息
-#         profile["primary_file"] = tool_results.get("primary_file", "Unknown")
-#         profile["file_type"] = tool_results.get("file_type", "Unknown")
-
-#         # 第一层级分类
-#         profile["Form"] = tool_results.get("Form", "Unknown")
-#         profile["Confidence"] = tool_results.get("Confidence", 0.0)
-
-#         # 第二层级分类
-#         if profile["Form"] == "Raster":
-#             profile["Spatial"] = tool_results.get("Spatial", {})
-#             profile["Resolution"] = tool_results.get("Resolution", {})
-#             profile["Band_count"] = tool_results.get("Band_count", 0)
-#             profile["Nodata"] = tool_results.get("Nodata", None)
-#             profile["Value_range"] = tool_results.get("Value_range", [])
-#         elif profile["Form"] == "Vector":
-#             profile["Spatial"] = tool_results.get("Spatial", {})
-#             profile["Geometry_type"] = tool_results.get("Geometry_type", "Unknown")
-#             profile["Feature_count"] = tool_results.get("Feature_count", 0)
-#             profile["Attributes"] = tool_results.get("Attributes", [])
-#         elif profile["Form"] == "Table":
-#             profile["Row_count"] = tool_results.get("Row_count", 0)
-#             profile["Columns"] = tool_results.get("Columns", [])
-#             profile["Dtypes"] = tool_results.get("Dtypes", {})
-#             profile["Sample_rows"] = tool_results.get("Sample_rows", [])
-#         elif profile["Form"] == "Timeseries":
-#             profile["Dimensions"] = tool_results.get("Dimensions", {})
-#             profile["Variables"] = tool_results.get("Variables", [])
-#         elif profile["Form"] == "Parameter":
-#             profile["Value_type"] = tool_results.get("Value_type", "Unknown")
-#             profile["Unit"] = tool_results.get("Unit", "Unknown")
-
-#         return {
-#             "profile": profile,
-#             "status": "success"
-#         }
-        
-#     except Exception as e:
-#         return {
-#             "status": "error",
-#             "error": str(e)
-#         }
 
 # ============================================================================
 # 工具注册（供 LangGraph 调用）

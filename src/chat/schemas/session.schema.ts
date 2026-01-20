@@ -31,7 +31,11 @@ export class Session {
     };
 
     @Prop({ type: Object })
-    dataProfile?: any;
+    profile?: any;
+
+    // 存储模型运行的上下文，比如用户选定的输入参数快照
+    @Prop({ type: Object })
+    context?: any;
 }
 
 export const SessionSchema = SchemaFactory.createForClass(Session);

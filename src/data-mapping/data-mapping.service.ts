@@ -593,10 +593,10 @@ export class DataMappingService {
                         // 捕获完整的profile数据和累积扫描结果文本
                         if (payload?.type === 'final' && payload.profile) {
                             profileData = payload.profile;
-                            scanResult += payload.explanation || '';
+                            scanResult += payload.message || '';
                             // 预存到 session 中
                             this.sessionModel.findByIdAndUpdate(sessionId, {
-                                dataProfile: profileData,
+                                profile: profileData,
                                 updatedAt: new Date(),
                             }).exec()
                                 .then(() => this.logger.log('Data profile pre-saved to session'))
@@ -685,14 +685,29 @@ export class DataMappingService {
             try {
                 const tasks: Promise<any>[] = [];
             
+                // 保存 AI 扫描工具消息
+                if (scanResult || tools.length > 0) {
+                    tasks.push(
+                        this.saveMessage(
+                            sessionId,
+                            'AI',
+                            scanResult || '',
+                            tools.length ? tools : undefined,
+                            'tool'
+                        )
+                    );
+                }
+
                 // 保存 AI 扫描结果消息
                 if (scanResult || tools.length > 0) {
                     tasks.push(
                         this.saveMessage(
                             sessionId,
                             'AI',
-                            scanResult || '数据扫描完成',
-                            tools.length ? tools : undefined
+                            scanResult || '',
+                            tools.length ? tools : undefined,
+                            'data',
+                            profileData
                         )
                     );
                 }
@@ -701,7 +716,7 @@ export class DataMappingService {
                 if (profileData) {
                     tasks.push(
                         this.sessionModel.findByIdAndUpdate(sessionId, {
-                            dataProfile: profileData,
+                            profile: profileData,
                             updatedAt: new Date(),
                         }).exec()
                     );
@@ -726,12 +741,16 @@ export class DataMappingService {
             role: 'user' | 'AI' | 'system',
             content: string,
             tools?: any,
+            type: 'text' | 'tool' | 'data' = 'text',
+            profile?: any,
         ): Promise<Message> {
             const message = new this.messageModel({
                 sessionId: new Types.ObjectId(sessionId),
                 role,
                 content,
                 tools,
+                type,
+                profile,
             });
 
             const saved = await message.save();

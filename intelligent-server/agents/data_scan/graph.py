@@ -43,13 +43,15 @@ def llm_node(state: DataScanState) -> Dict[str, Any]:
         详细数据画像，依据数据形式包含不同字段
         1.Raster：
             -Resolution：分辨率
-            -Statistics：统计信息（如min, max, mean, std, nodata_ratio）
+            -Statistics：统计信息（如min, max, mean, std）
             -Band_count：波段数量
-            -Value_range：数值范围（如[min, max]）
             -Nodata：无效值
+            -Data_Type：数据类型（如uint8, float32等）
+            -Quality：问题列表，空值比例
         2.Vector：
             -Geometry_type：包括几何类型（如Point, Line, Polygon）、要素数量、是否有效、有效值数量
             -Attributes：属性列表，每属性包含name、type、null_count、unique_count
+            -Quality：问题列表，空几何比例
         3.Table：
             -Row_count：行数
             -Columns：列名
@@ -159,14 +161,16 @@ def tool_node(state: DataScanState) -> Dict[str, Any]:
                 summary_profile["Spatial"] = data.get("Spatial", {})
                 summary_profile["Resolution"] = data.get("Resolution", {})
                 summary_profile["Statistics"] = data.get("Statistics", {})
-                summary_profile["Value_range"] = data.get("Value_range", {})
                 summary_profile["Band_count"] = data.get("Band_count", "Unknown")
-                summary_profile["NoData"] = data.get("NoData", "Unknown")
+                summary_profile["NoData"] = data.get("Nodata_Value", "Unknown")
+                summary_profile["Data_Type"] = data.get("Data_Type", "Unknown")
+                summary_profile["Quality"] = data.get("Quality", {})
 
             elif tool_name == "tool_analyze_vector":
                 summary_profile["Spatial"] = data.get("Spatial", {})
                 summary_profile["Geometry_type"] = data.get("Geometry_type", "Unknown")
                 summary_profile["Attributes"] = data.get("Attributes", [])
+                summary_profile["Quality"] = data.get("Quality", {})
 
             elif tool_name == "tool_analyze_table":
                 summary_profile["Row_count"] = data.get("Row_count", "Unknown")

@@ -168,6 +168,7 @@ export class ChatService {
             let aiResponse = '';
             const tools: any[] = [];
             let finalModelData: any = null;
+            let taskSpecData: any = null;
 
             // 记录用户消息（可选，用于历史查看；对话记忆交由 LangGraph）
             void this.saveMessage(sessionId, 'user', query).catch(() => undefined);
@@ -182,29 +183,37 @@ export class ChatService {
                     if (payload?.type === 'token') {
                         aiResponse += payload.message || '';
                     }
-                    if (payload?.tool) {
+                    if (payload?.tool && payload.type === 'tool_result') {
                         tools.push(payload);
                     }
-                    if (payload.type === 'model_details_end' && payload.data) {
+                    if (payload.type === 'tool_result' && payload.tool === 'get_model_details' && payload.data) {
                         finalModelData = payload.data;
                         this.sessionModel.findByIdAndUpdate(sessionId, {
                             recommendedModel: {
                                 name: finalModelData.name,
+                                md5: finalModelData.md5,
                                 description: finalModelData.description,
                                 workflow: finalModelData.workflow,
                             },
                             updatedAt: new Date(),
                         }).exec().then(() => console.log('Model details pre-saved.')).catch(err => console.error('Pre-save error:', err));
                     }
+                    if (payload.type === 'final' && payload.Task_spec) {
+                        taskSpecData = payload.Task_spec;
+                        this.sessionModel.findByIdAndUpdate(sessionId, {
+                            taskSpec: taskSpecData,
+                            updatedAt: new Date(),
+                        }).exec().then(() => console.log('Task spec pre-saved.')).catch(err => console.error('Pre-save error:', err));
+                    }
                 },
                 complete: async () => {
-                    await this.persistFinalData(sessionId, aiResponse, tools, finalModelData);
+                    await this.persistFinalData(sessionId, aiResponse, tools, finalModelData, taskSpecData);
                     observer.complete();
                 },
                 error: async (err) => {
                     console.error('SSE Stream Interrupted:', err.message);
                     // 即便断开了，也要把已经拿到的部分 AI 回答存入数据库
-                    await this.persistFinalData(sessionId, aiResponse, tools, finalModelData);
+                    await this.persistFinalData(sessionId, aiResponse, tools, finalModelData, taskSpecData);
                     observer.error(err);
                 },
             });
@@ -212,7 +221,7 @@ export class ChatService {
     }
 
     // 提取公共保存逻辑
-    private async persistFinalData(sessionId: string, aiResponse: string, tools: any[], modelData: any) {
+    private async persistFinalData(sessionId: string, aiResponse: string, tools: any[], modelData: any, taskSpecData: any) {
         try {
             const tasks: Promise<any>[] = [];
             if (aiResponse || tools.length > 0) {
@@ -222,6 +231,12 @@ export class ChatService {
             if (modelData) {
                 tasks.push(this.sessionModel.findByIdAndUpdate(sessionId, {
                     recommendedModel: modelData,
+                    updatedAt: new Date(),
+                }).exec());
+            }
+            if (taskSpecData) {
+                tasks.push(this.sessionModel.findByIdAndUpdate(sessionId, {
+                    taskSpec: taskSpecData,
                     updatedAt: new Date(),
                 }).exec());
             }

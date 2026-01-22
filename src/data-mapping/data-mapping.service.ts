@@ -684,19 +684,6 @@ export class DataMappingService {
         ) {
             try {
                 const tasks: Promise<any>[] = [];
-            
-                // 保存 AI 扫描工具消息
-                if (scanResult || tools.length > 0) {
-                    tasks.push(
-                        this.saveMessage(
-                            sessionId,
-                            'AI',
-                            scanResult || '',
-                            tools.length ? tools : undefined,
-                            'tool'
-                        )
-                    );
-                }
 
                 // 保存 AI 扫描结果消息
                 if (scanResult || tools.length > 0) {

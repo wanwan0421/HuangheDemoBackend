@@ -13,8 +13,8 @@ export class Message {
     @Prop({ required: true, enum: ['user', 'AI'] })
     role: 'user' | 'AI';
 
-    @Prop({ required: true })
-    content: string;
+    @Prop()
+    content?: string;
 
     @Prop({ default: 'text' })
     type: 'text' | 'tool' | 'data';

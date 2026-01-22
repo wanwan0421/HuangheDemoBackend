@@ -1,7 +1,7 @@
 from fastapi import FastAPI, WebSocket, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from agents.model_recommend.graph import agent
+from agents.model_recommend.graph import agent, ModelState
 from agents.model_requirement.tools import tool_parse_mdl
 from agents.data_scan.graph import DataScanState, data_scan_agent
 from agents.supervisor import supervisor, SupervisorState
@@ -90,7 +90,6 @@ def map_agent_event(event: Dict[str, Any], root_started_ref, root_finished_ref) 
                 elif isinstance(c, str):
                     texts.append(c)
             content = "".join(texts)
-            print("content:", content)
 
         if content:
             return {
@@ -162,6 +161,16 @@ def map_agent_event(event: Dict[str, Any], root_started_ref, root_finished_ref) 
 
     return None
 
+def extract_text(content):
+    if isinstance(content, str):
+        return content
+    elif isinstance(content, dict) and "text" in content:
+        return content["text"]
+    elif isinstance(content, list):
+        return "".join(extract_text(c) for c in content)
+    else:
+        return ""
+
 @app.get("/api/agent/stream")
 async def stream_agent(query: str, sessionId: Optional[str] = None):
     print("Received stream query:", query, "sessionId:", sessionId)
@@ -177,15 +186,12 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
         }
 
         try:
-            def extract_text(content):
-                if isinstance(content, str):
-                    return content
-                elif isinstance(content, dict) and "text" in content:
-                    return content["text"]
-                elif isinstance(content, list):
-                    return "".join(extract_text(c) for c in content)
-                else:
-                    return ""
+            final_state: ModelState= {
+                "messages": [],
+                "session_id": thread_id,
+                "status": "processing",
+                "Task_spec": {}
+            }
 
             async for mode, chunk in agent.astream(
                 init_input,
@@ -207,29 +213,39 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
                         content = extract_text(content)
 
                         if content and content.strip(): 
-                            print("content:", content) # 调试用
                             # 发送命名事件 + data
                             yield f"data: {json.dumps({'type': 'token', 'message': content}, ensure_ascii=False)}\n\n"
 
                 elif mode == "updates":
                     # 一般是节点名+小更新内容
                     if isinstance(chunk, dict):
+                        final_state = merge_state(final_state, chunk)
+
                         for node_name, node_output in chunk.items():
                             if node_name == "llm_node":
                                 # 获取messages列表
-                                llm_messages = node_output.get("messages", [])
+                                messages = node_output.get("messages", [])
+                                if messages and len(messages) > 0:
+                                    last_msg = messages[-1]    
 
                                 # 处理LLM调用工具
-                                last_msg = llm_messages[-1] if llm_messages else None
-                                tool_calls = getattr(last_msg, "tool_calls", []) or []
+                                if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                                    for tool_call in last_msg.tool_calls:
+                                        current_tool = tool_call.get('name', 'unknown')
 
-                                if tool_calls:
-                                    for tool_call in tool_calls:
-                                        event_name = tool_call.get('name') if isinstance(tool_call, dict) else str(tool_call)
-                                        yield f"data: {json.dumps({'type': event_name, 'message': event_name}, ensure_ascii=False)}\n\n"
-                                continue
+                                        yield f"data: {json.dumps({
+                                            'type': 'tool_call',
+                                            'tool': current_tool,
+                                            'message': f'工具开始执行: {current_tool}'
+                                        }, ensure_ascii=False)}\n\n"
+                                else:
+                                    # LLM 生成了最终结果
+                                    yield f"data: {json.dumps({
+                                        'type': 'status',
+                                        'message': 'LLM 生成推荐结果'
+                                    }, ensure_ascii=False)}\n\n"
 
-                            if node_name == "tool_node":
+                            elif node_name == "tool_node":
                                 # node_output is like {"messages": [ToolMessage,...]}
                                 tool_msgs = node_output.get("messages", [])
 
@@ -238,27 +254,30 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
                                         tool_result = json.loads(tmsg.content)
                                     except Exception:
                                         tool_result = tmsg.content
-                                    # get tool_name from tmsg if exists (fallback to id if not)
-
+                                    
                                     tool_name = getattr(tmsg, "tool_name", None)
-                                    event_type = {
-                                        "search_relevant_indices":"search_index_end",
-                                        "search_relevant_models":"search_model_end",
-                                        "get_model_details":"model_details_end"
-                                    }.get(tool_name, "tool_complete")
+                                    yield f"data: {json.dumps({
+                                        "type": 'tool_result',
+                                        "tool": tool_name,
+                                        "data": tool_result
+                                    }, ensure_ascii=False)}\n\n"
 
-                                    yield f"data: {json.dumps({"type": event_type, "tool": tool_name, "data": tool_result}, ensure_ascii=False)}\n\n"
+                        continue
 
-                                continue
-
-                            # fallback
-                            yield f"data: {json.dumps({"type": "update", "node": node_name, "data": node_output}, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(0)
 
                 elif mode == "custom":
                     # 工具内部通过 StreamWriter 发出的数据
-                    yield f"data: {json.dumps({'type': 'custom', 'data': chunk}, ensure_ascii=False)}\n\n"
-
-                await asyncio.sleep(0)
+                    yield f"data: {json.dumps({
+                        'type': 'custom',
+                        'data': chunk
+                    }, ensure_ascii=False)}\n\n"
+            
+            yield f"data: {json.dumps({
+                'type': 'final',
+                'Task_spec': final_state.get('Task_spec', {})
+            }, ensure_ascii=False)}\n\n"
+                
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
 
@@ -269,18 +288,6 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
 
 # ============= 数据分析辅助路由 =============
 
-class DataScanRequest(BaseModel):
-    """数据扫描请求体"""
-    file_path: str
-    session_id: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
-
-
-class DataScanStreamRequest(BaseModel):
-    """流式数据扫描请求体"""
-    file_path: str
-    session_id: Optional[str] = None
-    include_samples: Optional[bool] = True  # 是否包含样本数据
 class ModelRequirementScanRequest(BaseModel):
     """模型需求扫描请求体（MDL解析）"""
     mdl: Any  # MDL JSON 对象或字符串
@@ -313,60 +320,6 @@ async def model_requirement_scan_endpoint(request: ModelRequirementScanRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Model requirement scan failed: {str(e)}")
-
-
-@app.post("/api/agent/data-scan")
-async def data_scan_endpoint(request: DataScanRequest):
-    """
-    数据扫描端点：同步调用 LangGraph Agent 分析数据
-    用于 NestJS 后端直接调用，一次性获取完整结果
-    
-    Args:
-        request: 包含文件路径和会话ID
-        
-    Returns:
-        {
-            "status": "ok" | "error",
-            "profile": {...完整的 DataSemanticProfile...},
-            "agent_logs": ["工作流日志1", "工作流日志2"],
-            "session_id": "会话ID"
-        }
-    """
-    try:
-        session_id = request.session_id or str(uuid.uuid4())
-        
-        # 初始化 LangGraph 状态
-        initial_state: DataScanState = {
-            "messages": [],
-            "file_path": request.file_path,
-            "tool_results": {},
-            "profile": {},
-            "status": "processing"
-        }
-        
-        # 同步调用 LangGraph Agent
-        final_state = await asyncio.to_thread(
-            lambda: data_scan_agent.invoke(initial_state)
-        )
-        
-        profile = final_state.get("profile", {})
-        
-        # 添加基础字段
-        if "id" not in profile:
-            profile["id"] = f"data_{Path(request.file_path).stem}_{session_id[:8]}"
-        
-        if "format" not in profile:
-            profile["format"] = Path(request.file_path).suffix.lower()
-        
-        return {
-            "status": "ok",
-            "profile": profile,
-            "agent_logs": ["Agent 分析完成"],
-            "session_id": session_id
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Data scan failed: {str(e)}")
 
 
 @app.get("/api/agent/data-scan/stream")
@@ -411,66 +364,108 @@ async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = 
             
             # 流式调用 LangGraph Agent
             current_tool = None
-            final_state = None
+            final_state: DataScanState = {
+                "messages": [],
+                "file_path": file_path,
+                "facts": {},
+                "profile": {},
+                "status": "processing",
+            }
+            full_response = ""
+            is_json_started = False
             
-            async for event in data_scan_agent.astream(
+            async for mode, chunk in data_scan_agent.astream(
                 initial_state,
-                stream_mode="updates",
+                stream_mode=["messages", "updates", "custom"],
             ):
-                # 处理不同类型的事件
-                if isinstance(event, dict):
-                    final_state = merge_state(final_state, event)
+                if mode == "messages":
+                    message_chunk = chunk[0] if isinstance(chunk, tuple) else chunk
+                    if isinstance(message_chunk, AIMessageChunk):
+                        content = message_chunk.content
 
-                    for node_name, node_output in event.items():
-                        # LLM 节点事件
-                        if node_name == "llm_node":
-                            messages = node_output.get("messages", [])
-                            if messages and len(messages) > 0:
-                                last_msg = messages[-1]
-                                
-                                # 检查是否有工具调用
-                                if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
-                                    for tool_call in last_msg.tool_calls:
-                                        current_tool = tool_call.get("name", "unknown")
-                                        
-                                        yield f"data: {json.dumps({
-                                            'type': 'tool_call',
-                                            'tool': current_tool,
-                                            'message': f'工具开始执行: {current_tool}'
-                                        }, ensure_ascii=False)}\n\n"
-                                else:
-                                    # LLM 生成了最终结果
-                                    yield f"data: {json.dumps({
-                                        'type': 'status',
-                                        'message': 'LLM 生成分析结果'
-                                    }, ensure_ascii=False)}\n\n"
-                        
-                        # 工具执行节点事件
-                        elif node_name == "tool_node":
-                            tool_results = node_output.get("messages", [])
-
-                            for tmsg in tool_results:
-                                tool_name = getattr(tmsg, "tool_name", "unknown")
-                                
-                                if tool_name == "tool_prepare_file" or tool_name == "tool_detect_format":
-                                    yield f"data: {json.dumps({
-                                    'type': 'tool_result',
-                                    'tool': tool_name,
-                                    'message': f'工具执行完成: {tool_name}'
+                        # 如果是字符串
+                        if isinstance(content, str) and content.strip():
+                            if content:
+                                full_response += content
+                                yield f"data: {json.dumps({
+                                    'type': 'token',
+                                    'message': content
                                 }, ensure_ascii=False)}\n\n"
+
+                        # 如果是 list（结构化 chunk）
+                        elif isinstance(content, list):
+                            for part in content:
+                                if isinstance(part, dict) and part.get("type") == "text":
+                                    text = part.get("text", "")
+                                    if text:
+                                        full_response += text
+                                        yield f"data: {json.dumps({
+                                            'type': 'token',
+                                            'message': text
+                                        }, ensure_ascii=False)}\n\n"
+
+                        # 其他类型（忽略）
+                        else:
+                            pass
+
+                        # 逻辑分流：
+                        # 如果还没有遇到 ```json，则认为是给用户看的“口播”文字
+                        if "```json" not in full_response:
+                            yield f"data: {json.dumps({'type': 'token', 'message': content}, ensure_ascii=False)}\n\n"
+                        else:
+                            # 一旦检测到 JSON 开始，前端可以通过 status 事件显示“正在生成精美报告...”
+                            if not is_json_started:
+                                is_json_started = True
+                                yield f"data: {json.dumps({'type': 'status', 'message': '正在构建数据可视化视图...'}, ensure_ascii=False)}\n\n"
+                
+                elif mode == "updates":
+                # 处理不同类型的事件
+                    if isinstance(chunk, dict):
+                        final_state = merge_state(final_state, chunk)
+
+                        for node_name, node_output in chunk.items():
+                            # LLM 节点事件
+                            if node_name == "llm_node":
+                                messages = node_output.get("messages", [])
+                                if messages and len(messages) > 0:
+                                    last_msg = messages[-1]
                                     
-                                else:
+                                    # 检查是否有工具调用
+                                    if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
+                                        for tool_call in last_msg.tool_calls:
+                                            current_tool = tool_call.get("name", "unknown")
+                                            
+                                            yield f"data: {json.dumps({
+                                                'type': 'tool_call',
+                                                'tool': current_tool,
+                                                'message': f'工具开始执行: {current_tool}'
+                                            }, ensure_ascii=False)}\n\n"
+                                    else:
+                                        # LLM 生成了最终结果
+                                        yield f"data: {json.dumps({
+                                            'type': 'status',
+                                            'message': 'LLM 生成分析结果'
+                                        }, ensure_ascii=False)}\n\n"
+                            
+                            # 工具执行节点事件
+                            elif node_name == "tool_node":
+                                tool_results = node_output.get("messages", [])
+
+                                for tmsg in tool_results:
+                                    tool_name = getattr(tmsg, "tool_name", "unknown")
+                                    
                                     yield f"data: {json.dumps({
                                         'type': 'tool_result',
                                         'tool': tool_name,
                                         'message': f'工具执行完成: {tool_name}'
                                     }, ensure_ascii=False)}\n\n"
-                
-                await asyncio.sleep(0)
+
+                        continue
+                    
+                    await asyncio.sleep(0)
 
             yield f"data: {json.dumps({
                 'type': 'final',
-                'message': final_state.get("messages", []),
                 'profile': final_state.get("profile", {}),
                 'session_id': session_id
             }, ensure_ascii=False)}\n\n"

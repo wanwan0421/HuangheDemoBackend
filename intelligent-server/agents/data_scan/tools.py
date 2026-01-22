@@ -19,6 +19,8 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.messages import AnyMessage
 import operator
 from pyproj import CRS
+import numpy as np
+import hashlib
 
 # 初始化模型
 load_dotenv()
@@ -77,6 +79,9 @@ def tool_prepare_file(file_path: str) -> Dict[str, Any]:
     """
     try:
         file_path_obj = Path(file_path)
+
+        # 生成指纹ID
+        file_id = f"uid_{hashlib.md5(file_path.encode('utf-8')).hexdigest()[:8]}"
         
         # 情况1：单个文件
         if file_path_obj.is_file():
@@ -89,9 +94,11 @@ def tool_prepare_file(file_path: str) -> Dict[str, Any]:
             # 普通单文件
             return {
                 "status": "success",
+                "file_id": file_id,
                 "primary_file": str(file_path),
                 "temp_dir": None,
                 "file_type": "single",
+                "file_size_mb": round(os.path.getsize(file_path) / (1024*1024), 2)
             }
         
         # 情况2：目录
@@ -101,9 +108,11 @@ def tool_prepare_file(file_path: str) -> Dict[str, Any]:
             
             return {
                 "status": "success",
+                "file_id": file_id,
                 "primary_file": primary,
                 "temp_dir": None,
                 "file_type": "directory",
+                "file_size_mb": round(os.path.getsize(file_path) / (1024*1024), 2)
             }
         
         return {
@@ -117,12 +126,13 @@ def tool_prepare_file(file_path: str) -> Dict[str, Any]:
             "error": str(e)
         }
 
-
 def handle_archive(archive_path: str) -> Dict[str, Any]:
     """处理压缩包：解压并识别主文件"""
     try:
         ext = Path(archive_path).suffix.lower()
         temp_dir = tempfile.mkdtemp()
+        # 生成指纹ID
+        file_id = f"uid_{hashlib.md5(archive_path.encode('utf-8')).hexdigest()[:8]}"
         
         # 解压
         if ext == '.zip':
@@ -140,12 +150,16 @@ def handle_archive(archive_path: str) -> Dict[str, Any]:
         # 收集解压后的文件
         all_files = collect_files(temp_dir)
         primary = identify_primary_file(all_files)
+        sidecar_exts = [f.suffix.lower() for f in Path(temp_dir).glob(f"{Path(primary).stem}.*")]
         
         return {
             "status": "success",
+            "file_id": file_id,
             "primary_file": primary,
             "temp_dir": temp_dir,
+            "sidecar_files": sidecar_exts,
             "file_type": "archive",
+            "file_size_mb": round(os.path.getsize(archive_path) / (1024*1024), 2)
         }
         
     except Exception as e:
@@ -440,37 +454,49 @@ def tool_analyze_raster(file_path: str) -> Dict[str, Any]:
                 Extent: {min_x: 最小X, max_x: 最大X, min_y: 最小Y, max_y: 最大Y, unit: 单位, label_x: "Easting (X)"|"Longitude", label_y: "Northing (Y)"|"Latitude"}
             },
             Resolution: {x: 像素大小X, y: 像素大小Y},
-            Statistics: {min: 最小值, max: 最大值, mean: 平均值, std: 标准差, nodata_ratio: "无效值比例"},
-            Value_range: [最小值, 最大值],
+            Statistics: {min: 最小值, max: 最大值, mean: 平均值, std: 标准差},
             Band_count: 波段数,
-            Nodata: "无效值"
+            Nodata: "无效值",
+            Quality: {问题列表，空几何比例},
         }
     """
     try:
         with rasterio.open(file_path) as src:
-            # 基础信息
             crs_info = parse_wkt_to_dict(src.crs.to_wkt())
-
-            # 深度统计，计算真实值分布和空值占比（读取第一波段进行分析）
-            ov_level = 0
-            if src.width * src.height > 1000000: # 超过100万像素则抽样
-                ov_level = 2 
             
-            data = src.read(1, masked=True) # 使用 masked array 自动处理 nodata
-            
-            # 计算有效值
-            valid_data = data.compressed() # 移除 mask(nodata) 后的扁平数组
-            total_pixels = data.size
-            valid_count = len(valid_data)
-            nodata_ratio = (total_pixels - valid_count) / total_pixels if total_pixels > 0 else 0
+            # 只读取第一个波段，masked=True 会自动屏蔽 nodata
+            band1 = src.read(1, masked=True)  # shape = [height, width]
 
-            stats = {
-                "min": float(valid_data.min()) if valid_count > 0 else 0,
-                "max": float(valid_data.max()) if valid_count > 0 else 0,
-                "mean": float(valid_data.mean()) if valid_count > 0 else 0,
-                "std": float(valid_data.std()) if valid_count > 0 else 0,
-                "nodata_ratio": f"{nodata_ratio:.2%}"
-            }
+            # 统计有效像元
+            valid_mask = ~band1.mask            # True 表示有效像元
+            valid_count = np.sum(valid_mask)
+            total_count = band1.size            # 只计算该波段的像元数
+
+            # 质量检测
+            q_issues = []
+            nodata_ratio = (total_count - valid_count) / total_count
+            
+            if nodata_ratio > 0.9:
+                q_issues.append("mostly_empty or all_nodata")
+            
+            if valid_count > 0:
+                valid_pixels = band1.compressed()  # 有效像元值
+                g_min = float(valid_pixels.min())
+                g_max = float(valid_pixels.max())
+                std_val = float(valid_pixels.std())
+                mean_val = float(valid_pixels.mean())
+                # 如果最大值超过平均值 10 个标准差，可能存在未处理的离群点
+                if std_val > 0 and (float(valid_pixels.max()) > mean_val + 10 * std_val):
+                    q_issues.append("extreme_outliers_detected")
+
+                stats = {
+                    "min": g_min,
+                    "max": g_max,
+                    "mean": mean_val,
+                    "std":  std_val
+                }
+            else:
+                stats = {"min": 0, "max": 0, "mean": 0, "std": 0}
 
             return {
                 "status": "success",
@@ -482,20 +508,21 @@ def tool_analyze_raster(file_path: str) -> Dict[str, Any]:
                             "max_x": src.bounds.right,
                             "min_y": src.bounds.bottom,
                             "max_y": src.bounds.top,
-                            "unit": crs_info["Unit"],
-                            "label_x": "Easting (X)" if crs_info["Is_Projected"] else "Longitude",
-                            "label_y": "Northing (Y)" if crs_info["Is_Projected"] else "Latitude"
+                            "unit": crs_info.get("Unit", "unknown"),
+                            "label_x": "Easting (X)" if crs_info.get("Is_Projected") else "Longitude",
+                            "label_y": "Northing (Y)" if crs_info.get("Is_Projected") else "Latitude"
                         }
                     },
                     "Resolution": {"x": abs(src.res[0]), "y": abs(src.res[1])},
                     "Statistics": stats,
-                    "Value_range": [src.read().min().item(), src.read().max().item()],
                     "Band_count": src.count,
-                    "Nodata": src.nodata
+                    "Nodata_Value": src.nodata,
+                    "Data_Type": src.dtypes[0],
+                    "Quality": generate_quality_report(q_issues, nodata_ratio),
                 }
             }
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        return {"status": "error", "message": str(e)}
 
 @tool
 def tool_analyze_vector(file_path: str) -> Dict[str, Any]:
@@ -512,6 +539,7 @@ def tool_analyze_vector(file_path: str) -> Dict[str, Any]:
             },
             Geometry_type: "几何类型",
             Feature_count: 要素数量,
+            Quality: {问题列表，空几何比例},
             Attributes: [{name: 属性名, type: 属性类型}]
         }
     """
@@ -523,9 +551,28 @@ def tool_analyze_vector(file_path: str) -> Dict[str, Any]:
         crs_info = parse_wkt_to_dict(raw_wkt)
         bounds = gdf.total_bounds.tolist()
 
-        # 几何质量检查
-        is_all_valid = gdf.is_valid.all()
-        invalid_count = (~gdf.is_valid).sum()
+        q_issues = []
+        # 几何有效性检测
+        invalid_mask = ~gdf.is_valid
+        invalid_count = int(invalid_mask.sum())
+        if invalid_count > 0:
+            q_issues.append(f"invalid_geometry_found_{invalid_count}_features")
+
+        # 空几何检测
+        empty_mask = gdf.is_empty
+        empty_count = int(empty_mask.sum())
+        if empty_count > 0:
+            q_issues.append(f"empty_geometry_found_{empty_count}_features")
+
+        # 坐标系缺失风险
+        raw_wkt = gdf.crs.to_wkt() if gdf.crs else ""
+        if not raw_wkt:
+            q_issues.append("missing_crs_definition")
+
+        # 属性完整性检测
+        null_cols = [col for col in gdf.columns if gdf[col].isnull().all() and col != 'geometry']
+        if null_cols:
+            q_issues.append(f"empty_attribute_columns_{len(null_cols)}")
 
         # 属性统计摘要
         # 提取数值型列的描述统计
@@ -577,9 +624,8 @@ def tool_analyze_vector(file_path: str) -> Dict[str, Any]:
                 "Geometry_type": {
                     "Type": geom_type,
                     "Feature_count": len(gdf),
-                    "Is_all_valid": bool(is_all_valid),
-                    "Invalid_count": int(invalid_count)
                 },
+                "Quality": generate_quality_report(q_issues, empty_count/max(len(gdf),1)),
                 "Attributes": detailed_attributes
             }
         }
@@ -807,6 +853,15 @@ def build_spatial_info(raw_crs: str, bounds: list) -> Dict[str, Any]:
             spatial["Extent"]["unit"] = crs.axis_info[0].unit_name
 
     return spatial
+
+def generate_quality_report(issues: List[str], nodata_ratio: float = 0.0) -> Dict[str, Any]:
+    """统一质量报告结构"""
+    return {
+        "status": "warning" if issues else "healthy",
+        "issues": issues,
+        "nodata_percentage": f"{nodata_ratio:.2%}",
+        "requires_repair": len(issues) > 0
+    }
 
 # ============================================================================
 # 工具注册（供 LangGraph 调用）

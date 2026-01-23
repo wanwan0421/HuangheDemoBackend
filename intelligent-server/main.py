@@ -21,146 +21,6 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # ============= 模型推荐智能体路由 =============
 
-def serialize_message(msg: Any) -> Dict[str, Any]:
-    """
-    把langchain/message-like对象序列化为前端可使用的简单的dict
-    Args:
-        msg (Any): langchain消息对象
-    Returns:
-        Dict[str, Any]: 序列化后的消息字典
-    """
-
-    out: Dict[str, Any] = {}
-    out["content"] = getattr(msg, "content", None)
-
-    # 推断角色
-    cls_name = msg.__class__.__name__ if hasattr(msg, "__class__") else None
-    if cls_name:
-        if "Human" in cls_name or "User" in cls_name:
-            out["role"] = "user"
-        elif "System" in cls_name:
-            out["role"] = "system"
-        elif "Tool" in cls_name:
-            out["role"] = "tool"
-        else:
-            out["role"] = "assistant"
-    
-    # tool_calls如果存在
-    if hasattr(msg, "tool_calls"):
-        try:
-            out["tool_calls"] = list(getattr(msg, "tool_calls") or [])
-        except Exception:
-            out["tool_calls"] = getattr(msg, "tool_calls")
-    
-    # tool_call_id（ToolMessage）
-    if hasattr(msg, "tool_call_id"):
-        out["tool_call_id"] = getattr(msg, "tool_call_id")
-    return out
-
-def serialize_messages(msgs: List[Any]) -> List[Dict[str, Any]]:
-    return [serialize_message(m) for m in msgs]
-
-def map_agent_event(event: Dict[str, Any], root_started_ref, root_finished_ref) -> Optional[Dict[str, Any]]:
-    """
-    将LangGraph原始事件映射为“可解释事件”
-    """
-    print("event:", event)
-    etype = event.get("event")
-    parent_run_id = event.get("parent_run_id")
-    is_root = parent_run_id is None
-
-    # Agent开始分析问题，只在整个Graph的根节点开始时触发一次
-    if etype == "on_chain_start" and is_root and not root_started_ref["value"]:
-        root_started_ref["value"] = True
-        return {
-            "type": "status",
-            "message": "Agent正在分析问题"
-        }
-
-    # LLM token流
-    if etype == "on_chat_model_stream":
-        chunk = event.get("data", {}).get("chunk")
-        content = getattr(chunk, "content", "")
-
-        if isinstance(content, list):
-            texts = []
-            for c in content:
-                if isinstance(c, dict) and 'text' in c:
-                    texts.append(c['text'])
-                elif isinstance(c, str):
-                    texts.append(c)
-            content = "".join(texts)
-
-        if content:
-            return {
-                "type": "token",
-                "message": content
-            }
-
-    # Tool开始调用工具
-    if etype == "on_tool_start":
-        print("Tool开始调用工具")
-        name = event.get('name')
-        # 开始检索指标库
-        if name == "search_relevant_indices":
-            return {
-                "type": "search_index",
-                "message": "正在检索地理指标库...",
-                "data": event.get("data")
-            }
-        # 开始检索模型库
-        if name == "search_relevant_models":
-            return {
-                "type": "search_model",
-                "message": "正在检索地理模型库...",
-                "data": event.get("data")
-            }
-        # 开始获取模型详情
-        if name == "get_model_details":
-            return {
-                "type": "model_details",
-                "message": "正在读取模型工作流详情...",
-                "data": event.get("data")
-            }
-
-    # Tool结束调用工具
-    if etype == "on_tool_end":
-        name = event.get('name')
-        data = event.get("data", {})
-        output = data.get("output", {})
-
-        # 指标库返回结果
-        if name == "search_relevant_indices":
-            return {
-                "type": "search_index_end",
-                "message": "工具已返回相关地理指标",
-                "data": output
-            }
-        # 模型库返回结果
-        if name == "search_relevant_models":
-            return {
-                "type": "search_model_end",
-                "message": "工具已返回相关地理模型",
-                "data": output
-            }
-        # 模型详情返回结果
-        if name == "get_model_details":
-            return {
-                "type": "model_details_end",
-                "message": "工具已返回模型工作流详情",
-                "data": output
-            }
-
-    # Agent完成分析
-    if etype == "on_chain_end" and is_root and not root_finished_ref["value"]:
-        root_finished_ref["value"] = True
-        return {
-            "type": "final",
-            "message": "Agent已得出结论"
-        }
-
-    return None
-
 def extract_text(content):
     if isinstance(content, str):
         return content
@@ -192,6 +52,7 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
                 "status": "processing",
                 "Task_spec": {}
             }
+            final_state_task_spec = {}
 
             async for mode, chunk in agent.astream(
                 init_input,
@@ -203,17 +64,28 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
                 }
             ):
                 if mode == "messages":
+                    # chunk 结构: (MessageChunk, metadata)
                     if isinstance(chunk, tuple):
-                        message_chunk = chunk[0]
+                        message_chunk, metadata = chunk
                     else:
                         message_chunk = chunk
-                    
-                    if isinstance(message_chunk, AIMessageChunk):
-                        content = message_chunk.content
-                        content = extract_text(content)
+                        metadata = {}
 
-                        if content and content.strip(): 
-                            # 发送命名事件 + data
+                    # 获取当前产生消息的节点名称
+                    node_name = metadata.get("langgraph_node", "")
+
+                    # 屏蔽 parse_task_spec 的文本输出
+                    # 如果当前是解析节点，不仅不显示 JSON，什么都不发给前端文本流
+                    if node_name == "parse_task_spec":
+                        continue 
+
+                    # 正常的 LLM 节点 (llm_node) 才发送 Token
+                    if isinstance(message_chunk, AIMessageChunk):
+                        if message_chunk.tool_call_chunks:
+                            continue
+                        
+                        content = extract_text(message_chunk.content)
+                        if content:
                             yield f"data: {json.dumps({'type': 'token', 'message': content}, ensure_ascii=False)}\n\n"
 
                 elif mode == "updates":
@@ -222,6 +94,20 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
                         final_state = merge_state(final_state, chunk)
 
                         for node_name, node_output in chunk.items():
+                            if "parse_task_spec" in chunk:
+                                node_output = chunk["parse_task_spec"]
+                                
+                                # 提取 Task_spec
+                                if "Task_spec" in node_output:
+                                    specific_spec = node_output["Task_spec"]
+                                    
+                                    # 立即发送 SSE 事件给前端！
+                                    # 前端收到这个 type 后，立刻渲染 TaskSpecCard
+                                    yield f"data: {json.dumps({
+                                        'type': 'task_spec_generated', 
+                                        'data': specific_spec
+                                    }, ensure_ascii=False)}\n\n"
+
                             if node_name == "llm_node":
                                 # 获取messages列表
                                 messages = node_output.get("messages", [])
@@ -292,7 +178,6 @@ class ModelRequirementScanRequest(BaseModel):
     """模型需求扫描请求体（MDL解析）"""
     mdl: Any  # MDL JSON 对象或字符串
     session_id: Optional[str] = None
-
 
 @app.post("/api/agent/model-requirement/scan")
 async def model_requirement_scan_endpoint(request: ModelRequirementScanRequest):

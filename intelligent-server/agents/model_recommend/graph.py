@@ -23,40 +23,105 @@ def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
     首轮节点：只负责从用户输入中解析 Task_spec
     ❗不允许 tool calls
     """
-    system = SystemMessage(content=(
-        """你是任务需求解析器。请从用户输入中提取 Task_spec，并输出JSON。
+    # 1. 获取上一轮的 Task_spec 作为基础 (实现记忆继承)
+    current_task_spec = state.get("Task_spec", {}) or {}
 
-            格式如下：
-            {"Task_spec": 
-                {
-                "Domain": "",
-                "Target_object": "",
-                "Spatial_scope": "",
-                "Temporal_scope": "",
-                "Resolution_requirements": ""
-                }
-            }
+    # 如果 current_task_spec 是空或者不完整，初始化默认结构
+    default_keys = ["Domain", "Target_object", "Spatial_scope", "Temporal_scope", "Resolution_requirements"]
+    for key in default_keys:
+        if key not in current_task_spec:
+            current_task_spec[key] = ""
+
+    system = SystemMessage(content=(
+        f"""你是任务需求解析器。请从用户最新的输入中提取或更新地理建模任务规范。
+
+            **关键元数据解释**
+            1.Task_spec: 任务规范，包含以下字段：
+                -Domain: 任务领域（如气象、水文、土地利用等）
+                -Target_object: 具体研究对象（如径流量、土壤侵蚀度、降水、河流、植被等）
+                -Spatial_scope: 空间范围（如某流域、某省份、上游、具体经纬度等）
+                -Temporal_scope: 时间范围（如某年、某月、某日、某时间段等）
+                -Resolution_requirements: 分辨率要求（如空间分辨率、时间分辨率等）
+
+            **已有任务信息** (如果用户未提及修改，请保持原样):
+            {current_task_spec}
+
+            **输出要求：必须输出以下 JSON 格式（即使某些字段为空也必须包含）**：
+            ```json
+            {{
+            "Task_spec": {{
+                "Domain": "...",
+                "Target_object": "...",
+                "Spatial_scope": "...",
+                "Temporal_scope": "...",
+                "Resolution_requirements": "..."
+                }}
+            }}
+            ```
+            
+            **提取规则**：
+            1. 仅提取用户显式提及的变更或新增信息。
+            2. 如果用户只是在指令切换模型或者其他询问而没有修改任务属性（如时间、地点），则输出空JSON或保持原值。
+            3. 输出JSON格式，不要输出其他文字。
+            4. 如果某个字段无法从用户输入中确定，使用空字符串 ""。
             """
     ))
 
     messages = [system] + state["messages"]
-    response = tools.recommendation_model.invoke(messages)
-    raw_text = extract_text_content(response.content)
 
-    task_spec = {}
     try:
-        data = json.loads(raw_text)
-        task_spec = data.get("Task_spec", {})
-    except Exception as e:
-        print("[parse_task_spec_node] parse failed:", e)
+        response = tools.recommendation_model.invoke(messages)
+        raw_text = extract_text_content(response.content).strip()
         task_spec = {}
 
-    return {
-        "messages": [response],
-        "Task_spec": task_spec
-    }
+        # 正则提取 JSON (增强鲁棒性)
+        json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw_text, re.DOTALL)
+        
+        if json_match:
+            json_str = json_match.group(1)
+            data = json.loads(json_str)
+            task_spec = data.get("Task_spec", {})
+        else:
+            # 尝试直接解析（防止 LLM 没写 markdown 代码块）
+            # 如果 raw_text 看起来像 json (以 { 开头)
+            if raw_text.startswith("{") and raw_text.endswith("}"):
+                data = json.loads(raw_text)
+                task_spec = data.get("Task_spec", {})
+            else:
+                # 这种情况通常是 LLM 回复了 "好的，正在为您查找..." 这种废话
+                # 我们选择忽略这次解析，直接返回旧状态
+                print(f"[parse_task_spec_node] No JSON found, keeping previous state. Raw: {raw_text[:50]}...")
+                return {
+                    "messages": [response], # 这里返回 response 是为了让 graph 记录 trace，但在 main.py 会被过滤
+                    "Task_spec": current_task_spec
+                }
 
+        final_spec = current_task_spec.copy()
+        for k, v in task_spec.items():
+            if v and str(v).strip(): 
+                final_spec[k] = v
 
+        return {
+            "messages": [response],
+            "Task_spec": final_spec
+        }
+
+    except json.JSONDecodeError as e:
+        print(f"[parse_task_spec_node] JSON parse error: {e}")
+        print(f"[parse_task_spec_node] Failed JSON: {raw_text[:200]}")
+        return {
+            "messages": [],
+            "Task_spec": current_task_spec
+        }
+    
+    except Exception as e:
+        print(f"[parse_task_spec_node] Unexpected error: {type(e).__name__}: {e}")
+        return {
+            "messages": [],
+            "Task_spec": current_task_spec
+        }
+
+    
 def llm_node(state: ModelState) -> Dict[str, Any]:
     """
     负责根据当前消息历史决定下一步

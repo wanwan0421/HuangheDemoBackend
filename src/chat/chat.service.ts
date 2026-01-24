@@ -1,7 +1,7 @@
 import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
+import { model, Model, Types } from 'mongoose';
 import { Observable } from 'rxjs';
 import { Session, SessionDocument } from './schemas/session.schema';
 import { Message, MessageDocument } from './schemas/message.schema';
@@ -169,6 +169,7 @@ export class ChatService {
             const tools: any[] = [];
             let finalModelData: any = null;
             let taskSpecData: any = null;
+            let modelContractData: any = null;
 
             // 记录用户消息（可选，用于历史查看；对话记忆交由 LangGraph）
             void this.saveMessage(sessionId, 'user', query).catch(() => undefined);
@@ -198,22 +199,29 @@ export class ChatService {
                             updatedAt: new Date(),
                         }).exec().then(() => console.log('Model details pre-saved.')).catch(err => console.error('Pre-save error:', err));
                     }
-                    if (payload.type === 'final' && payload.Task_spec) {
-                        taskSpecData = payload.Task_spec;
+                    if (payload.type === 'task_spec_generated' && payload.data) {
+                        taskSpecData = payload.data;
                         this.sessionModel.findByIdAndUpdate(sessionId, {
                             taskSpec: taskSpecData,
                             updatedAt: new Date(),
                         }).exec().then(() => console.log('Task spec pre-saved.')).catch(err => console.error('Pre-save error:', err));
                     }
+                    if (payload.type === 'model_contract_generated' && payload.data) {
+                        modelContractData = payload.data;
+                        this.sessionModel.findByIdAndUpdate(sessionId, {
+                            modelContract: modelContractData,
+                            updatedAt: new Date(),
+                        }).exec().then(() => console.log('Model contract pre-saved.')).catch(err => console.error('Pre-save error:', err));
+                    }
                 },
                 complete: async () => {
-                    await this.persistFinalData(sessionId, aiResponse, tools, finalModelData, taskSpecData);
+                    await this.persistFinalData(sessionId, aiResponse, tools, finalModelData, taskSpecData, modelContractData);
                     observer.complete();
                 },
                 error: async (err) => {
                     console.error('SSE Stream Interrupted:', err.message);
                     // 即便断开了，也要把已经拿到的部分 AI 回答存入数据库
-                    await this.persistFinalData(sessionId, aiResponse, tools, finalModelData, taskSpecData);
+                    await this.persistFinalData(sessionId, aiResponse, tools, finalModelData, taskSpecData, modelContractData);
                     observer.error(err);
                 },
             });
@@ -221,7 +229,7 @@ export class ChatService {
     }
 
     // 提取公共保存逻辑
-    private async persistFinalData(sessionId: string, aiResponse: string, tools: any[], modelData: any, taskSpecData: any) {
+    private async persistFinalData(sessionId: string, aiResponse: string, tools: any[], modelData: any, taskSpecData: any, modelContractData: any) {
         try {
             const tasks: Promise<any>[] = [];
             if (aiResponse || tools.length > 0) {
@@ -237,6 +245,12 @@ export class ChatService {
             if (taskSpecData) {
                 tasks.push(this.sessionModel.findByIdAndUpdate(sessionId, {
                     taskSpec: taskSpecData,
+                    updatedAt: new Date(),
+                }).exec());
+            }
+            if (modelContractData) {
+                tasks.push(this.sessionModel.findByIdAndUpdate(sessionId, {
+                    modelContract: modelContractData,
                     updatedAt: new Date(),
                 }).exec());
             }

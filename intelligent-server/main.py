@@ -52,7 +52,6 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
                 "status": "processing",
                 "Task_spec": {}
             }
-            final_state_task_spec = {}
 
             async for mode, chunk in agent.astream(
                 init_input,
@@ -74,12 +73,12 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
                     # 获取当前产生消息的节点名称
                     node_name = metadata.get("langgraph_node", "")
 
-                    # 屏蔽 parse_task_spec 的文本输出
+                    # 屏蔽 parse_task_spec_node 的文本输出
                     # 如果当前是解析节点，不仅不显示 JSON，什么都不发给前端文本流
-                    if node_name == "parse_task_spec":
+                    if node_name == "parse_task_spec_node" or node_name == "model_contract_node":
                         continue 
 
-                    # 正常的 LLM 节点 (llm_node) 才发送 Token
+                    # 正常的LLM节点才发送 Token
                     if isinstance(message_chunk, AIMessageChunk):
                         if message_chunk.tool_call_chunks:
                             continue
@@ -94,43 +93,42 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
                         final_state = merge_state(final_state, chunk)
 
                         for node_name, node_output in chunk.items():
-                            if "parse_task_spec" in chunk:
-                                node_output = chunk["parse_task_spec"]
-                                
+                            # 处理parse_task_spec_node节点
+                            if node_name == "parse_task_spec_node":
                                 # 提取 Task_spec
                                 if "Task_spec" in node_output:
                                     specific_spec = node_output["Task_spec"]
                                     
-                                    # 立即发送 SSE 事件给前端！
-                                    # 前端收到这个 type 后，立刻渲染 TaskSpecCard
                                     yield f"data: {json.dumps({
                                         'type': 'task_spec_generated', 
                                         'data': specific_spec
                                     }, ensure_ascii=False)}\n\n"
 
-                            if node_name == "llm_node":
+                            # 处理recommend_model_node节点
+                            elif node_name == "recommend_model_node":
                                 # 获取messages列表
                                 messages = node_output.get("messages", [])
                                 if messages and len(messages) > 0:
                                     last_msg = messages[-1]    
 
-                                # 处理LLM调用工具
-                                if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-                                    for tool_call in last_msg.tool_calls:
-                                        current_tool = tool_call.get('name', 'unknown')
+                                    # 处理LLM调用工具
+                                    if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                                        for tool_call in last_msg.tool_calls:
+                                            current_tool = tool_call.get('name', 'unknown')
 
+                                            yield f"data: {json.dumps({
+                                                'type': 'tool_call',
+                                                'tool': current_tool,
+                                                'message': f'工具开始执行: {current_tool}'
+                                            }, ensure_ascii=False)}\n\n"
+                                    else:
+                                        # LLM 生成了最终结果
                                         yield f"data: {json.dumps({
-                                            'type': 'tool_call',
-                                            'tool': current_tool,
-                                            'message': f'工具开始执行: {current_tool}'
+                                            'type': 'status',
+                                            'message': 'LLM 生成推荐结果'
                                         }, ensure_ascii=False)}\n\n"
-                                else:
-                                    # LLM 生成了最终结果
-                                    yield f"data: {json.dumps({
-                                        'type': 'status',
-                                        'message': 'LLM 生成推荐结果'
-                                    }, ensure_ascii=False)}\n\n"
 
+                            # 处理tool_node节点
                             elif node_name == "tool_node":
                                 # node_output is like {"messages": [ToolMessage,...]}
                                 tool_msgs = node_output.get("messages", [])
@@ -148,6 +146,17 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
                                         "data": tool_result
                                     }, ensure_ascii=False)}\n\n"
 
+                            # 处理model_contract_node节点
+                            elif node_name == "model_contract_node":
+                                # 提取 Model_contract
+                                if "Model_contract" in node_output:
+                                    model_contract = node_output["Model_contract"]
+                                    
+                                    yield f"data: {json.dumps({
+                                        'type': 'model_contract_generated',
+                                        'data': model_contract
+                                    }, ensure_ascii=False)}\n\n"
+
                         continue
 
                     await asyncio.sleep(0)
@@ -160,8 +169,7 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
                     }, ensure_ascii=False)}\n\n"
             
             yield f"data: {json.dumps({
-                'type': 'final',
-                'Task_spec': final_state.get('Task_spec', {})
+                'type': 'final'
             }, ensure_ascii=False)}\n\n"
                 
         except Exception as e:

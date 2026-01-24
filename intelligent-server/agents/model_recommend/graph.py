@@ -15,13 +15,32 @@ DB_NAME = "huanghe-demo"
 class ModelState(TypedDict):
     messages: Annotated[list[AnyMessage], operator.add]
     llm_calls: int
-    # 任务规范
+    # 任务规范，由Task Agent生成
     Task_spec: Annotated[Dict[str, Any], operator.or_]
+    # 模型契约：由Model Agent生成
+    Model_contract: Annotated[Dict[str, Any], operator.or_]
+    # 模型推荐详情
+    recommended_model: Annotated[Dict[str, Any], operator.or_]
+
+def extract_text_content(content: Any) -> str:
+    """
+    兼容处理字符串格式和列表格式的 AIMessage content
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text_parts.append(part.get("text", ""))
+            elif isinstance(part, str):
+                text_parts.append(part)
+        return "".join(text_parts)
+    return ""
 
 def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
     """
-    首轮节点：只负责从用户输入中解析 Task_spec
-    ❗不允许 tool calls
+    负责从用户最新输入中提取或更新地理建模任务规范
     """
     # 1. 获取上一轮的 Task_spec 作为基础 (实现记忆继承)
     current_task_spec = state.get("Task_spec", {}) or {}
@@ -121,17 +140,11 @@ def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
             "Task_spec": current_task_spec
         }
 
-    
-def llm_node(state: ModelState) -> Dict[str, Any]:
+def recommend_model_node(state: ModelState) -> Dict[str, Any]:
     """
     负责根据当前消息历史决定下一步
     调用已绑定工具的模型，返回模型产生的新消息
     如果需要调用工具，则返回工具调用指令
-    
-    Args:
-        state (ModelState): 当前代理状态，包含消息历史等信息
-    Returns:
-        Dict[str, Any]: 更新后的状态，包含新消息
     """
     # 加入SystemMessage以约束模型行为（同时生成 Task Spec 与模型推荐）
     system = SystemMessage(content=(
@@ -151,27 +164,116 @@ def llm_node(state: ModelState) -> Dict[str, Any]:
 
     response = tools.model_with_tools.invoke(messages)
 
+    return {"messages": [response]}
+
+def model_contract_node(state: ModelState) -> Dict[str, Any]:
+    """
+    负责根据推荐模型详情数据，生成模型契约
+    """
+    print("\n[model_contract_node] START")
+    
+    # 寻找最近使用的模型详情数据
+    target_model_data = None
+    messages = state.get("messages", [])
+    
+    print(f"[model_contract_node] Total messages: {len(messages)}")
+    
+    # 显示所有消息类型，便于诊断
+    for i, msg in enumerate(reversed(messages)):
+        msg_type = type(msg).__name__
+        tool_id = getattr(msg, "tool_name", None) or getattr(msg, "name", None)
+        print(f"[model_contract_node] Message {i}: {msg_type}, tool_id={tool_id}")
+        
+        if isinstance(msg, ToolMessage) and tool_id == "get_model_details":
+            print(f"[model_contract_node] Found get_model_details at index {i}")
+            try:
+                data = json.loads(msg.content)
+                if data.get("status") == "success":
+                    target_model_data = data
+                    print(f"[model_contract_node] ✅ Extracted model data: {data.get('name')}")
+                    break
+            except Exception as e:
+                print(f"[model_contract_node] ❌ Failed to parse get_model_details: {e}")
+                continue
+
+    if not target_model_data:
+        print("[model_contract_node] ❌ No get_model_details found in messages, returning empty contract")
+        return {
+            "messages": [],
+            "Model_contract": {}
+        }
+    
+    task_spec = state.get("Task_spec", {})
+    print(f"[model_contract_node] Task_spec: {task_spec}")
+    
+    workflow_inputs = []
+    workflow = target_model_data.get("workflow", [])
+    print(f"[model_contract_node] Workflow steps: {len(workflow)}")
+    
+    for state_item in workflow:
+        for event in state_item.get("events", []):
+            for input in event.get("inputs", []):
+                workflow_inputs.append(input)
+    
+    prompt_content = f"""你是一个地理建模专家。请为以下模型参数生成数据准入契约。
+
+    **用户任务需求**
+    {json.dumps(task_spec, ensure_ascii=False)}
+
+    **模型输入定义**
+    {json.dumps(workflow_inputs, ensure_ascii=False)}
+
+    **关键元数据解释**
+    1.Required_slots: 模型数据准入契约列表，包括以下字段：
+        -Input_name: 输入参数名称
+        -Semantic_requirement: 语义要求（如降水、温度、土地利用等）
+        -Data_type: 数据类型（Raster, Vector, Table, Timeseries, Parameter）
+        -Spatial_requirement: 空间要求（如某区域、某流域等，包含Region和Crs）
+        -Temporal_requirement: 时间要求（如某年、某月、某日等）
+        -Format_requirement: 格式要求（如TIFF、TIFF、Shapefile、NC、CSV等）
+
+    **输出要求**
+    请基于上述定义，将原始参数转化为具体的 "Required_slots"。
+    必须返回标准的JSON格式，包含：Required_slots 列表。
+
+    示例格式：
+    {{
+    "Required_slots": [
+        {{
+        "Input_name": "...",
+        "Data_type": "...",
+        "Semantic_requirement": "...",
+        "Spatial_requirement": {{"Region": "...", "Crs": "..."}},
+        "Temporal_requirement": "...",
+        "Format_requirement": "..."
+        }}
+    ]
+    }}
+    """
+
+    # 仅发送当前任务相关的 Prompt，不带state["messages"]里的历史聊天
+    try:
+        response = tools.recommendation_model.invoke([HumanMessage(content=prompt_content)])
+        raw_content = extract_text_content(response.content).strip()
+        
+        # 增强 JSON 提取逻辑
+        contract = {}
+        json_match = re.search(r'(\{.*\})', raw_content, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(1)
+            contract = json.loads(json_str)
+        else:
+            raise ValueError("No JSON object found in response")
+            
+    except Exception as e:
+        print(f"[model_contract_node] ❌ LLM Generation/Parsing failed: {e}")
+
     return {
-        "messages": [response]
+        "messages": [response], 
+        "recommended_model": target_model_data,
+        "Model_contract": contract
     }
-
-def extract_text_content(content: Any) -> str:
-    """
-    兼容处理字符串格式和列表格式的 AIMessage content
-    """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        text_parts = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                text_parts.append(part.get("text", ""))
-            elif isinstance(part, str):
-                text_parts.append(part)
-        return "".join(text_parts)
-    return ""
-
-
+    
 def tool_node(state: ModelState) -> Dict[str, Any]:
     """
     读取最后一条消息的 tool_calls，按顺序执行对应工具并返回 ToolMessage 列表
@@ -205,35 +307,62 @@ def tool_node(state: ModelState) -> Dict[str, Any]:
 
 def should_continue(state: ModelState) -> Any:
     """
-    判断是否需要继续迭代（即 LLM 是否还需要调用工具）
-    
-    Args:
-        state (ModelState): 当前代理状态，包含消息历史等信息
-    Returns:
-        Literal["tool_node", END]: 如果需要调用工具则返回 "tool_node"，否则返回 END
+    判断是否需要继续迭代
+    优先级：已完成工作流 > 还需工具 > 结束
     """
-    last_message = state["messages"][-1]
-    if last_message.tool_calls:
+    messages = state.get("messages", [])
+    last_message = messages[-1] if messages else None
+    
+    if not last_message:
+        return END
+    
+    # 检查是否已有完整的推荐（Task_spec + model_details 都有）
+    task_spec = state.get("Task_spec", {})
+    has_task_spec = bool(task_spec and any(task_spec.values()))
+    
+    # 反向查找是否已有get_model_details的结果
+    has_model_details = False
+    for msg in reversed(messages):
+        if isinstance(msg, ToolMessage) and msg.tool_name == "get_model_details":
+            has_model_details = True
+            break
+    
+    # 如果工作流已完整，进入合约生成阶段
+    if has_task_spec and has_model_details:
+        print(f"[should_continue] ✅ Routing to model_contract_node: has_task_spec={has_task_spec}, has_model_details={has_model_details}")
+        return "model_contract_node"
+    
+    # 检查是否还需要调用工具（但防止重复调用）
+    # 只有当最后一条消息是 AIMessage 且有 tool_calls 时，才调用工具
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        print(f"[should_continue] 🔧 Routing to tool_node: calling {[c.get('name') for c in last_message.tool_calls]}")
         return "tool_node"
     
+    # 否则结束
     return END
 
 agent_builder = StateGraph(ModelState)
 
-agent_builder.add_node("parse_task_spec", parse_task_spec_node)
-agent_builder.add_node("llm_node", llm_node)
+agent_builder.add_node("parse_task_spec_node", parse_task_spec_node)
+agent_builder.add_node("recommend_model_node", recommend_model_node)
+agent_builder.add_node("model_contract_node", model_contract_node)
 agent_builder.add_node("tool_node", tool_node)
 
-agent_builder.add_edge(START, "parse_task_spec")
-agent_builder.add_edge("parse_task_spec", "llm_node")
+agent_builder.add_edge(START, "parse_task_spec_node")
+agent_builder.add_edge("parse_task_spec_node", "recommend_model_node")
 
 agent_builder.add_conditional_edges(
-    "llm_node",
+    "recommend_model_node",
     should_continue,
-    ["tool_node", END]
+    {
+        "tool_node": "tool_node",
+        "model_contract_node": "model_contract_node",
+        END: END
+    }
 )
 
-agent_builder.add_edge("tool_node", "llm_node")
+agent_builder.add_edge("tool_node", "recommend_model_node")
+agent_builder.add_edge("model_contract_node", END)
 
 mongo_client = MongoClient(MONGO_URI)
 checkpointer = MongoDBSaver(mongo_client)

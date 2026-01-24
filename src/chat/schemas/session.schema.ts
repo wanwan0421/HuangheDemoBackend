@@ -36,6 +36,9 @@ export class Session {
     @Prop({ type: Object })
     taskSpec?: any;
 
+    @Prop({ type: Object })
+    modelContract?: any;
+
     // 存储模型运行的上下文，比如用户选定的输入参数快照
     @Prop({ type: Object })
     context?: any;

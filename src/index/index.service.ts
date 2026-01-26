@@ -14,16 +14,16 @@ export class IndexService {
         private genAIService: GenAIService,
     ) { }
 
-    async onModuleInit() {
-        console.log('🚀 正在初始化指标向量数据...');
-        try {
-            await this.initVectorData();
-            await this.initModelVectorData();
-            console.log('✅ 指标向量初始化完成');
-        } catch (error) {
-            console.error('❌ 指标向量初始化失败:', error);
-        }
-    }
+    // async onModuleInit() {
+    //     console.log('🚀 正在初始化指标向量数据...');
+    //     try {
+    //         await this.initVectorData();
+    //         await this.initModelVectorData();
+    //         console.log('✅ 指标向量初始化完成');
+    //     } catch (error) {
+    //         console.error('❌ 指标向量初始化失败:', error);
+    //     }
+    // }
 
     // 获取数据库中的指标体系，即二级指标
     // 获取二级指标中英文名+连接的模型

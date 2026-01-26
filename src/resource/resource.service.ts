@@ -1,11 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { Model, Document } from 'mongoose';
 import { ConfigService } from '@nestjs/config';
 import { plainToInstance } from 'class-transformer';
-import { Cron, CronExpression } from '@nestjs/schedule';
 import { ModelResource, ResourceType } from './schemas/modelResource.schema';
+import { ModelEmbedding } from '../index/schemas/modelEmbedding.schema';
 import { Md5Item, OnePageMd5Result, PortalMd5Data } from './interfaces/portalSync.interface';
 import { firstValueFrom } from 'rxjs';
 import { ModelItemDataDto } from './dto/modelItemData.dto';
@@ -14,6 +14,8 @@ import { ModelUtilsService } from './modelUtils.service';
 import { ModelItemEventDataDto } from './dto/modelItemEventData.dto';
 import { ModelItemEventDataNodeDto } from './dto/modelItemEventDataNode.dto';
 import { ModelItemEventDto } from './dto/modelItemEvent.dto';
+import { GenAIService } from 'src/genai/genai.service';
+import { Cron, CronExpression } from '@nestjs/schedule';
 
 @Injectable()
 export class ResourceService {
@@ -25,11 +27,25 @@ export class ResourceService {
     constructor(private readonly httpService: HttpService,
                 private readonly configService: ConfigService,
                 private readonly modelUtilsService: ModelUtilsService,
+                private readonly genAIService: GenAIService,
                 @InjectModel(ModelResource.name)
                 private modelResourceModel: Model<ModelResource>,
+                @InjectModel(ModelEmbedding.name)
+                private ModelEmbeddingModel: Model<ModelEmbedding & Document>,
     ) {
         this.portalLocation = this.configService.get<string>('portalLocation')!;
         this.portalToken = this.configService.get<string>('portalToken')!;
+    }
+
+    async onModuleInit() {
+        console.log('🚀 正在初始化模型向量数据...');
+        try {
+            // await this.synchronizePortalModels();
+            await this.initResourceModelVectorData();
+            console.log('✅ 模型向量初始化完成');
+        } catch (error) {
+            console.error('❌ 模型向量初始化失败:', error);
+        }
     }
 
     // 获取单页健康模型的md5列表
@@ -113,7 +129,6 @@ export class ResourceService {
                 }
 
                 const modelData = detailResponse.data.data;
-                console.log(`modelData: ${JSON.stringify(modelData)}`);
                 // 将mdl的XML转换为JSON对象
                 const mdlJson = await this.modelUtilsService.convertMdlXmlToJson(modelData.mdl);
 
@@ -319,5 +334,79 @@ export class ResourceService {
     // 用于返回指标对应的单个模型的详细信息
     public async getModelDetails(md5: string): Promise<ModelResource | null> {
         return this.modelResourceModel.findOne({ md5: md5 }).lean().exec();
+    }
+
+    /**
+     * 遍历modelResourceModel数据库将"模型名称+模型描述"拼接为一段话为每个模型生成embedding并存入到ModelEmbeddingModel
+     */
+    public async initResourceModelVectorData() {
+        const data = await this.modelResourceModel.find().lean();
+        console.log(`查找到 ${data.length} 条模型资源数据`);
+
+        // 先判断原有的model是否已经获取了embedding
+        const existingModel = await this.ModelEmbeddingModel
+            .find(
+                { 
+                    modelMd5: { $exists: true, $ne: "" }, 
+                    embedding: { $exists: true, $not: { $size: 0 } } 
+                },
+                { modelMd5: 1 })
+            .lean();
+        const existingModelSet = new Set(existingModel.map(e => e.modelMd5));
+        const currentTaskModelSet = new Set();
+        const modelTasks: any[] = [];
+
+        for (const model of data) {
+            // 跳过没有md5的模型
+            if (!model.md5) continue;
+
+            // 跳过已存在或已在任务队列中的模型
+            if (existingModelSet.has(model.md5) || currentTaskModelSet.has(model.md5)) continue;
+
+            modelTasks.push({
+                modelMd5: model.md5,
+                modelName: model.name,
+                modelDescription: model.description,
+                textToEmbed: `model_name: ${model.name}. model_description: ${model.description}.`
+            });
+
+            currentTaskModelSet.add(model.md5);
+        }
+
+        if (modelTasks.length === 0) {
+            console.log("没有检测到新模型，无需更新向量数据。");
+            return;
+        }
+
+        // 分批生成 embedding
+        const CHUNK_SIZE = 50;
+        for (let i = 0; i < modelTasks.length; i += CHUNK_SIZE) {
+            try {
+                const chunk = modelTasks.slice(i, i + CHUNK_SIZE);
+                const texts = chunk.map(t => t.textToEmbed);
+
+                const vectors = await this.genAIService.generateEmbeddings(texts);
+
+                if (!vectors || !Array.isArray(vectors) || vectors.length !== chunk.length) {
+                    console.error(`⚠️ 批次索引 ${i} 失败：API 返回数据无效或受限。跳过此批次。`);
+                    await new Promise(r => setTimeout(r, 60000)); 
+                    continue;
+                }
+
+                const modelVectors = chunk.map((t, idx) => ({
+                    modelMd5: t.modelMd5,
+                    modelName: t.modelName,
+                    modelDescription: t.modelDescription,
+                    embedding: vectors[idx]
+                }));
+
+                await this.ModelEmbeddingModel.insertMany(modelVectors);
+                await new Promise(r => setTimeout(r, 30000));
+            } catch (error) {
+                console.log(`处理批次起始索引为 ${i} 的数据时出错:`, error);
+            }
+        }
+        
+        console.log(`✅ 成功写入 ${modelTasks.length} 条模型 embedding`);
     }
 }

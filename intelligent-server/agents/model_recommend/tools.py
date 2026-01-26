@@ -157,26 +157,79 @@ def search_relevant_indices(user_query_text: str, top_k: int = 5) -> Dict[str, A
             "message": f"搜索指标失败: {str(e)}"
         }
 
+# @tool
+# def search_relevant_models(user_query_text: str, model_ids: List[str], top_k: int = 10) -> Dict[str, Any]:
+#     """
+#     在给定的候选模型范围内，根据用户需求进行语义筛选。
+#     当指标关联的模型太多时，使用此工具找出最符合用户具体意图的模型。
+#     Args:
+#         user_query_text: 用户查询文本
+#         model_ids: 候选模型MD5值列表
+#         top_k: 返回的最相关模型数（默认 10）
+#     Returns:
+#         包含相关模型列表的字典
+#     """
+#     try:
+#         if not model_ids:
+#             return {
+#                 "status": "error",
+#                 "message": "模型 ID 列表为空"
+#             }
+        
+#         # query_vector = embedding_model.embed_query(user_query_text)
+#         query_vector = client.models.embed_content(
+#             model="gemini-embedding-001",
+#             contents=user_query_text
+#         ).embeddings[0].values
+
+#         db = get_db()
+#         model_embeddings_collection = db["modelembeddings"]
+
+#         # 查询指定MD5的所有模型
+#         all_models = list(
+#             model_embeddings_collection.find({"modelMd5": {"$in": model_ids}})
+#         )
+
+#         flattened_models = []
+        
+#         for model in all_models:
+#             if model.get("embedding") and len(model.get("embedding", [])) > 0:
+#                 score = cosine_similarity(query_vector, model["embedding"])
+#                 flattened_models.append({
+#                     "modelMd5": model.get("modelMd5"),
+#                     "modelName": model.get("modelName"),
+#                     "modelDescription": model.get("modelDescription", ""),
+#                     "score": score
+#                 })
+
+#         # 按相似度排序并取前top_k
+#         flattened_models.sort(key=lambda x: x["score"], reverse=True)
+#         result = flattened_models[:top_k]
+        
+#         return {
+#             "status": "success",
+#             "count": len(result),
+#             "models": result
+#         }
+#     except Exception as e:
+#         return {
+#             "status": "error",
+#             "message": f"搜索模型失败: {str(e)}"
+#         }
+
 @tool
-def search_relevant_models(user_query_text: str, model_ids: List[str], top_k: int = 10) -> Dict[str, Any]:
+def search_relevant_models(user_query_text: str, top_k: int = 10) -> Dict[str, Any]:
     """
-    在给定的候选模型范围内，根据用户需求进行语义筛选。
-    当指标关联的模型太多时，使用此工具找出最符合用户具体意图的模型。
+    根据用户查询文本，从所有模型中找出最相关的10个模型。
+    计算余弦相似度，返回最相关的模型MD5和相似度分数。
     Args:
         user_query_text: 用户查询文本
-        model_ids: 候选模型MD5值列表
         top_k: 返回的最相关模型数（默认 10）
     Returns:
-        包含相关模型列表的字典
+        包含相关模型MD5和相似度分数的字典
     """
-    try:
-        if not model_ids:
-            return {
-                "status": "error",
-                "message": "模型 ID 列表为空"
-            }
-        
-        # query_vector = embedding_model.embed_query(user_query_text)
+    try:        
+        # 生成用户查询向量
         query_vector = client.models.embed_content(
             model="gemini-embedding-001",
             contents=user_query_text
@@ -185,26 +238,23 @@ def search_relevant_models(user_query_text: str, model_ids: List[str], top_k: in
         db = get_db()
         model_embeddings_collection = db["modelembeddings"]
 
-        # 查询指定MD5的所有模型
-        all_models = list(
-            model_embeddings_collection.find({"modelMd5": {"$in": model_ids}})
-        )
+        # 查询所有模型embedding
+        all_models = list(model_embeddings_collection.find({}))
 
-        flattened_models = []
-        
+        # 计算相似度并排序
+        scored_models = []
         for model in all_models:
             if model.get("embedding") and len(model.get("embedding", [])) > 0:
                 score = cosine_similarity(query_vector, model["embedding"])
-                flattened_models.append({
+                scored_models.append({
                     "modelMd5": model.get("modelMd5"),
                     "modelName": model.get("modelName"),
-                    "modelDescription": model.get("modelDescription", ""),
                     "score": score
                 })
 
         # 按相似度排序并取前top_k
-        flattened_models.sort(key=lambda x: x["score"], reverse=True)
-        result = flattened_models[:top_k]
+        scored_models.sort(key=lambda x: x["score"], reverse=True)
+        result = scored_models[:top_k]
         
         return {
             "status": "success",
@@ -215,6 +265,51 @@ def search_relevant_models(user_query_text: str, model_ids: List[str], top_k: in
         return {
             "status": "error",
             "message": f"搜索模型失败: {str(e)}"
+        }
+
+@tool
+def search_most_model(model_md5s: List[str]) -> Dict[str, Any]:
+    """
+    根据给定的模型MD5列表，从数据库获取这些模型的详细信息。
+    供LLM使用，让LLM基于详细信息来选择最相关的模型。
+    Args:
+        model_md5s: 模型MD5值列表
+    Returns:
+        包含模型详细信息的字典
+    """
+    try:
+        if not model_md5s:
+            return {
+                "status": "error",
+                "message": "模型 MD5 列表为空"
+            }
+
+        db = get_db()
+        model_resource_collection = db["modelResource"]
+
+        # 根据MD5列表查询模型详细信息
+        models = list(
+            model_resource_collection.find({"md5": {"$in": model_md5s}})
+        )
+        
+        # 构建结果
+        result_models = []
+        for model in models:
+            result_models.append({
+                "modelMd5": model.get("md5", ""),
+                "modelName": model.get("name", ""),
+                "mdl": model.get("mdl", "")
+            })
+        
+        return {
+            "status": "success",
+            "count": len(result_models),
+            "models": result_models
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"获取模型详情失败: {str(e)}"
         }
 
 @tool
@@ -298,6 +393,7 @@ def get_model_details(model_md5: str) -> Dict[str, Any]:
 tools = [
     search_relevant_indices,
     search_relevant_models,
+    search_most_model,
     get_model_details
 ]
 

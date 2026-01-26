@@ -151,13 +151,13 @@ def recommend_model_node(state: ModelState) -> Dict[str, Any]:
         """你是用户任务需求解析+模型推荐一体化智能体.请根据用户需求，完成以下任务要求。
 
         **工作流程**:
-        1.指标检索：调用`search_relevant_indices`查找与需求相关的指标。
-        2.模型初选：从指标结果中提取的`models_Id`(MD5 列表)，调用`search_relevant_models`精选模型。
+        1.模型初选：更加用户查询文本，调用`search_relevant_models`方法检索相关模型列表。
+        2.模型评估：根据初选模型的`modelMd5`，调用`search_most_model`方法获取模型详细信息，选择最优模型。
         3.详情确认：调用`get_model_details`获取最优模型的工作流。
 
         **输出与结束规则**
         1.仅当你不再需要调用任何工具时，才进行最终的模型推荐总结。
-        2.最终推荐的模型必须基于用户需求与检索到的指标进行匹配与筛选。
+        2.最终推荐的模型必须基于用户需求与模型详情进行综合评估。
         """
     ))
     messages = [system] + state["messages"]

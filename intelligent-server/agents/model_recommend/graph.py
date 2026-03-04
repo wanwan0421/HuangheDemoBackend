@@ -38,6 +38,51 @@ def extract_text_content(content: Any) -> str:
         return "".join(text_parts)
     return ""
 
+def extract_json_from_text(text: str) -> dict:
+    """
+    从文本中提取 JSON 对象，支持多种格式：
+    1. ```json {...} ``` 代码块
+    2. 直接的 {...} JSON 对象
+    3. 文本中嵌入的 JSON（前后有其他文字）
+    
+    返回提取的 JSON 对象，如果失败返回 None
+    """
+    # 方法1：尝试提取 markdown 代码块
+    json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if json_match:
+        try:
+            return json.loads(json_match.group(1))
+        except json.JSONDecodeError:
+            pass
+    
+    # 方法2：尝试从 { 到 } 的最外层 JSON 对象
+    # 找到第一个 { 和最后一个 }
+    first_brace = text.find('{')
+    last_brace = text.rfind('}')
+    
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        json_candidate = text[first_brace:last_brace+1]
+        try:
+            return json.loads(json_candidate)
+        except json.JSONDecodeError:
+            # 方法3：尝试嵌套匹配，从 { 开始逐层匹配到对应的 }
+            for i in range(first_brace, len(text)):
+                if text[i] == '{':
+                    # 尝试匹配这个开始位置
+                    brace_count = 0
+                    for j in range(i, len(text)):
+                        if text[j] == '{':
+                            brace_count += 1
+                        elif text[j] == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                try:
+                                    return json.loads(text[i:j+1])
+                                except json.JSONDecodeError:
+                                    break
+    
+    return None
+
 def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
     """
     负责从用户最新输入中提取或更新地理建模任务规范
@@ -93,27 +138,20 @@ def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
         raw_text = extract_text_content(response.content).strip()
         task_spec = {}
 
-        # 正则提取 JSON (增强鲁棒性)
-        json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw_text, re.DOTALL)
+        # 使用增强的 JSON 提取函数
+        extracted_json = extract_json_from_text(raw_text)
         
-        if json_match:
-            json_str = json_match.group(1)
-            data = json.loads(json_str)
-            task_spec = data.get("Task_spec", {})
+        if extracted_json:
+            task_spec = extracted_json.get("Task_spec", {})
+            print(f"[parse_task_spec_node] ✅ JSON extracted successfully: {list(task_spec.keys())}")
         else:
-            # 尝试直接解析（防止 LLM 没写 markdown 代码块）
-            # 如果 raw_text 看起来像 json (以 { 开头)
-            if raw_text.startswith("{") and raw_text.endswith("}"):
-                data = json.loads(raw_text)
-                task_spec = data.get("Task_spec", {})
-            else:
-                # 这种情况通常是 LLM 回复了 "好的，正在为您查找..." 这种废话
-                # 我们选择忽略这次解析，直接返回旧状态
-                print(f"[parse_task_spec_node] No JSON found, keeping previous state. Raw: {raw_text[:50]}...")
-                return {
-                    "messages": [response], # 这里返回 response 是为了让 graph 记录 trace，但在 main.py 会被过滤
-                    "Task_spec": current_task_spec
-                }
+            # 这种情况通常是 LLM 回复了 "好的，正在为您查找..." 这种废话
+            # 我们选择忽略这次解析，直接返回旧状态
+            print(f"[parse_task_spec_node] ❌ No JSON found, keeping previous state. Raw: {raw_text[:100]}...")
+            return {
+                "messages": [response], # 这里返回 response 是为了让 graph 记录 trace，但在 main.py 会被过滤
+                "Task_spec": current_task_spec
+            }
 
         final_spec = current_task_spec.copy()
         for k, v in task_spec.items():
@@ -125,16 +163,8 @@ def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
             "Task_spec": final_spec
         }
 
-    except json.JSONDecodeError as e:
-        print(f"[parse_task_spec_node] JSON parse error: {e}")
-        print(f"[parse_task_spec_node] Failed JSON: {raw_text[:200]}")
-        return {
-            "messages": [],
-            "Task_spec": current_task_spec
-        }
-    
     except Exception as e:
-        print(f"[parse_task_spec_node] Unexpected error: {type(e).__name__}: {e}")
+        print(f"[parse_task_spec_node] ❌ Unexpected error: {type(e).__name__}: {e}")
         return {
             "messages": [],
             "Task_spec": current_task_spec
@@ -256,17 +286,17 @@ def model_contract_node(state: ModelState) -> Dict[str, Any]:
         response = tools.recommendation_model.invoke([HumanMessage(content=prompt_content)])
         raw_content = extract_text_content(response.content).strip()
         
-        # 增强 JSON 提取逻辑
-        contract = {}
-        json_match = re.search(r'(\{.*\})', raw_content, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(1)
-            contract = json.loads(json_str)
+        # 使用增强的 JSON 提取函数
+        contract = extract_json_from_text(raw_content) or {}
+        
+        if contract:
+            print(f"[model_contract_node] ✅ Contract JSON extracted: {list(contract.keys())}")
         else:
-            raise ValueError("No JSON object found in response")
+            print(f"[model_contract_node] ⚠️  No JSON found in response, using empty contract")
             
     except Exception as e:
         print(f"[model_contract_node] ❌ LLM Generation/Parsing failed: {e}")
+        contract = {}
 
     return {
         "messages": [response], 

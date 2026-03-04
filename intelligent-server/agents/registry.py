@@ -50,6 +50,28 @@ AGENTS = {
             "models": "List[Dict]"
         }
     },
+
+    "alignment": {
+        "name": "AlignmentAgent",
+        "description": "将任务规范、模型契约与数据画像进行三方对齐分析",
+        "endpoint": "POST /api/agent/alignment",
+        "capabilities": [
+            "semantic_alignment",
+            "spatiotemporal_alignment",
+            "spec_alignment",
+            "gap_analysis",
+            "transformation_suggestions"
+        ],
+        "input": {
+            "task_spec": "Dict",
+            "model_contract": "Dict",
+            "data_profile": "Dict"
+        },
+        "output": {
+            "alignment_result": "Dict",
+            "status": "str"
+        }
+    },
     
     "data_visualize": {
         "name": "DataVisualizationAgent",

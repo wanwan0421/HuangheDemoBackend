@@ -2,7 +2,7 @@ from fastapi import FastAPI, WebSocket, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from agents.model_recommend.graph import agent, ModelState
-from agents.model_requirement.tools import tool_parse_mdl
+from agents.alignment.graph import alignment_agent, AlignmentState
 from agents.data_scan.graph import DataScanState, data_scan_agent
 from agents.supervisor import supervisor, SupervisorState
 from agents.registry import list_agents, get_agent_info
@@ -181,40 +181,6 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
     )
 
 # ============= 数据分析辅助路由 =============
-
-class ModelRequirementScanRequest(BaseModel):
-    """模型需求扫描请求体（MDL解析）"""
-    mdl: Any  # MDL JSON 对象或字符串
-    session_id: Optional[str] = None
-
-@app.post("/api/agent/model-requirement/scan")
-async def model_requirement_scan_endpoint(request: ModelRequirementScanRequest):
-    """
-    模型需求扫描端点：解析 MDL，提取模型输入/输出/参数需求
-
-    输入：MDL JSON（对象或字符串）
-    输出：结构化的需求信息
-    """
-    try:
-        # 直接调用工具以避免引入LLM，确保纯解析
-        mdl_input = request.mdl
-        if isinstance(mdl_input, (dict, list)):
-            result = tool_parse_mdl.invoke({"mdl_data": mdl_input})
-        elif isinstance(mdl_input, str):
-            # 如果是字符串，可能是JSON文本
-            result = tool_parse_mdl.invoke({"mdl_data": mdl_input})
-        else:
-            raise HTTPException(status_code=400, detail="Invalid MDL input type")
-
-        return {
-            "status": result.get("status", "success"),
-            "requirements": result,
-            "session_id": request.session_id
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Model requirement scan failed: {str(e)}")
-
-
 @app.get("/api/agent/data-scan/stream")
 async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = None):
     """
@@ -302,11 +268,9 @@ async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = 
                             pass
 
                         # 逻辑分流：
-                        # 如果还没有遇到 ```json，则认为是给用户看的“口播”文字
                         if "```json" not in full_response:
                             yield f"data: {json.dumps({'type': 'token', 'message': content}, ensure_ascii=False)}\n\n"
                         else:
-                            # 一旦检测到 JSON 开始，前端可以通过 status 事件显示“正在生成精美报告...”
                             if not is_json_started:
                                 is_json_started = True
                                 yield f"data: {json.dumps({'type': 'status', 'message': '正在构建数据可视化视图...'}, ensure_ascii=False)}\n\n"
@@ -386,6 +350,42 @@ def merge_state(old, update):
     for _, v in update.items():
         old.update(v)
     return old
+
+
+class AlignmentRequest(BaseModel):
+    """对齐分析请求体"""
+    task_spec: Dict[str, Any]
+    model_contract: Dict[str, Any]
+    data_profile: Dict[str, Any]
+    session_id: Optional[str] = None
+
+
+@app.post("/api/agent/alignment")
+async def alignment_endpoint(request: AlignmentRequest):
+    """
+    对齐分析端点：三方对齐 Task_spec / Model_contract / Data_profile
+    """
+    try:
+        initial_state: AlignmentState = {
+            "messages": [],
+            "Task_spec": request.task_spec,
+            "Model_contract": request.model_contract,
+            "Data_profile": request.data_profile,
+            "Alignment_result": {},
+            "status": "processing"
+        }
+
+        final_state = await asyncio.to_thread(
+            lambda: alignment_agent.invoke(initial_state)
+        )
+
+        return {
+            "status": "ok",
+            "alignment_result": final_state.get("Alignment_result", {}),
+            "session_id": request.session_id
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Alignment failed: {str(e)}")
 
 # ============= 智能体协调者路由（暂时保留框架） =============
 

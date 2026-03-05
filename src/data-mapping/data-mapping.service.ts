@@ -1,16 +1,14 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
+import { Model } from 'mongoose';
 import { Observable } from 'rxjs';
 import { DataFormCandidate, DataSemanticProfile, DatasetPackage } from './dto/dataSemanticProfile.dto';
-import { Session, SessionDocument } from '../chat/schemas/session.schema';
-import { Message, MessageDocument } from '../chat/schemas/message.schema';
+import { DataScanResult, DataScanResultDocument } from './schemas/data-scan-result.schema';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as unzipper from 'unzipper';
 import { spawn } from 'child_process';
 import axios from 'axios';
-import type { Response } from 'express';
 
 @Injectable()
 export class DataMappingService {
@@ -19,8 +17,8 @@ export class DataMappingService {
     private readonly pythonExe = path.join(__dirname, '..', '..', '..', 'venv', 'Scripts', 'python.exe');
 
     constructor(
-        @InjectModel(Session.name) private readonly sessionModel: Model<SessionDocument>,
-        @InjectModel(Message.name) private readonly messageModel: Model<MessageDocument>,
+        @InjectModel(DataScanResult.name)
+        private readonly dataScanResultModel: Model<DataScanResultDocument>,
     ) {}
 
     /**
@@ -594,23 +592,16 @@ export class DataMappingService {
                         if (payload?.type === 'final' && payload.profile) {
                             profileData = payload.profile;
                             scanResult += payload.message || '';
-                            // 预存到 session 中
-                            this.sessionModel.findByIdAndUpdate(sessionId, {
-                                profile: profileData,
-                                updatedAt: new Date(),
-                            }).exec()
-                                .then(() => this.logger.log('Data profile pre-saved to session'))
-                                .catch(err => this.logger.error('Pre-save error:', err));
                         }
                     },
                     complete: async () => {
-                        await this.persistDataScanResult(sessionId, scanResult, tools, profileData);
+                        await this.persistDataScanResult(sessionId, filePath, scanResult, tools, profileData, 'completed');
                         observer.complete();
                     },
                     error: async (err) => {
                         this.logger.error('Data scan stream interrupted:', err.message);
                         // 即使断开，也保存已获取的结果
-                        await this.persistDataScanResult(sessionId, scanResult, tools, profileData);
+                        await this.persistDataScanResult(sessionId, filePath, scanResult, tools, profileData, 'interrupted', err?.message);
                         observer.error(err);
                     },
                 });
@@ -678,79 +669,29 @@ export class DataMappingService {
          */
         private async persistDataScanResult(
             sessionId: string,
+            filePath: string,
             scanResult: string,
             tools: any[],
-            profileData: any
+            profileData: any,
+            status: 'completed' | 'interrupted',
+            errorMessage?: string,
         ) {
             try {
-                const tasks: Promise<any>[] = [];
-
-                // 保存 AI 扫描结果消息
-                if (scanResult || tools.length > 0) {
-                    tasks.push(
-                        this.saveMessage(
-                            sessionId,
-                            'AI',
-                            scanResult || '',
-                            tools.length ? tools : undefined,
-                            'data',
-                            profileData
-                        )
-                    );
-                }
-            
-                // 保存 profile 数据到 session（兜底）
-                if (profileData) {
-                    tasks.push(
-                        this.sessionModel.findByIdAndUpdate(sessionId, {
-                            profile: profileData,
-                            updatedAt: new Date(),
-                        }).exec()
-                    );
-                }
-            
-                await Promise.all(tasks);
+                await this.dataScanResultModel.create({
+                    sessionId,
+                    filePath,
+                    scanResult: scanResult || '',
+                    tools,
+                    profile: profileData,
+                    status,
+                    errorMessage,
+                });
                 this.logger.log(`Data scan results persisted for session ${sessionId}`);
             } catch (e) {
                 this.logger.error('Failed to persist data scan results:', e);
             }
         }
 
-        /**
-         * 保存消息到数据库
-         * @param sessionId Session ID
-         * @param role 角色
-         * @param content 内容
-         * @param tools 工具调用
-         */
-        async saveMessage(
-            sessionId: string,
-            role: 'user' | 'AI' | 'system',
-            content: string,
-            tools?: any,
-            type: 'text' | 'tool' | 'data' = 'text',
-            profile?: any,
-        ): Promise<Message> {
-            const message = new this.messageModel({
-                sessionId: new Types.ObjectId(sessionId),
-                role,
-                content,
-                tools,
-                type,
-                profile,
-            });
-
-            const saved = await message.save();
-            await this.sessionModel
-                .findByIdAndUpdate(sessionId, {
-                    $inc: { messageCount: 1 },
-                    lastMessage: content.substring(0, 100),
-                    updatedAt: new Date(),
-                })
-                .exec();
-
-            return saved;
-        }
     /**
      * 第四阶段：使用LLM检验、修正和补全数据分析结果
      * @param filePath 主要文件路径

@@ -8,6 +8,8 @@ import {
   HttpStatus,
   Delete,
   Param,
+  Body,
+  Query,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import * as path from 'path';
@@ -124,6 +126,142 @@ export class DataController {
       };
     } catch (error) {
       throw new BadRequestException(`清理失败: ${error.message}`);
+    }
+  }
+
+  /**
+   * 上传并转换地理数据为 Mapbox 兼容格式
+   * @param file 上传的地理数据文件
+   * @param saveConverted 是否保存转换后的文件
+   * @returns 转换结果（包含 GeoJSON 或栅格信息）
+   */
+  @Post('uploadAndConvert')
+  @HttpCode(HttpStatus.OK)
+  @UseInterceptors(
+    FileInterceptor(
+      'file',
+      createFileInterceptorConfig({
+        destination: TEMP_UPLOAD_DIR,
+        maxFileSize: 500 * 1024 * 1024,
+      }),
+    ),
+  )
+  async uploadAndConvert(
+    @UploadedFile() file: ExpressMulter.File,
+    @Query('saveConverted') saveConverted?: string,
+  ): Promise<any> {
+    if (!file) {
+      throw new BadRequestException('请选择要上传的文件');
+    }
+
+    try {
+      const absolutePath = path.resolve(file.path);
+
+      // 检查是否为支持的地理数据格式
+      if (!this.dataService.isSupportedGeoFormat(file.originalname)) {
+        throw new BadRequestException(
+          '不支持的文件格式。支持的格式: .shp, .geojson, .json, .tif, .tiff, .kml',
+        );
+      }
+
+      // 转换数据
+      const shouldSave = saveConverted === 'true' || saveConverted === '1';
+      const convertResult = await this.dataService.convertToMapboxFormat(
+        absolutePath,
+        shouldSave,
+      );
+
+      return {
+        success: true,
+        message: '文件上传并转换成功',
+        fileName: file.originalname,
+        fileSize: file.size,
+        filePath: absolutePath.replace(/\\/g, '/'),
+        conversion: convertResult,
+      };
+    } catch (error) {
+      throw new BadRequestException(
+        `文件上传或转换失败: ${error.message}`,
+      );
+    }
+  }
+
+  /**
+   * 转换已上传的地理数据文件为 Mapbox 兼容格式
+   * @param filePath 文件路径
+   * @param saveConverted 是否保存转换后的文件
+   * @returns 转换结果
+   */
+  @Post('convert')
+  @HttpCode(HttpStatus.OK)
+  async convertFile(
+    @Body('filePath') filePath: string,
+    @Body('saveConverted') saveConverted?: boolean,
+  ): Promise<any> {
+    if (!filePath) {
+      throw new BadRequestException('文件路径不能为空');
+    }
+
+    try {
+      // 验证文件存在
+      if (!fs.existsSync(filePath)) {
+        throw new BadRequestException('文件不存在');
+      }
+
+      // 检查是否为支持的格式
+      if (!this.dataService.isSupportedGeoFormat(filePath)) {
+        throw new BadRequestException(
+          '不支持的文件格式。支持的格式: .shp, .geojson, .json, .tif, .tiff, .kml',
+        );
+      }
+
+      // 转换数据
+      const convertResult = await this.dataService.convertToMapboxFormat(
+        filePath,
+        saveConverted || false,
+      );
+
+      return {
+        success: true,
+        message: '数据转换成功',
+        filePath: filePath,
+        conversion: convertResult,
+      };
+    } catch (error) {
+      throw new BadRequestException(`数据转换失败: ${error.message}`);
+    }
+  }
+
+  /**
+   * 批量转换地理数据文件
+   * @param filePaths 文件路径列表
+   * @param saveConverted 是否保存转换后的文件
+   * @returns 转换结果列表
+   */
+  @Post('convert-batch')
+  @HttpCode(HttpStatus.OK)
+  async convertBatch(
+    @Body('filePaths') filePaths: string[],
+    @Body('saveConverted') saveConverted?: boolean,
+  ): Promise<any> {
+    if (!filePaths || filePaths.length === 0) {
+      throw new BadRequestException('文件路径列表不能为空');
+    }
+
+    try {
+      const results = await this.dataService.convertMultipleFiles(
+        filePaths,
+        saveConverted || false,
+      );
+
+      return {
+        success: true,
+        message: '批量转换完成',
+        total: filePaths.length,
+        results,
+      };
+    } catch (error) {
+      throw new BadRequestException(`批量转换失败: ${error.message}`);
     }
   }
 }

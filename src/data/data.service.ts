@@ -182,19 +182,17 @@ export class DataService {
         args.push(outputDir);
       }
 
-      // 日志：打印执行信息便于诊断
-      this.logger.log(`执行 Python 转换脚本`);
-      this.logger.log(`  Python 可执行文件: ${this.pythonExe}`);
-      this.logger.log(`  脚本路径: ${this.pythonConverterScript}`);
-      this.logger.log(`  输入文件: ${filePath}`);
-      this.logger.log(`  命令参数: ${JSON.stringify(args)}`);
-
       const python = spawn(this.pythonExe, [
         this.pythonConverterScript,
         ...args,
       ], {
         shell: process.platform === 'win32', // Windows 上需要 shell
         cwd: this.projectRoot,
+        env: {
+          ...process.env,
+          PYTHONIOENCODING: 'utf-8',
+          PYTHONUTF8: '1',
+        },
         timeout: 5 * 60 * 1000, // 5 分钟超时
       });
 

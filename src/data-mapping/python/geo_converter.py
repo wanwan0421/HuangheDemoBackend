@@ -5,6 +5,7 @@
 import sys
 import json
 import os
+import math
 import geopandas as gpd
 import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
@@ -14,6 +15,85 @@ import base64
 from io import BytesIO
 from PIL import Image
 import numpy as np
+
+
+def _try_configure_proj_lib():
+    """Try to locate proj.db and set PROJ_LIB if available."""
+    if os.environ.get('PROJ_LIB'):
+        return
+
+    candidate_dirs = []
+
+    try:
+        import pyproj  # type: ignore
+
+        try:
+            data_dir = pyproj.datadir.get_data_dir()
+            if data_dir:
+                candidate_dirs.append(data_dir)
+        except Exception:
+            pass
+
+        pyproj_root = os.path.dirname(pyproj.__file__)
+        candidate_dirs.extend([
+            os.path.join(pyproj_root, 'proj_dir', 'share', 'proj'),
+            os.path.join(pyproj_root, 'share', 'proj'),
+        ])
+    except Exception:
+        pass
+
+    try:
+        rasterio_root = os.path.dirname(rasterio.__file__)
+        candidate_dirs.extend([
+            os.path.join(rasterio_root, 'proj_data'),
+            os.path.join(rasterio_root, 'gdal_data'),
+        ])
+    except Exception:
+        pass
+
+    for candidate in candidate_dirs:
+        if candidate and os.path.isdir(candidate):
+            proj_db = os.path.join(candidate, 'proj.db')
+            if os.path.exists(proj_db):
+                os.environ['PROJ_LIB'] = candidate
+                return
+
+
+def _is_web_mercator_crs(crs):
+    if not crs:
+        return False
+
+    try:
+        epsg = crs.to_epsg()
+    except Exception:
+        epsg = None
+
+    if epsg in (3857, 900913):
+        return True
+
+    crs_text = str(crs).lower()
+    return (
+        'pseudo-mercator' in crs_text
+        or 'web mercator' in crs_text
+        or 'wgs 84 / pseudo-mercator' in crs_text
+        or 'epsg:3857' in crs_text
+    )
+
+
+def _mercator_to_wgs84_bounds(bounds):
+    minx, miny, maxx, maxy = bounds
+    radius = 6378137.0
+
+    def x_to_lon(x):
+        return (x / radius) * (180.0 / math.pi)
+
+    def y_to_lat(y):
+        return (2.0 * math.atan(math.exp(y / radius)) - math.pi / 2.0) * (180.0 / math.pi)
+
+    return (x_to_lon(minx), y_to_lat(miny), x_to_lon(maxx), y_to_lat(maxy))
+
+
+_try_configure_proj_lib()
 
 
 def shapefile_to_geojson(shapefile_path, output_path=None):
@@ -70,68 +150,106 @@ def geotiff_to_mapbox_info(tif_path):
     """
     读取 GeoTIFF 信息并返回边界、元数据
     用于在 Mapbox 上叠加显示栅格数据
-    
-    Args:
-        tif_path: GeoTIFF 文件路径
-        
-    Returns:
-        dict: 包含边界 GeoJSON、元数据和栅格信息
     """
     try:
-        print(f"[DEBUG] 开始处理 GeoTIFF 文件: {tif_path}", file=sys.stderr, flush=True)
+        print(f"[DEBUG] Start processing GeoTIFF: {tif_path}", file=sys.stderr, flush=True)
         
-        with rasterio.open(tif_path) as src:
-            print(f"[DEBUG] 已打开文件，开始读取元数据...", file=sys.stderr, flush=True)
-            
-            # 获取边界（转换为 WGS84）
+        with rasterio.open(tif_path) as src:            
+            # 获取边界
             bounds = src.bounds
+            src_crs = src.crs
             
-            # 转换坐标系到 WGS84 如果不是
-            if src.crs and src.crs.to_epsg() != 4326:
-                print(f"[DEBUG] 坐标系转换: {src.crs} -> EPSG:4326", file=sys.stderr, flush=True)
-                from rasterio.warp import transform_bounds
-                bounds = transform_bounds(src.crs, 'EPSG:4326', *bounds)
+            print(f"[DEBUG] Original CRS: {src_crs}", file=sys.stderr, flush=True)
+            print(f"[DEBUG] Original bounds: {bounds}", file=sys.stderr, flush=True)
+            
+            # 转换坐标系到 WGS84
+            wgs84_bounds = bounds
+            if src_crs:
+                try:
+                    # 检查是否为 Web Mercator
+                    if _is_web_mercator_crs(src_crs):
+                        print(f"[DEBUG] Web Mercator detected, using manual conversion", file=sys.stderr, flush=True)
+                        wgs84_bounds = _mercator_to_wgs84_bounds(bounds)
+                    elif src_crs.to_epsg() != 4326:
+                        print(f"[DEBUG] CRS transform: {src_crs} -> EPSG:4326", file=sys.stderr, flush=True)
+                        from pyproj import Transformer
+                        transformer = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
+                        minx, miny = transformer.transform(bounds[0], bounds[1])
+                        maxx, maxy = transformer.transform(bounds[2], bounds[3])
+                        wgs84_bounds = (minx, miny, maxx, maxy)
+                except Exception as e:
+                    print(f"[WARN] CRS transform failed: {str(e)}, using fallback", file=sys.stderr, flush=True)
+                    if _is_web_mercator_crs(src_crs):
+                        wgs84_bounds = _mercator_to_wgs84_bounds(bounds)
+                    else:
+                        # 如果转换失败，尝试直接使用原始边界（可能不准确）
+                        print(f"[WARN] Using original bounds as fallback", file=sys.stderr, flush=True)
+                        wgs84_bounds = bounds
+            
+            print(f"[DEBUG] WGS84 bounds: {wgs84_bounds}", file=sys.stderr, flush=True)
             
             # 创建边界 GeoJSON
-            print(f"[DEBUG] 创建边界 GeoJSON...", file=sys.stderr, flush=True)
-            bbox_geom = box(bounds[0], bounds[1], bounds[2], bounds[3])
-            bounds_geojson = {
-                "type": "Feature",
-                "geometry": json.loads(gpd.GeoSeries([bbox_geom]).to_json())['features'][0]['geometry'],
-                "properties": {
-                    "name": os.path.basename(tif_path),
-                    "type": "raster_bounds"
+            try:
+                bbox_geom = box(wgs84_bounds[0], wgs84_bounds[1], wgs84_bounds[2], wgs84_bounds[3])
+                bounds_geojson = {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[
+                            [wgs84_bounds[0], wgs84_bounds[1]],
+                            [wgs84_bounds[2], wgs84_bounds[1]],
+                            [wgs84_bounds[2], wgs84_bounds[3]],
+                            [wgs84_bounds[0], wgs84_bounds[3]],
+                            [wgs84_bounds[0], wgs84_bounds[1]]
+                        ]]
+                    },
+                    "properties": {
+                        "name": os.path.basename(tif_path),
+                        "type": "raster_bounds"
+                    }
                 }
-            }
-            
-            print(f"[DEBUG] GeoTIFF 处理完成，生成结果...", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[ERROR] Failed to create bounds GeoJSON: {str(e)}", file=sys.stderr, flush=True)
+                raise
             
             # 获取栅格元数据
-            print(f"[DEBUG] 读取栅格元数据: {src.width}x{src.height}, {src.count}个波段", file=sys.stderr, flush=True)
             metadata = {
                 "width": src.width,
                 "height": src.height,
-                "count": src.count,  # 波段数
+                "count": src.count,
                 "dtype": str(src.dtypes[0]),
-                "crs": str(src.crs) if src.crs else None,
+                "crs": str(src_crs) if src_crs else None,
                 "transform": list(src.transform),
                 "nodata": src.nodata,
-                "bounds": list(bounds)
+                "bounds": list(wgs84_bounds)
             }
             
             # 读取统计信息（第一个波段）
-            print(f"[DEBUG] 计算波段统计信息...", file=sys.stderr, flush=True)
-            band1 = src.read(1)
-            stats = {
-                "min": float(np.nanmin(band1)),
-                "max": float(np.nanmax(band1)),
-                "mean": float(np.nanmean(band1)),
-                "std": float(np.nanstd(band1))
-            }
+            try:
+                band1 = src.read(1)
+                valid_data = band1[np.isfinite(band1)]
+                if src.nodata is not None:
+                    valid_data = band1[(np.isfinite(band1)) & (band1 != src.nodata)]
+                
+                if len(valid_data) > 0:
+                    stats = {
+                        "min": float(np.min(valid_data)),
+                        "max": float(np.max(valid_data)),
+                        "mean": float(np.mean(valid_data)),
+                        "std": float(np.std(valid_data))
+                    }
+                else:
+                    stats = {
+                        "min": None,
+                        "max": None,
+                        "mean": None,
+                        "std": None
+                    }
+            except Exception as e:
+                print(f"[WARN] Failed to calculate statistics: {str(e)}", file=sys.stderr, flush=True)
+                stats = {"min": None, "max": None, "mean": None, "std": None}
             
-            print(f"[DEBUG] GeoTIFF 处理完全完成！", file=sys.stderr, flush=True)
-            
-            return {
+            result = {
                 "success": True,
                 "type": "raster",
                 "format": "geotiff",
@@ -141,13 +259,19 @@ def geotiff_to_mapbox_info(tif_path):
                 "file_path": tif_path
             }
             
+            print(f"[DEBUG] GeoTIFF processing completed successfully", file=sys.stderr, flush=True)
+            return result
+            
     except Exception as e:
+        error_msg = str(e)
+        print(f"[ERROR] GeoTIFF processing failed: {error_msg}", file=sys.stderr, flush=True)
+        import traceback
+        print(f"[ERROR] Traceback:\n{traceback.format_exc()}", file=sys.stderr, flush=True)
         return {
             "success": False,
-            "error": str(e),
+            "error": error_msg,
             "type": "raster"
         }
-
 
 def geotiff_to_png_tile(tif_path, output_path=None, max_size=1024):
     """
@@ -228,17 +352,12 @@ def convert_to_mapbox(file_path, output_dir=None):
         
     Returns:
         dict: 转换结果
-    """
-    print(f"[DEBUG] 开始转换文件: {file_path}", file=sys.stderr, flush=True)
-    
+    """    
     ext = os.path.splitext(file_path)[1].lower()
     base_name = os.path.splitext(os.path.basename(file_path))[0]
     
-    print(f"[DEBUG] 文件扩展名: {ext}", file=sys.stderr, flush=True)
-    
     # Shapefile
     if ext == '.shp':
-        print(f"[DEBUG] 检测到 Shapefile, 正在转换为 GeoJSON...", file=sys.stderr, flush=True)
         output_path = None
         if output_dir:
             output_path = os.path.join(output_dir, f"{base_name}.geojson")
@@ -246,7 +365,6 @@ def convert_to_mapbox(file_path, output_dir=None):
     
     # GeoJSON (直接读取并验证)
     elif ext in ['.geojson', '.json']:
-        print(f"[DEBUG] 检测到 GeoJSON, 正在处理...", file=sys.stderr, flush=True)
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 geojson_data = json.load(f)
@@ -254,8 +372,6 @@ def convert_to_mapbox(file_path, output_dir=None):
             if geojson_data.get('type') in ['FeatureCollection', 'Feature']:
                 gdf = gpd.GeoDataFrame.from_features(geojson_data)
                 bounds = gdf.total_bounds
-                
-                print(f"[DEBUG] GeoJSON 处理完成", file=sys.stderr, flush=True)
                 
                 return {
                     "success": True,
@@ -270,13 +386,20 @@ def convert_to_mapbox(file_path, output_dir=None):
     
     # GeoTIFF / TIFF
     elif ext in ['.tif', '.tiff', '.geotiff']:
-        print(f"[DEBUG] 检测到 GeoTIFF/TIFF, 正在处理...", file=sys.stderr, flush=True)
+        # 获取地理坐标信息
         result = geotiff_to_mapbox_info(file_path)
+
+        # 生成PNG文件
+        png_path = os.path.splitext(file_path)[0] + '.png'
+        png_result = geotiff_to_png_tile(file_path, output_path=png_path)
+
+        if png_result['success']:
+            result['png_path'] = png_path
+            result['has_png'] = True
         return result
     
     # KML (需要转换)
     elif ext == '.kml':
-        print(f"[DEBUG] 检测到 KML, 正在转换为 GeoJSON...", file=sys.stderr, flush=True)
         try:
             gdf = gpd.read_file(file_path)
             if gdf.crs and gdf.crs.to_epsg() != 4326:
@@ -289,8 +412,6 @@ def convert_to_mapbox(file_path, output_dir=None):
                 with open(output_path, 'w', encoding='utf-8') as f:
                     json.dump(geojson_data, f, ensure_ascii=False, indent=2)
             
-            print(f"[DEBUG] KML 转换完成", file=sys.stderr, flush=True)
-            
             return {
                 "success": True,
                 "type": "vector",
@@ -301,64 +422,66 @@ def convert_to_mapbox(file_path, output_dir=None):
                 "output_path": output_path
             }
         except Exception as e:
-            print(f"[ERROR] KML 转换失败: {str(e)}", file=sys.stderr, flush=True)
+            print(f"[ERROR] KML conversion failed: {str(e)}", file=sys.stderr, flush=True)
             return {"success": False, "error": str(e), "type": "vector"}
-    
-    print(f"[ERROR] 不支持的文件格式: {ext}", file=sys.stderr, flush=True)
-    return {
-        "success": False,
-        "error": f"Unsupported file format: {ext}",
-        "supported_formats": [".shp", ".geojson", ".json", ".tif", ".tiff", ".kml"]
-    }
-
-
-if __name__ == "__main__":
-    print(f"[DEBUG] 地理数据转换脚本启动", file=sys.stderr, flush=True)
-    
-    if len(sys.argv) < 2:
-        print(json.dumps({"error": "Usage: python geo_converter.py <command> <file_path> [output_dir]"}))
-        sys.exit(1)
-    
-    command = sys.argv[1]
-    print(f"[DEBUG] 执行命令: {command}", file=sys.stderr, flush=True)
-    
-    if command == "convert":
-        if len(sys.argv) < 3:
-            print(json.dumps({"error": "File path required"}))
-            sys.exit(1)
-        
-        file_path = sys.argv[2]
-        output_dir = sys.argv[3] if len(sys.argv) > 3 else None
-        
-        print(f"[DEBUG] 输入文件: {file_path}", file=sys.stderr, flush=True)
-        if output_dir:
-            print(f"[DEBUG] 输出目录: {output_dir}", file=sys.stderr, flush=True)
-        
-        result = convert_to_mapbox(file_path, output_dir)
-        print(f"[DEBUG] 转换完成，即将输出结果...", file=sys.stderr, flush=True)
-        print(json.dumps(result, ensure_ascii=False))
-        print(f"[DEBUG] 脚本执行完毕", file=sys.stderr, flush=True)
-    
-    elif command == "shapefile_to_geojson":
-        if len(sys.argv) < 3:
-            print(json.dumps({"error": "Shapefile path required"}))
-            sys.exit(1)
-        
-        file_path = sys.argv[2]
-        output_path = sys.argv[3] if len(sys.argv) > 3 else None
-        
-        result = shapefile_to_geojson(file_path, output_path)
-        print(json.dumps(result, ensure_ascii=False))
-    
-    elif command == "geotiff_info":
-        if len(sys.argv) < 3:
-            print(json.dumps({"error": "GeoTIFF path required"}))
-            sys.exit(1)
-        
-        file_path = sys.argv[2]
-        result = geotiff_to_mapbox_info(file_path)
-        print(json.dumps(result, ensure_ascii=False))
-    
     else:
-        print(json.dumps({"error": f"Unknown command: {command}"}))
+        print(f"[ERROR] Unsupported file format: {ext}", file=sys.stderr, flush=True)
+        return {
+            "success": False,
+            "error": f"Unsupported file format: {ext}",
+            "supported_formats": [".shp", ".geojson", ".json", ".tif", ".tiff", ".kml"]
+        }
+
+
+if __name__ == "__main__":    
+    try:
+        if len(sys.argv) < 2:
+            print(json.dumps({"error": "Usage: python geo_converter.py <command> <file_path> [output_dir]"}))
+            sys.exit(1)
+        
+        command = sys.argv[1]
+        result = None
+        
+        if command == "convert":
+            if len(sys.argv) < 3:
+                result = {"error": "File path required"}
+            else:
+                file_path = sys.argv[2]
+                output_dir = sys.argv[3] if len(sys.argv) > 3 else None
+                result = convert_to_mapbox(file_path, output_dir)
+        
+        elif command == "shapefile_to_geojson":
+            if len(sys.argv) < 3:
+                result = {"error": "Shapefile path required"}
+            else:
+                file_path = sys.argv[2]
+                output_path = sys.argv[3] if len(sys.argv) > 3 else None
+                result = shapefile_to_geojson(file_path, output_path)
+        
+        elif command == "geotiff_info":
+            if len(sys.argv) < 3:
+                result = {"error": "GeoTIFF path required"}
+            else:
+                file_path = sys.argv[2]
+                result = geotiff_to_mapbox_info(file_path)
+        
+        else:
+            result = {"error": f"Unknown command: {command}"}
+        
+        # 确保始终输出有效的 JSON
+        if result is None:
+            result = {"error": "No result generated"}
+        
+        print(json.dumps(result, ensure_ascii=False))
+        sys.stdout.flush()
+        
+    except Exception as e:
+        import traceback
+        error_result = {
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+        print(json.dumps(error_result, ensure_ascii=False))
+        sys.stdout.flush()
         sys.exit(1)

@@ -15,6 +15,8 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import * as path from 'path';
 import * as fs from 'fs';
 import { Express as ExpressMulter } from 'multer';
+import { Req } from '@nestjs/common';
+import express from "express";
 import { DataService } from './data.service';
 import { createFileInterceptorConfig } from '../common/upload-config';
 
@@ -31,6 +33,16 @@ export class DataController {
    * @param sessionId 会话ID（可选，用于关联数据）
    * @returns 返回上传结果和临时文件路径
    */
+  private buildFileUrls(absolutePath: string, req: any): { fileUrl: string; fileRelativeUrl: string } {
+    const uploadRoot = path.resolve(TEMP_UPLOAD_DIR);
+    const relativeFilePath = path.relative(uploadRoot, absolutePath).replace(/\\/g, '/');
+    const fileRelativeUrl = `/uploads/${relativeFilePath}`;
+    const protocol = req?.headers?.['x-forwarded-proto'] || req?.protocol || 'http';
+    const host = req?.headers?.host || 'localhost:3000';
+    const fileUrl = `${protocol}://${host}${fileRelativeUrl}`;
+
+    return { fileUrl, fileRelativeUrl };
+  }
   @Post('upload')
   @HttpCode(HttpStatus.OK)
   @UseInterceptors(
@@ -39,11 +51,17 @@ export class DataController {
       maxFileSize: 500 * 1024 * 1024,
     })),
   )
-  async uploadFile(@UploadedFile() file: ExpressMulter.File): Promise<{
+  async uploadFile(
+    @UploadedFile() file: ExpressMulter.File,
+    @Req() req: any,
+  ): Promise<{
     success: boolean;
     message: string;
     filePath?: string;
     fileName?: string;
+    originalFileName?: string;
+    fileUrl?: string;
+    fileRelativeUrl?: string;
     fileSize?: number;
     mimeType?: string;
   }> {
@@ -54,12 +72,16 @@ export class DataController {
     try {
       // 返回绝对路径，确保跨服务访问时路径正确
       const absolutePath = path.resolve(file.path);
+      const { fileUrl, fileRelativeUrl } = this.buildFileUrls(absolutePath, req);
 
       return {
         success: true,
         message: '文件上传成功',
         filePath: absolutePath.replace(/\\/g, '/'), // 统一使用正斜杠
-        fileName: file.originalname,
+        fileName: file.filename,
+        originalFileName: file.originalname,
+        fileUrl,
+        fileRelativeUrl,
         fileSize: file.size,
         mimeType: file.mimetype,
       };
@@ -114,7 +136,10 @@ export class DataController {
    */
   @Delete('temp-session/:sessionId')
   @HttpCode(HttpStatus.OK)
-  async cleanSessionTempFiles(@Param('sessionId') sessionId: string): Promise<{
+  async cleanSessionTempFiles(
+    @Param('sessionId') sessionId: string,
+    @Req() req?: any,
+  ): Promise<{
     success: boolean;
     message: string;
   }> {
@@ -149,6 +174,7 @@ export class DataController {
   async uploadAndConvert(
     @UploadedFile() file: ExpressMulter.File,
     @Query('saveConverted') saveConverted?: string,
+    @Req() req?: any,
   ): Promise<any> {
     if (!file) {
       throw new BadRequestException('请选择要上传的文件');
@@ -174,9 +200,15 @@ export class DataController {
       return {
         success: true,
         message: '文件上传并转换成功',
-        fileName: file.originalname,
+        fileName: file.filename,
+        originalFileName: file.originalname,
         fileSize: file.size,
         filePath: absolutePath.replace(/\\/g, '/'),
+        fileUrl: (() => {
+          const uploadRoot = path.resolve(TEMP_UPLOAD_DIR);
+          const relativeFilePath = path.relative(uploadRoot, absolutePath).replace(/\\/g, '/');
+          return `/uploads/${relativeFilePath}`;
+        })(),
         conversion: convertResult,
       };
     } catch (error) {

@@ -45,10 +45,19 @@ export function createDiskStorageConfig(options: UploadConfigOptions) {
       const originalName = Buffer.from(file.originalname, 'latin1').toString(
         'utf8'
       );
-      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
       const ext = path.extname(originalName);
       const nameWithoutExt = path.basename(originalName, ext);
+      const sessionId = req.body?.sessionId || req.query?.sessionId || 'default';
+      const sessionDir = path.join(options.destination, String(sessionId));
+      const preferredName = `${nameWithoutExt}${ext}`;
+      const preferredPath = path.join(sessionDir, preferredName);
 
+      if (!fs.existsSync(preferredPath)) {
+        cb(null, preferredName);
+        return;
+      }
+
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
       cb(null, `${nameWithoutExt}-${uniqueSuffix}${ext}`);
     },
   });

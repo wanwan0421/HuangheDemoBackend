@@ -52,6 +52,8 @@ class CustomHTTPEmbeddings(Embeddings):
 
 # 初始化模型
 load_dotenv()
+AIHUBMIX_API_KEY = os.getenv("AIHUBMIX_API_KEY")
+AIHUBMIX_BASE_URL = "https://aihubmix.com/v1"
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 client = genai.Client(api_key=GOOGLE_API_KEY )
 

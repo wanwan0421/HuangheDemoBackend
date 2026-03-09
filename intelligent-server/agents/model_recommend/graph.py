@@ -100,7 +100,7 @@ def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
         f"""你是任务需求解析器。请从用户最新的输入中提取或更新地理建模任务规范。
 
             **关键元数据解释**
-            1.Task_spec: 任务规范，包含以下字段：
+            Task_spec: 任务规范，包含以下字段：
                 -Domain: 任务领域（如气象、水文、土地利用等）
                 -Target_object: 具体研究对象（如径流量、土壤侵蚀度、降水、河流、植被等）
                 -Spatial_scope: 空间范围（如某流域、某省份、上游、具体经纬度等）
@@ -282,6 +282,7 @@ def model_contract_node(state: ModelState) -> Dict[str, Any]:
     """
 
     # 仅发送当前任务相关的 Prompt，不带state["messages"]里的历史聊天
+    response = None
     try:
         response = tools.recommendation_model.invoke([HumanMessage(content=prompt_content)])
         raw_content = extract_text_content(response.content).strip()
@@ -299,7 +300,7 @@ def model_contract_node(state: ModelState) -> Dict[str, Any]:
         contract = {}
 
     return {
-        "messages": [response], 
+        "messages": [response] if response else [], 
         "recommended_model": target_model_data,
         "Model_contract": contract
     }

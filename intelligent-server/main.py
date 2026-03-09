@@ -4,16 +4,21 @@ from fastapi.responses import StreamingResponse
 from agents.model_recommend.graph import agent, ModelState
 from agents.alignment.graph import alignment_agent, AlignmentState
 from agents.data_scan.graph import DataScanState, data_scan_agent
-from agents.supervisor import supervisor, SupervisorState
-from agents.registry import list_agents, get_agent_info
+from agents.triangle_coordinator import get_coordinator, TriangleMatchingCoordinator
+from agents.data_monitor import get_data_scanner
 from langchain.messages import HumanMessage, AIMessageChunk, AnyMessage, ToolMessage
-from typing import Any, Dict, List, Optional,TypedDict, Annotated
+from typing import Any, Dict, List, Optional
 import uuid
 import json
 import asyncio
 from pydantic import BaseModel
 import operator
 from pathlib import Path
+import logging
+
+# 配置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 # 允许任何来源的跨域请求
@@ -39,6 +44,7 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
 
     # 使用 LangGraph checkpointer 的 thread_id
     thread_id = sessionId or str(uuid.uuid4())
+    coordinator = get_coordinator()
 
     async def event_generator():
         init_input = {
@@ -98,6 +104,10 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
                                 # 提取 Task_spec
                                 if "Task_spec" in node_output:
                                     specific_spec = node_output["Task_spec"]
+                                    coordinator.update_task_and_model_from_stream(
+                                        session_id=thread_id,
+                                        task_spec=specific_spec
+                                    )
                                     
                                     yield f"data: {json.dumps({
                                         'type': 'task_spec_generated', 
@@ -151,6 +161,10 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
                                 # 提取 Model_contract
                                 if "Model_contract" in node_output:
                                     model_contract = node_output["Model_contract"]
+                                    coordinator.update_task_and_model_from_stream(
+                                        session_id=thread_id,
+                                        model_contract=model_contract
+                                    )
                                     
                                     yield f"data: {json.dumps({
                                         'type': 'model_contract_generated',
@@ -168,8 +182,13 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
                         'data': chunk
                     }, ensure_ascii=False)}\n\n"
             
+            session = coordinator.get_session(thread_id)
             yield f"data: {json.dumps({
-                'type': 'final'
+                'type': 'final',
+                'session_id': thread_id,
+                'phase': 'task_model_completed',
+                'has_task_spec': bool(session and session.task_spec),
+                'has_model_contract': bool(session and session.model_contract)
             }, ensure_ascii=False)}\n\n"
                 
         except Exception as e:
@@ -181,8 +200,9 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
     )
 
 # ============= 数据分析辅助路由 =============
+
 @app.get("/api/agent/data-scan/stream")
-async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = None):
+async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = None, sessionId: Optional[str] = None):
     """
     流式数据扫描端点：实时返回分析过程
     用于React前端实时展示分析进度
@@ -205,7 +225,8 @@ async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = 
         - error: 错误信息
         - final: 最终结果
     """
-    session_id = session_id or str(uuid.uuid4())
+    session_id = session_id or sessionId or str(uuid.uuid4())
+    coordinator = get_coordinator()
     
     async def event_generator():
         try:
@@ -321,10 +342,19 @@ async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = 
                     
                     await asyncio.sleep(0)
 
+            final_profile = final_state.get("profile", {})
+            session = coordinator.add_data_profile_from_stream(
+                session_id=session_id,
+                file_path=file_path,
+                profile=final_profile
+            )
+
             yield f"data: {json.dumps({
                 'type': 'final',
-                'profile': final_state.get("profile", {}),
-                'session_id': session_id
+                'profile': final_profile,
+                'session_id': session_id,
+                'saved_to_session': True,
+                'data_profile_count': len(session.data_profiles)
             }, ensure_ascii=False)}\n\n"
 
         except Exception as e:
@@ -351,119 +381,49 @@ def merge_state(old, update):
         old.update(v)
     return old
 
+# ============= 数据驱动三角检验API（流式闭环） =============
 
-class AlignmentRequest(BaseModel):
-    """对齐分析请求体"""
-    task_spec: Dict[str, Any]
-    model_contract: Dict[str, Any]
-    data_profile: Dict[str, Any]
-    session_id: Optional[str] = None
-
-
-@app.post("/api/agent/alignment")
-async def alignment_endpoint(request: AlignmentRequest):
+@app.post("/api/agent/align-session")
+async def align_session(session_id: str):
     """
-    对齐分析端点：三方对齐 Task_spec / Model_contract / Data_profile
-    """
-    try:
-        initial_state: AlignmentState = {
-            "messages": [],
-            "Task_spec": request.task_spec,
-            "Model_contract": request.model_contract,
-            "Data_profile": request.data_profile,
-            "Alignment_result": {},
-            "status": "processing"
-        }
-
-        final_state = await asyncio.to_thread(
-            lambda: alignment_agent.invoke(initial_state)
-        )
-
-        return {
-            "status": "ok",
-            "alignment_result": final_state.get("Alignment_result", {}),
-            "session_id": request.session_id
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Alignment failed: {str(e)}")
-
-# ============= 智能体协调者路由（暂时保留框架） =============
-
-class SupervisorRequest(BaseModel):
-    """
-    智能体协调者请求体格式
-    """
-    task_type: str  # "data_scan", "model_recommend", "composite"
-    user_request: str
-    data_context: Optional[Dict[str, Any]] = None
-
-
-@app.post("/api/agents/supervisor")
-async def supervisor_endpoint(request: SupervisorRequest):
-    """
-    通过智能体协调者路由用户请求到合适的智能体。
-    Args:
-        request: 智能体协调者请求体
-    Returns:
-        JSON包含路由决策和相关消息
-    """
-    try:
-        initial_state: SupervisorState = {
-            "messages": [],
-            "task_type": request.task_type,
-            "user_request": request.user_request,
-            "next_agent": "data_scan",
-            "data_scan_result": {},
-            "model_recommendation_result": {},
-            "final_result": {}
-        }
-        
-        # Run the supervisor
-        final_state = await asyncio.to_thread(
-            lambda: supervisor.invoke(initial_state)
-        )
-        
-        return {
-            "status": "ok",
-            "task_type": request.task_type,
-            "routing_decision": final_state.get("next_agent", "data_scan"),
-            "messages": [msg.content if hasattr(msg, 'content') else str(msg) for msg in final_state.get("messages", [])]
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Supervisor routing failed: {str(e)}")
-
-
-# ============= 智能体清单路由 =============
-
-@app.get("/api/agents")
-async def list_agents_endpoint():
-    """
-    列表系统中所有可用的智能体。
-    Returns:
-        返回JSON，包含智能体清单和基本信息
-    """
-    return {
-        "status": "ok",
-        "agents": list_agents(),
-        "total": len(list_agents())
-    }
-
-
-@app.get("/api/agents/{agent_name}")
-async def get_agent_endpoint(agent_name: str):
-    """
-    获取特定智能体的详细信息。
-    Args:
-        agent_name: 智能体名称
-    Returns:
-        返回JSON，包含智能体详细信息、能力和API规范
-    """
-    agent_info = get_agent_info(agent_name)
-    if not agent_info:
-        raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found")
+    一键对齐：基于已保存的task_spec + data_profiles执行三角检验
     
-    return {
-        "status": "ok",
-        "agent": agent_info
-    }
+    前端流程闭环：
+    1. GET /api/agent/stream?query=xxx → 获取session_id + task_spec/model_contract
+    2. GET /api/agent/data-scan/stream?file_path=xxx&sessionId=xxx → 保存data_profiles
+    3. POST /api/agent/align-session?session_id=xxx → 执行对齐，返回Go/No-Go决策
+    
+    Args:
+        session_id: 会话ID（由流式接口返回）
+    
+    Returns:
+        对齐结果、Go/No-Go决策、建议操作列表
+    """
+    try:
+        coordinator = get_coordinator()
+        session = coordinator.get_session(session_id)
+        
+        if not session:
+            raise HTTPException(status_code=404, detail=f"会话 {session_id} 不存在")
+        
+        # 执行对齐
+        session = await coordinator.execute_alignment(session_id)
+        alignment_result = session.alignment_result or {}
+        
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "alignment_result": alignment_result,
+            "alignment_status": session.status.value,
+            "go_no_go": alignment_result.get("go_no_go", "no-go"),
+            "can_run_now": alignment_result.get("can_run_now", False),
+            "recommended_actions": alignment_result.get("recommended_actions", []),
+            "minimal_runnable_inputs": alignment_result.get("minimal_runnable_inputs", []),
+            "mapping_plan": alignment_result.get("mapping_plan_draft", [])
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"对齐失败: {e}")
+        raise HTTPException(status_code=500, detail=f"对齐执行失败: {str(e)}")

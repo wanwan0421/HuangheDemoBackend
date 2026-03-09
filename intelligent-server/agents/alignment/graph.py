@@ -9,6 +9,9 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
 
 load_dotenv()
+AIHUBMIX_API_KEY = os.getenv("AIHUBMIX_API_KEY")
+AIHUBMIX_BASE_URL = "https://aihubmix.com/v1"
+
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 alignment_model = ChatGoogleGenerativeAI(

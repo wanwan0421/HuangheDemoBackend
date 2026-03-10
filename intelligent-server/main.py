@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, HTTPException
+from fastapi import FastAPI, WebSocket, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from agents.model_recommend.graph import agent, ModelState
@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 import uuid
 import json
 import asyncio
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import operator
 from pathlib import Path
 import logging
@@ -383,36 +383,51 @@ def merge_state(old, update):
 
 # ============= 数据驱动三角检验API（流式闭环） =============
 
+class AlignSessionRequest(BaseModel):
+    """对齐请求体"""
+    session_id: str
+    task_spec: Dict[str, Any]
+    model_contract: Dict[str, Any]
+    data_profiles: List[Dict[str, Any]] = Field(default_factory=list)
+
 @app.post("/api/agent/align-session")
-async def align_session(session_id: str):
+async def align_session(request: AlignSessionRequest):
     """
-    一键对齐：基于已保存的task_spec + data_profiles执行三角检验
+    一键对齐：接收完整数据执行三角检验
     
     前端流程闭环：
-    1. GET /api/agent/stream?query=xxx → 获取session_id + task_spec/model_contract
-    2. GET /api/agent/data-scan/stream?file_path=xxx&sessionId=xxx → 保存data_profiles
-    3. POST /api/agent/align-session?session_id=xxx → 执行对齐，返回Go/No-Go决策
+    1. GET /api/agent/stream?query=xxx → Node 存入 MongoDB
+    2. GET /api/agent/data-scan/stream?file_path=xxx → Node 存入 MongoDB
+    3. POST /api/agent/align-session（body 带完整数据）→ 执行对齐
     
     Args:
-        session_id: 会话ID（由流式接口返回）
+        request: 包含 session_id、task_spec、model_contract、data_profiles
     
     Returns:
         对齐结果、Go/No-Go决策、建议操作列表
     """
     try:
-        coordinator = get_coordinator()
-        session = coordinator.get_session(session_id)
+        if not request.task_spec or not request.model_contract:
+            raise HTTPException(
+                status_code=400,
+                detail="缺少必要数据：task_spec 或 model_contract 为空"
+            )
         
-        if not session:
-            raise HTTPException(status_code=404, detail=f"会话 {session_id} 不存在")
+        coordinator = get_coordinator()
+        
+        # 临时创建或更新会话（用于执行对齐）
+        session = coordinator._get_or_create_session(request.session_id)
+        session.task_spec = request.task_spec
+        session.model_contract = request.model_contract
+        session.data_profiles = request.data_profiles
         
         # 执行对齐
-        session = await coordinator.execute_alignment(session_id)
+        session = await coordinator.execute_alignment(request.session_id)
         alignment_result = session.alignment_result or {}
         
         return {
             "status": "success",
-            "session_id": session_id,
+            "session_id": request.session_id,
             "alignment_result": alignment_result,
             "alignment_status": session.status.value,
             "go_no_go": alignment_result.get("go_no_go", "no-go"),

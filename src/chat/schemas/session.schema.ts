@@ -39,7 +39,18 @@ export class Session {
     @Prop({ type: Object })
     modelContract?: any;
 
-    // 存储模型运行的上下文，比如用户选定的输入参数快照
+    @Prop({ type: Object })
+    alignmentResult?: any;
+
+    @Prop()
+    alignmentStatus?: string;
+
+    @Prop()
+    goNoGo?: string;
+
+    @Prop()
+    canRunNow?: boolean;
+
     @Prop({ type: Object })
     context?: any;
 }

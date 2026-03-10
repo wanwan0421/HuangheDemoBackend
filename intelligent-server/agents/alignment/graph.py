@@ -2,7 +2,7 @@ import json
 import os
 import re
 import operator
-from typing import TypedDict, Dict, Any, List, Annotated
+from typing import TypedDict, Dict, Any, List, Annotated, Optional, Set
 from langchain.messages import HumanMessage, SystemMessage, AnyMessage
 from langgraph.graph import StateGraph, START, END
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -62,6 +62,165 @@ def parse_json_from_text(raw_text: str) -> Dict[str, Any]:
         return json.loads(fallback_match.group(1))
 
     return {}
+
+
+def _normalize_text(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _normalize_form(value: Any) -> str:
+    raw = _normalize_text(value)
+    if raw in ["raster", "grid"]:
+        return "raster"
+    if raw in ["vector", "shapefile", "geojson", "kml", "gml", "shp"]:
+        return "vector"
+    if raw in ["table", "csv", "xlsx", "xls"]:
+        return "table"
+    if raw in ["timeseries", "time series", "nc", "netcdf", "hdf", "h5"]:
+        return "timeseries"
+    if raw in ["parameter", "xml"]:
+        return "parameter"
+    return raw
+
+
+def _expected_forms_from_requirement(slot: Dict[str, Any]) -> Set[str]:
+    combined = " ".join([
+        _normalize_text(slot.get("Data_type")),
+        _normalize_text(slot.get("Format_requirement")),
+    ])
+
+    expected: Set[str] = set()
+    if any(k in combined for k in ["tif", "tiff", "geotiff", "raster", "img", "vrt", "asc"]):
+        expected.add("raster")
+    if any(k in combined for k in ["shp", "shapefile", "geojson", "kml", "gml", "vector"]):
+        expected.add("vector")
+    if any(k in combined for k in ["csv", "xlsx", "xls", "table"]):
+        expected.add("table")
+    if any(k in combined for k in ["nc", "netcdf", "hdf", "h5", "timeseries", "time series"]):
+        expected.add("timeseries")
+    if any(k in combined for k in ["parameter", "xml"]):
+        expected.add("parameter")
+
+    return expected
+
+
+def _extract_expected_crs(slot: Dict[str, Any]) -> Optional[str]:
+    spatial_req = slot.get("Spatial_requirement") or {}
+    if isinstance(spatial_req, dict):
+        crs = spatial_req.get("Crs") or spatial_req.get("CRS") or spatial_req.get("crs")
+        text = str(crs).strip() if crs else ""
+        return text or None
+    return None
+
+
+def _extract_data_sources(data_profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+    data_sources = data_profile.get("data_sources")
+    if isinstance(data_sources, list) and data_sources:
+        return data_sources
+
+    return [{
+        "file_path": data_profile.get("primary_file") or "single",
+        "form": data_profile.get("Form"),
+        "spatial": data_profile.get("Spatial"),
+    }]
+
+
+def _source_form_set(data_profile: Dict[str, Any]) -> Set[str]:
+    forms: Set[str] = set()
+    for source in _extract_data_sources(data_profile):
+        form = _normalize_form(source.get("form"))
+        if form:
+            forms.add(form)
+    return forms
+
+
+def _source_crs_tokens(data_profile: Dict[str, Any]) -> Set[str]:
+    tokens: Set[str] = set()
+    for source in _extract_data_sources(data_profile):
+        spatial = source.get("spatial") or {}
+        crs = (spatial.get("Crs") if isinstance(spatial, dict) else None) or {}
+
+        if isinstance(crs, dict):
+            for key in ["EPSG", "Name", "Wkt", "Projection", "Datum"]:
+                value = crs.get(key)
+                if value:
+                    tokens.add(_normalize_text(value))
+        elif isinstance(crs, str):
+            tokens.add(_normalize_text(crs))
+    return tokens
+
+
+def _ensure_slot_item(alignment_result: Dict[str, Any], input_name: str) -> Dict[str, Any]:
+    per_slot = alignment_result.setdefault("per_slot", [])
+    for item in per_slot:
+        if _normalize_text(item.get("input_name")) == _normalize_text(input_name):
+            return item
+
+    slot_item = {
+        "input_name": input_name,
+        "semantic_alignment": {"score": 0.5, "status": "partial", "evidence": [], "gaps": []},
+        "spatiotemporal_alignment": {"score": 0.5, "status": "partial", "evidence": [], "gaps": []},
+        "spec_alignment": {"score": 0.5, "status": "partial", "evidence": [], "gaps": []},
+        "actions": [],
+    }
+    per_slot.append(slot_item)
+    return slot_item
+
+
+def _apply_rule_validation(
+    alignment_result: Dict[str, Any],
+    model_contract: Dict[str, Any],
+    data_profile: Dict[str, Any],
+) -> Dict[str, Any]:
+    required_slots = model_contract.get("Required_slots", []) or []
+    if not required_slots:
+        return alignment_result
+
+    forms_available = _source_form_set(data_profile)
+    crs_tokens = _source_crs_tokens(data_profile)
+
+    blocking_issues = alignment_result.setdefault("blocking_issues", [])
+    non_blocking_issues = alignment_result.setdefault("non_blocking_issues", [])
+
+    for slot in required_slots:
+        input_name = slot.get("Input_name") or slot.get("input_name") or "unknown_input"
+        expected_forms = _expected_forms_from_requirement(slot)
+        expected_crs = _extract_expected_crs(slot)
+        slot_item = _ensure_slot_item(alignment_result, input_name)
+
+        if expected_forms and forms_available and forms_available.isdisjoint(expected_forms):
+            expected_text = "/".join(sorted(expected_forms))
+            actual_text = "/".join(sorted(forms_available))
+            gap_text = f"格式不匹配：期望 {expected_text}，实际 {actual_text}"
+            slot_item["spec_alignment"].setdefault("gaps", []).append(gap_text)
+            slot_item["spec_alignment"]["status"] = "mismatch"
+            slot_item["spec_alignment"]["score"] = 0.0
+            slot_item.setdefault("actions", []).append("请上传符合格式要求的数据，或进行格式转换")
+            blocking_issues.append(f"{input_name}: {gap_text}")
+
+        if expected_crs:
+            norm_expected = _normalize_text(expected_crs)
+            crs_match = any(norm_expected in token or token in norm_expected for token in crs_tokens if token)
+            if not crs_match:
+                gap_text = f"CRS 可能不一致：期望 {expected_crs}"
+                slot_item["spatiotemporal_alignment"].setdefault("gaps", []).append(gap_text)
+                if slot_item["spatiotemporal_alignment"].get("status") != "mismatch":
+                    slot_item["spatiotemporal_alignment"]["status"] = "partial"
+                    slot_item["spatiotemporal_alignment"]["score"] = min(
+                        0.4,
+                        slot_item["spatiotemporal_alignment"].get("score", 0.5)
+                    )
+                slot_item.setdefault("actions", []).append("请检查并统一坐标参考系（CRS）")
+                non_blocking_issues.append(f"{input_name}: {gap_text}")
+
+    if blocking_issues:
+        alignment_result["overall_score"] = min(alignment_result.get("overall_score", 0.0), 0.49)
+
+    dedup_blocking = list(dict.fromkeys(blocking_issues))
+    dedup_non_blocking = list(dict.fromkeys(non_blocking_issues))
+    alignment_result["blocking_issues"] = dedup_blocking
+    alignment_result["non_blocking_issues"] = dedup_non_blocking
+    return alignment_result
 
 
 def alignment_node(state: AlignmentState) -> Dict[str, Any]:
@@ -152,9 +311,12 @@ Data_profile:
             "raw": raw_text
         }
 
+    alignment_result = alignment.get("Alignment_result", alignment)
+    alignment_result = _apply_rule_validation(alignment_result, model_contract, data_profile)
+
     return {
         "messages": [response],
-        "Alignment_result": alignment.get("Alignment_result", alignment),
+        "Alignment_result": alignment_result,
         "status": "completed"
     }
 

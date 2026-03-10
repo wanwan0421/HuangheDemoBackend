@@ -1,10 +1,11 @@
 import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { InjectModel } from '@nestjs/mongoose';
-import { model, Model, Types } from 'mongoose';
+import { Model, Types } from 'mongoose';
 import { Observable } from 'rxjs';
 import { Session, SessionDocument } from './schemas/session.schema';
 import { Message, MessageDocument } from './schemas/message.schema';
+import { DataScanResult, DataScanResultDocument } from '../data-mapping/schemas/data-scan-result.schema';
 
 @Injectable()
 export class ChatService {
@@ -12,6 +13,7 @@ export class ChatService {
         private readonly httpService: HttpService,
         @InjectModel(Session.name) private readonly sessionModel: Model<SessionDocument>,
         @InjectModel(Message.name) private readonly messageModel: Model<MessageDocument>,
+        @InjectModel(DataScanResult.name) private readonly dataScanResultModel: Model<DataScanResultDocument>,
     ) { }
 
     // ============ SSE 代理到 Python（带 thread_id） ============
@@ -156,6 +158,160 @@ export class ChatService {
         await this.sessionModel
             .findByIdAndUpdate(sessionId, { messageCount: 0, lastMessage: null })
             .exec();
+    }
+
+    async alignSession(sessionId: string): Promise<any> {
+        const session = await this.sessionModel.findById(sessionId).exec();
+        if (!session) {
+            throw new HttpException('Session not found', HttpStatus.NOT_FOUND);
+        }
+
+        if (!session.taskSpec || !session.modelContract) {
+            throw new HttpException('Task spec or model contract is missing', HttpStatus.BAD_REQUEST);
+        }
+
+        // 从数据库中读取数据扫描结果
+        const dataScanResults = await this.dataScanResultModel
+            .find({ sessionId: sessionId, status: 'completed' })
+            .sort({ createdAt: -1 })
+            .exec();
+
+        // 同一路径只保留最新一条扫描结果，避免历史脏数据干扰对齐
+        const latestByPath = new Map<string, DataScanResultDocument>();
+        for (const result of dataScanResults) {
+            if (!latestByPath.has(result.filePath)) {
+                latestByPath.set(result.filePath, result);
+            }
+        }
+        const latestResults = Array.from(latestByPath.values()).reverse();
+
+        // 组装文件类 data_profiles
+        const scannedProfiles = latestResults.map((result, index) => ({
+            file_id: `node_${sessionId}_${index}`,
+            file_path: result.filePath,
+            profile: result.profile || {},
+            timestamp: new Date().toISOString(),
+            status: 'active',
+        }));
+
+        // 组装前端输入框参数类 data_profiles（例如阈值、系数、开关等）
+        const manualProfiles = this.buildManualParameterProfiles(session.context, sessionId);
+        const dataProfiles = [...scannedProfiles, ...manualProfiles];
+
+        try {
+            const response = await this.httpService.axiosRef({
+                url: `${process.env.agentUrl}/align-session`,
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                data: {
+                    session_id: sessionId,
+                    task_spec: session.taskSpec,
+                    model_contract: session.modelContract,
+                    data_profiles: dataProfiles,
+                },
+            });
+
+            const result = response.data || {};
+            await this.sessionModel.findByIdAndUpdate(sessionId, {
+                alignmentResult: result.alignment_result || {},
+                alignmentStatus: result.alignment_status,
+                goNoGo: result.go_no_go,
+                canRunNow: result.can_run_now,
+                updatedAt: new Date(),
+            }).exec();
+
+            return result;
+        } catch (error) {
+            const detail = error?.response?.data?.detail || error?.message || 'Align session failed';
+            const statusCode = error?.response?.status || HttpStatus.BAD_GATEWAY;
+            throw new HttpException(detail, statusCode);
+        }
+    }
+
+    private buildManualParameterProfiles(context: any, sessionId: string): any[] {
+        if (!context || typeof context !== 'object') {
+            return [];
+        }
+
+        const candidates =
+            context.manualInputs ||
+            context.manual_inputs ||
+            context.inputParams ||
+            context.inputs ||
+            [];
+
+        const normalized = this.normalizeManualInputs(candidates);
+
+        return normalized.map((item, index) => ({
+            file_id: `manual_${sessionId}_${index}`,
+            file_path: `manual://input/${item.name}`,
+            profile: {
+                Form: 'Parameter',
+                Value_type: item.valueType,
+                Unit: item.unit || 'Unknown',
+                Parameter: {
+                    name: item.name,
+                    value: item.value,
+                },
+                Semantic: {
+                    Abstract: `用户输入参数 ${item.name}`,
+                    Applications: ['模型运行输入'],
+                    Tags: ['manual', 'parameter'],
+                },
+            },
+            timestamp: new Date().toISOString(),
+            status: 'active',
+        }));
+    }
+
+    private normalizeManualInputs(source: any): Array<{ name: string; value: any; unit?: string; valueType: string }> {
+        if (Array.isArray(source)) {
+            return source
+                .map((item, idx) => {
+                    const name = item?.name || item?.key || `manual_input_${idx + 1}`;
+                    const value = item?.value;
+                    const unit = item?.unit;
+                    return {
+                        name,
+                        value,
+                        unit,
+                        valueType: this.inferValueType(value),
+                    };
+                })
+                .filter((item) => item.value !== undefined && item.value !== null);
+        }
+
+        if (source && typeof source === 'object') {
+            return Object.entries(source).map(([name, value]) => ({
+                name,
+                value,
+                valueType: this.inferValueType(value),
+            }));
+        }
+
+        return [];
+    }
+
+    private inferValueType(value: any): 'int' | 'float' | 'string' | 'boolean' {
+        if (typeof value === 'boolean') {
+            return 'boolean';
+        }
+        if (typeof value === 'number') {
+            return Number.isInteger(value) ? 'int' : 'float';
+        }
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+            if (/^(true|false)$/i.test(trimmed)) {
+                return 'boolean';
+            }
+            if (/^-?\d+$/.test(trimmed)) {
+                return 'int';
+            }
+            if (/^-?\d+\.\d+$/.test(trimmed)) {
+                return 'float';
+            }
+        }
+        return 'string';
     }
 
     // ============ 流式对话，记忆交给 LangGraph checkpointer ============

@@ -28,8 +28,8 @@ export class ChatController {
   }
 
   @Post('sessions/:id')
-  updateSession(@Param('id') id: string, @Body('title') title: string) {
-    return this.chatService.updateSession(id, { title }).then((data) => ({ success: true, data }));
+  updateSession(@Param('id') id: string, @Body() updates: any) {
+    return this.chatService.updateSession(id, updates || {}).then((data) => ({ success: true, data }));
   }
 
   @Delete('sessions/:id')
@@ -60,5 +60,11 @@ export class ChatController {
       throw new HttpException('Query is required', HttpStatus.BAD_REQUEST);
     }
     return this.chatService.streamWithMemory(sessionId, query);
+  }
+
+  @Post('sessions/:sessionId/align')
+  async alignSession(@Param('sessionId') sessionId: string) {
+    const data = await this.chatService.alignSession(sessionId);
+    return { success: true, data };
   }
 }

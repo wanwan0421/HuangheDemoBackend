@@ -1,119 +1,13 @@
-import os
 import json
-from typing import TypedDict, Dict, Any, List, Optional, Annotated
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.messages import HumanMessage, SystemMessage, AnyMessage, ToolMessage
+import re
+from typing import Dict, Any
+from langchain.messages import HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END
-from dotenv import load_dotenv
-from google import genai
 from . import tools
 from .tools import DataScanState, data_scan_model
-import re
 
-def llm_node(state: DataScanState) -> Dict[str, Any]:
-    """
-    负责根据当前用户上传的文件路径和已有工具结果，生成数据画像
-    通过调用绑定工具的模型，返回模型产生的新消息和数据画像
-    Args:
-        state (DataScanState): 当前代理状态，包含消息历史等信息
-    Returns:
-        Dict[str, Any]: 更新后的状态，包含新消息和数据画像
-    """
-    system_message = f"""你是一个专业的地理空间数据分析专家。请根据用户上传的文件路径，生成该数据的语义画像。\n"
-        
-        **工作流程**:
-        1.首先调用`tool_prepare_file`工具，传入文件路径，准备数据。
-        2.根据准备的数据，调用`tool_detect_format`工具，检测数据类型。
-        3.根据数据类型的检测结果，调用专项分析工具，包括`tool_analyze_raster`, `tool_analyze_vector`, `tool_analyze_table`, `tool_analyze_timeseries`, `tool_analyze_parameter`，提取元数据。
-        4.只有当所有信息完整，且你不再需要调用任何工具时，才进行最后的总结。
-
-        **重要规则**：
-        1.必须先调用`tool_prepare_file`
-        2.其中有些难以根据后缀名判断的数据类型，需要调用其他工具来读取数据进行详细判断
-        3.所有工具调用完成后，基于已有的工具结果生成最终完整的profile
-        4.最终返回的profile必须整合所有工具的分析结果
-
-        **关键元数据解释**
-        第一层：最小通用语义内核
-        1.Form：数据形式（Raster, Vector, Table, Timeseries, Parameter）
-        2.Spatial：空间域信息，包括crs：空间参考系统（如EPSG:4326）和extent：空间范围（如 [minX, minY, maxX, maxY]）
-        3.Temporal：时间域信息，包括has_time：是否包含时间维度，time_range：时间范围（如[start, end]）
-
-        第二层：类型化语义描述
-        详细数据画像，依据数据形式包含不同字段
-        1.Raster：
-            -Resolution：分辨率
-            -Statistics：统计信息（如min, max, mean, std）
-            -Band_count：波段数量
-            -Nodata：无效值
-            -Data_Type：数据类型（如uint8, float32等）
-            -Quality：问题列表，空值比例
-        2.Vector：
-            -Geometry_type：包括几何类型（如Point, Line, Polygon）、要素数量、是否有效、有效值数量
-            -Attributes：属性列表，每属性包含name、type、null_count、unique_count
-            -Quality：问题列表，空几何比例
-        3.Table：
-            -Row_count：行数
-            -Columns：列名
-            -Column_types：列类型映射（如name, type, semantic等）
-            -Sample_rows：样本数据行
-        4.Timeseries：
-            -Dimensions：维度信息
-            -Variables：变量列表（如name, type, semantic等）
-            -Has_time：是否包含时间维度
-        5.Parameter：
-            -Value_type：值类型（int, float, string, boolean）
-            -Unit：单位
-        
-        第三层：领域语义扩展
-        1.Semantic:
-            -Abstract: 数据摘要，简要描述数据内容
-            -Applications: 适用场景，列出数据可能的应用领域
-            -Tags: 3-5个关键词标签，帮助快速理解数据主题
-
-        **输出与结束规则**
-        1. 当所有分析工具执行完毕，你不需要再生成给用户看的“自然语言解释”，而是将所有分析结果总结成一个最终的JSON对象。
-        2. 请发挥你的专家知识，反推数据的“语义信息”。
-        3. 最终将完整的profile结构体通过状态更新返回。
-        """
-
-    user_message = f"""请根据以下信息，生成数据画像：
-    文件路径: {state['file_path']}"""
-
-    messages = [
-        SystemMessage(content=system_message),
-        HumanMessage(content=user_message)
-    ] + state["messages"]
-
-    response = tools.model_with_tools.invoke(messages)
-
-    if not response.tool_calls:
-        raw_content = extract_text_content(response.content)
-        
-        # 1. 强力清洗：只提取最外层的 JSON 部分，去除 ```json 这种 Markdown 标签
-        json_str = raw_content
-        if "```" in raw_content:
-            # 匹配 ```json { ... } ``` 格式
-            match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_content, re.DOTALL)
-            if match:
-                json_str = match.group(1)
-        
-        semantic_data = {"Abstract": "未能解析摘要", "Applications": [], "Tags": []}
-
-        try:
-            semantic_profile = json.loads(json_str)
-            semantic_data = semantic_profile.get("Semantic", {})
-        except Exception:
-            semantic_data = {"Abstract": raw_content, "Applications": "N/A", "Tags": []}
-        
-        return {"messages": [response], "status": "completed", "profile": {**state.get("profile", {}), "Semantic": semantic_data}}
-
-    return {"messages": [response], "status": "processing"}
 
 def extract_text_content(content: Any) -> str:
-    """
-    兼容处理字符串格式和列表格式的 AIMessage content
-    """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -126,98 +20,159 @@ def extract_text_content(content: Any) -> str:
         return "".join(text_parts)
     return ""
 
+
+def parse_json_from_text(raw_text: str) -> Dict[str, Any]:
+    raw_text = (raw_text or "").strip()
+    if not raw_text:
+        return {}
+
+    json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_text, re.DOTALL)
+    if json_match:
+        raw_text = json_match.group(1)
+
+    if raw_text.startswith("{") and raw_text.endswith("}"):
+        return json.loads(raw_text)
+
+    fallback_match = re.search(r"(\{.*\})", raw_text, re.DOTALL)
+    if fallback_match:
+        return json.loads(fallback_match.group(1))
+
+    return {}
+
+
 def tool_node(state: DataScanState) -> Dict[str, Any]:
     """
-    工具调用节点：根据当前状态调用相应工具，并累积结果
-    Args:
-        state (DataScanState): 当前代理状态，包含消息历史等信息
-    Returns:
-        Dict[str, Any]: 更新后的状态，包含新消息和工具结果
+    确定性扫描阶段（规则优先，避免LLM主导扫描过程）
+    执行顺序：prepare -> detect -> analyze_dataset -> validate
     """
-    last_message = state["messages"][-1]
-    tool_calls = getattr(last_message, "tool_calls", []) or []
-
+    file_path = state.get("file_path", "")
     tool_messages = []
     summary_profile = dict(state.get("profile", {}))
 
-    for tool_call in tool_calls:
-        tool_name = tool_call["name"]
-        tool = tools.TOOLS_BY_NAME[tool_name]
-        result = tool.invoke(tool_call["args"])
+    step_results = []
 
-        if result.get("status") =="success":
-            data = result.get("data", {})
+    prepare_result = tools.tool_prepare_file.invoke({"file_path": file_path})
+    step_results.append(("tool_prepare_file", prepare_result))
 
-            # 语义映射规则
-            if tool_name == "tool_prepare_file":
-                summary_profile["primary_file"] = result.get("primary_file")
-                summary_profile["file_type"] = result.get("file_type")
+    detect_result = tools.tool_detect_format.invoke({"file_path": file_path})
+    step_results.append(("tool_detect_format", detect_result))
 
-            elif tool_name == "tool_detect_format":
-                summary_profile["Form"] = result.get("Form")
-                summary_profile["Confidence"] = result.get("Confidence")
+    dataset_result = tools.analyze_dataset(file_path)
+    step_results.append(("tool_analyze_dataset", dataset_result))
 
-            elif tool_name == "tool_analyze_raster":
-                summary_profile["Spatial"] = data.get("Spatial", {})
-                summary_profile["Resolution"] = data.get("Resolution", {})
-                summary_profile["Statistics"] = data.get("Statistics", {})
-                summary_profile["Band_count"] = data.get("Band_count", "Unknown")
-                summary_profile["NoData"] = data.get("Nodata_Value", "Unknown")
-                summary_profile["Data_Type"] = data.get("Data_Type", "Unknown")
-                summary_profile["Quality"] = data.get("Quality", {})
+    if dataset_result.get("status") == "success":
+        summary_profile.update(dataset_result.get("data", {}))
+    else:
+        summary_profile.update({
+            "Form": detect_result.get("Form", "Unknown"),
+            "Confidence": detect_result.get("Confidence", 0.3),
+            "primary_file": detect_result.get("Resolved_primary_file"),
+            "Source_type": detect_result.get("Source_type"),
+            "Source_forms": detect_result.get("Source_forms", []),
+            "data_sources": [],
+            "Temporal": {
+                "Has_time": False,
+                "Years": [],
+                "Time_range": None,
+                "Frequency_hint": "unknown",
+                "Confidence": 0.2,
+            },
+        })
 
-            elif tool_name == "tool_analyze_vector":
-                summary_profile["Spatial"] = data.get("Spatial", {})
-                summary_profile["Geometry_type"] = data.get("Geometry_type", "Unknown")
-                summary_profile["Attributes"] = data.get("Attributes", [])
-                summary_profile["Quality"] = data.get("Quality", {})
+    validation_data = tools.validate_profile_consistency(summary_profile)
+    validation_result = {"status": "success", "data": validation_data}
+    step_results.append(("tool_validate_profile", validation_result))
 
-            elif tool_name == "tool_analyze_table":
-                summary_profile["Row_count"] = data.get("Row_count", "Unknown")
-                summary_profile["Columns"] = data.get("Columns", [])
-                summary_profile["Dtypes"] = data.get("Dtypes", {})
-                summary_profile["Sample_rows"] = data.get("Sample_rows", [])
+    summary_profile["Validation"] = validation_data
+    summary_profile["Scan_trace"] = {
+        "strategy": "rule_first_scan_with_secondary_validation",
+        "steps": [
+            {
+                "name": name,
+                "status": result.get("status", "unknown") if isinstance(result, dict) else "unknown"
+            }
+            for name, result in step_results
+        ]
+    }
 
-            elif tool_name == "tool_analyze_timeseries":
-                summary_profile["Dimensions"] = data.get("Dimensions", {})
-                summary_profile["Variables"] = data.get("Variables", [])
-                summary_profile["Has_time"] = data.get("Has_time", False)
-
-            elif tool_name == "tool_analyze_parameter":
-                summary_profile["Value_type"] = data.get("Value_type", "Unknown")
-                summary_profile["Unit"] = data.get("Unit", "Unknown")
-
+    for idx, (name, result) in enumerate(step_results):
         tool_messages.append(ToolMessage(
             content=json.dumps(result, ensure_ascii=False),
-            tool_call_id=tool_call["id"],
-            tool_name=tool_name
+            tool_call_id=f"manual_step_{idx}",
+            tool_name=name,
         ))
 
     return {
         "messages": tool_messages,
         "profile": summary_profile,
-        "status": "processing"
+        "status": "processing",
     }
 
-def should_continue(state: DataScanState) -> Any:
+
+def llm_node(state: DataScanState) -> Dict[str, Any]:
     """
-    判断是否需要继续调用工具
-    Args:
-        state (DataScanState): 当前代理状态
-    Returns:
-        Literal["tool_node", END]: 如果需要调用工具则返回 "tool_node"，否则返回 END
+    LLM只做语义补全，不参与工具调度与事实抽取
     """
-    last_message = state["messages"][-1]
-    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        return "tool_node"
-    
-    return END
+    profile = state.get("profile", {}) or {}
+
+    system_prompt = """你是GIS数据解释专家。基于已给出的结构化扫描结果生成语义信息，不得臆造事实。\n
+请输出JSON，且只包含以下结构：
+{
+  "Semantic": {
+    "Abstract": "...",
+    "Applications": ["..."],
+    "Tags": ["...", "...", "..."]
+  }
+}
+
+要求：
+1) Abstract 1-2句，数据摘要，简要描述数据内容,必须引用已有字段（如Form、Source_forms、Temporal、Validation）
+2) Applications 适用场景，列出数据可能的应用领域，必须基于已有字段推断，不得凭空想象
+3) Tags 3-5个关键词标签，帮助快速理解数据主题
+4) 仅输出JSON
+"""
+
+    user_prompt = f"""请基于以下结构化数据画像补全Semantic：
+{json.dumps(profile, ensure_ascii=False)}
+"""
+
+    semantic_data = {
+        "Abstract": "基于规则扫描生成的数据画像",
+        "Applications": ["数据入模前质检"],
+        "Tags": ["gis", "data-scan", "validation"],
+    }
+
+    response = data_scan_model.invoke([
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt),
+    ])
+
+    raw_text = extract_text_content(response.content)
+    try:
+        payload = parse_json_from_text(raw_text)
+        semantic_candidate = payload.get("Semantic", payload)
+        if isinstance(semantic_candidate, dict):
+            semantic_data = {
+                "Abstract": semantic_candidate.get("Abstract") or semantic_data["Abstract"],
+                "Applications": semantic_candidate.get("Applications") or semantic_data["Applications"],
+                "Tags": semantic_candidate.get("Tags") or semantic_data["Tags"],
+            }
+    except Exception:
+        pass
+
+    merged_profile = {**profile, "Semantic": semantic_data}
+    return {
+        "messages": [response],
+        "status": "completed",
+        "profile": merged_profile,
+    }
+
 
 agent_builder = StateGraph(DataScanState)
-agent_builder.add_node("llm_node", llm_node)
 agent_builder.add_node("tool_node", tool_node)
-agent_builder.add_edge(START, "llm_node")
-agent_builder.add_conditional_edges("llm_node", should_continue, ["tool_node", END])
+agent_builder.add_node("llm_node", llm_node)
+agent_builder.add_edge(START, "tool_node")
 agent_builder.add_edge("tool_node", "llm_node")
+agent_builder.add_edge("llm_node", END)
 
 data_scan_agent = agent_builder.compile()

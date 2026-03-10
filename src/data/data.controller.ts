@@ -182,12 +182,23 @@ export class DataController {
 
     try {
       const absolutePath = path.resolve(file.path);
+      const { fileUrl, fileRelativeUrl } = this.buildFileUrls(absolutePath, req);
 
       // 检查是否为支持的地理数据格式
       if (!this.dataService.isSupportedGeoFormat(file.originalname)) {
-        throw new BadRequestException(
-          '不支持的文件格式。支持的格式: .shp, .geojson, .json, .tif, .tiff, .kml',
-        );
+        // 不支持的格式仍然上传，但不进行转换
+        return {
+          success: true,
+          message: '文件上传成功（不支持的地理数据格式，未进行转换）',
+          fileName: file.filename,
+          originalFileName: file.originalname,
+          fileSize: file.size,
+          filePath: absolutePath.replace(/\\/g, '/'),
+          fileUrl,
+          fileRelativeUrl,
+          conversion: null,
+          conversionStatus: 'unsupported',
+        };
       }
 
       // 转换数据
@@ -204,12 +215,10 @@ export class DataController {
         originalFileName: file.originalname,
         fileSize: file.size,
         filePath: absolutePath.replace(/\\/g, '/'),
-        fileUrl: (() => {
-          const uploadRoot = path.resolve(TEMP_UPLOAD_DIR);
-          const relativeFilePath = path.relative(uploadRoot, absolutePath).replace(/\\/g, '/');
-          return `/uploads/${relativeFilePath}`;
-        })(),
+        fileUrl,
+        fileRelativeUrl,
         conversion: convertResult,
+        conversionStatus: 'success',
       };
     } catch (error) {
       throw new BadRequestException(

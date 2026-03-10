@@ -4,11 +4,13 @@ import { Model } from 'mongoose';
 import { Observable } from 'rxjs';
 import { DataFormCandidate, DataSemanticProfile, DatasetPackage } from './dto/dataSemanticProfile.dto';
 import { DataScanResult, DataScanResultDocument } from './schemas/data-scan-result.schema';
+import { Session, SessionDocument } from '../chat/schemas/session.schema';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as unzipper from 'unzipper';
 import { spawn } from 'child_process';
 import axios from 'axios';
+import { profile } from 'console';
 
 @Injectable()
 export class DataMappingService {
@@ -17,8 +19,8 @@ export class DataMappingService {
     private readonly pythonExe = path.join(__dirname, '..', '..', '..', 'venv', 'Scripts', 'python.exe');
 
     constructor(
-        @InjectModel(DataScanResult.name)
-        private readonly dataScanResultModel: Model<DataScanResultDocument>,
+        @InjectModel(DataScanResult.name) private readonly dataScanResultModel: Model<DataScanResultDocument>,
+        @InjectModel(Session.name) private readonly sessionModel: Model<SessionDocument>,
     ) {}
 
     /**
@@ -686,6 +688,10 @@ export class DataMappingService {
                     status,
                     errorMessage,
                 });
+                await this.sessionModel.findByIdAndUpdate(sessionId, {
+                    profile: profileData,
+                }).exec();
+
                 this.logger.log(`Data scan results persisted for session ${sessionId}`);
             } catch (e) {
                 this.logger.error('Failed to persist data scan results:', e);

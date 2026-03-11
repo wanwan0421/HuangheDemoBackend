@@ -10,7 +10,6 @@ import * as path from 'path';
 import * as unzipper from 'unzipper';
 import { spawn } from 'child_process';
 import axios from 'axios';
-import { profile } from 'console';
 
 @Injectable()
 export class DataMappingService {
@@ -28,6 +27,45 @@ export class DataMappingService {
      */
     private generateDataId(seed: string) {
         return `data_${Date.now()}_${seed}`;
+    }
+
+    private mergeSessionProfileStore(
+        existingProfile: any,
+        slotKey: string | undefined,
+        profileData: any,
+    ) {
+        const key = (slotKey && String(slotKey).trim());
+
+        const nextEntry = {
+            slot_key: slotKey || null,
+            ...profileData,
+        };
+
+        let dataProfiles: any[] = [];
+
+        if (Array.isArray(existingProfile)) {
+            dataProfiles = [...existingProfile];
+        } else if (existingProfile?.data_profiles && Array.isArray(existingProfile.data_profiles)) {
+            dataProfiles = [...existingProfile.data_profiles];
+        } else if (existingProfile && typeof existingProfile === 'object') {
+            dataProfiles = [{
+                slot_key: null,
+                profile: existingProfile,
+            }];
+        }
+
+        const index = dataProfiles.findIndex((item) => {
+            const itemKey = (item?.slot_key && String(item.slot_key).trim());
+            return itemKey === key;
+        });
+
+        if (index >= 0) {
+            dataProfiles[index] = nextEntry;
+        } else {
+            dataProfiles.push(nextEntry);
+        }
+
+        return dataProfiles;
     }
 
     /**
@@ -570,7 +608,8 @@ export class DataMappingService {
          * @param sessionId Session ID
          * @param filePath 文件路径
          */
-        streamDataScanWithMemory(sessionId: string, filePath: string): Observable<{ event?: string; data: any }> {
+        streamDataScanWithMemory(sessionId: string, filePath: string, slotKey?: string): Observable<{ event?: string; data: any }> {
+            console.log('Starting data scan stream with memory. Session ID:', sessionId, 'File Path:', filePath, 'Slot Key:', slotKey);
             if (!filePath) {
                 throw new Error('File path is required');
             }
@@ -597,13 +636,13 @@ export class DataMappingService {
                         }
                     },
                     complete: async () => {
-                        await this.persistDataScanResult(sessionId, filePath, scanResult, tools, profileData, 'completed');
+                        await this.persistDataScanResult(sessionId, filePath, scanResult, tools, profileData, 'completed', undefined, slotKey);
                         observer.complete();
                     },
                     error: async (err) => {
                         this.logger.error('Data scan stream interrupted:', err.message);
                         // 即使断开，也保存已获取的结果
-                        await this.persistDataScanResult(sessionId, filePath, scanResult, tools, profileData, 'interrupted', err?.message);
+                        await this.persistDataScanResult(sessionId, filePath, scanResult, tools, profileData, 'interrupted', err?.message, slotKey);
                         observer.error(err);
                     },
                 });
@@ -677,10 +716,12 @@ export class DataMappingService {
             profileData: any,
             status: 'completed' | 'interrupted',
             errorMessage?: string,
+            slotKey?: string,
         ) {
             try {
                 await this.dataScanResultModel.create({
                     sessionId,
+                    slotKey,
                     filePath,
                     scanResult: scanResult || '',
                     tools,
@@ -688,8 +729,22 @@ export class DataMappingService {
                     status,
                     errorMessage,
                 });
+
+                const session = await this.sessionModel
+                    .findById(sessionId)
+                    .select('profile')
+                    .lean()
+                    .exec();
+
+                const mergedProfileStore = this.mergeSessionProfileStore(
+                    session?.profile,
+                    slotKey,
+                    profileData,
+                );
+
                 await this.sessionModel.findByIdAndUpdate(sessionId, {
-                    profile: profileData,
+                    profile: mergedProfileStore,
+                    updatedAt: new Date(),
                 }).exec();
 
                 this.logger.log(`Data scan results persisted for session ${sessionId}`);

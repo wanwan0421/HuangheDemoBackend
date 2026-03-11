@@ -13,7 +13,8 @@ export class DataMappingController {
     streamWithMemory(
         @Param('sessionId') sessionId: string,
         @Query('filePath') filePath: string,
+        @Query('slotKey') slotKey?: string,
     ): Observable<MessageEvent> {
-        return this.dataMappingService.streamDataScanWithMemory(sessionId, filePath);
+        return this.dataMappingService.streamDataScanWithMemory(sessionId, filePath, slotKey);
     }
 }

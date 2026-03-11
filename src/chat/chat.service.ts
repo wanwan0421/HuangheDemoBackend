@@ -176,19 +176,21 @@ export class ChatService {
             .sort({ createdAt: -1 })
             .exec();
 
-        // 同一路径只保留最新一条扫描结果，避免历史脏数据干扰对齐
-        const latestByPath = new Map<string, DataScanResultDocument>();
+        // 同一输入槽只保留最新一条（回退到文件路径），避免历史脏数据干扰对齐
+        const latestBySlotOrPath = new Map<string, DataScanResultDocument>();
         for (const result of dataScanResults) {
-            if (!latestByPath.has(result.filePath)) {
-                latestByPath.set(result.filePath, result);
+            const key = (result as any).slotKey || result.filePath;
+            if (!latestBySlotOrPath.has(key)) {
+                latestBySlotOrPath.set(key, result);
             }
         }
-        const latestResults = Array.from(latestByPath.values()).reverse();
+        const latestResults = Array.from(latestBySlotOrPath.values()).reverse();
 
         // 组装文件类 data_profiles
         const scannedProfiles = latestResults.map((result, index) => ({
-            file_id: `node_${sessionId}_${index}`,
+            file_id: `node_${sessionId}_${(result as any).slotKey || index}`,
             file_path: result.filePath,
+            slot_key: (result as any).slotKey || null,
             profile: result.profile || {},
             timestamp: new Date().toISOString(),
             status: 'active',

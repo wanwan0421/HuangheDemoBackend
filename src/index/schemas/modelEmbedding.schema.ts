@@ -3,6 +3,9 @@ import { Prop, Schema, SchemaFactory } from "@nestjs/mongoose";
 @Schema({ timestamps: true })
 export class ModelEmbedding {
 
+    @Prop({ index: true, sparse: true, unique: true })
+    modelId?: string;
+
     @Prop({ required: true, index: true })
     modelMd5: string;
 
@@ -29,6 +32,9 @@ export class ModelEmbedding {
 
     @Prop({ index: true })
     sphereCnName: string;
+
+    @Prop({ index: true })
+    embeddingSource?: string;
 
     @Prop({ type: [Number], required: true })
     embedding: number[];

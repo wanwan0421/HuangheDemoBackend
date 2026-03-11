@@ -66,7 +66,6 @@ def tool_node(state: DataScanState) -> Dict[str, Any]:
         summary_profile.update({
             "Form": detect_result.get("Form", "Unknown"),
             "Confidence": detect_result.get("Confidence", 0.3),
-            "primary_file": detect_result.get("Resolved_primary_file"),
             "Source_type": detect_result.get("Source_type"),
             "Source_forms": detect_result.get("Source_forms", []),
             "data_sources": [],
@@ -84,16 +83,6 @@ def tool_node(state: DataScanState) -> Dict[str, Any]:
     step_results.append(("tool_validate_profile", validation_result))
 
     summary_profile["Validation"] = validation_data
-    summary_profile["Scan_trace"] = {
-        "strategy": "rule_first_scan_with_secondary_validation",
-        "steps": [
-            {
-                "name": name,
-                "status": result.get("status", "unknown") if isinstance(result, dict) else "unknown"
-            }
-            for name, result in step_results
-        ]
-    }
 
     for idx, (name, result) in enumerate(step_results):
         tool_messages.append(ToolMessage(

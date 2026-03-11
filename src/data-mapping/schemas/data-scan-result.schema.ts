@@ -8,6 +8,9 @@ export class DataScanResult {
   @Prop({ required: true, index: true })
   sessionId: string;
 
+  @Prop({ index: true })
+  slotKey?: string;
+
   @Prop({ required: true })
   filePath: string;
 

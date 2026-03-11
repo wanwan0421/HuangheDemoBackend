@@ -23,6 +23,7 @@ export class ResourceService {
     private readonly portalLocation: string;
     private readonly portalToken: string;
     private readonly pageSize = 20;
+    private readonly embeddingSource = 'resource-sync';
 
     constructor(private readonly httpService: HttpService,
                 private readonly configService: ConfigService,
@@ -40,7 +41,6 @@ export class ResourceService {
     async onModuleInit() {
         console.log('🚀 正在初始化模型向量数据...');
         try {
-            // await this.synchronizePortalModels();
             await this.initResourceModelVectorData();
             console.log('✅ 模型向量初始化完成');
         } catch (error) {
@@ -111,7 +111,7 @@ export class ResourceService {
 
     // 主入口：获取门户模型并同步到本地
     // 每小时更新一次
-    // @Cron(CronExpression.EVERY_HOUR)
+    @Cron(CronExpression.EVERY_DAY_AT_1AM)
     public async synchronizePortalModels(): Promise<void> {
         console.log("Start synchronizing portal models...");
         const modelsMd5List = await this.getPortalModelMd5();
@@ -160,6 +160,12 @@ export class ResourceService {
             } catch (error) {
                 this.logger.error(`Error processing model with md5 ${md5}: ${error}`);
             }
+        }
+
+        try {
+            await this.initResourceModelVectorData();
+        } catch (error) {
+            this.logger.error(`Error synchronizing model embeddings: ${error}`);
         }
     }
 
@@ -339,74 +345,185 @@ export class ResourceService {
     /**
      * 遍历modelResourceModel数据库将"模型名称+模型描述"拼接为一段话为每个模型生成embedding并存入到ModelEmbeddingModel
      */
-    public async initResourceModelVectorData() {
-        const data = await this.modelResourceModel.find().lean();
-        console.log(`查找到 ${data.length} 条模型资源数据`);
+    private normalizeText(value: unknown): string {
+        return typeof value === 'string' ? value : '';
+    }
 
-        // 先判断原有的model是否已经获取了embedding
-        const existingModel = await this.ModelEmbeddingModel
-            .find(
-                { 
-                    modelMd5: { $exists: true, $ne: "" }, 
-                    embedding: { $exists: true, $not: { $size: 0 } } 
-                },
-                { modelMd5: 1 })
-            .lean();
-        const existingModelSet = new Set(existingModel.map(e => e.modelMd5));
-        const currentTaskModelSet = new Set();
-        const modelTasks: any[] = [];
+    private async upsertResourceEmbeddings(
+        tasks: Array<{
+            modelId: string;
+            modelMd5: string;
+            modelName: string;
+            modelDescription: string;
+        }>,
+        activeModelIds: string[],
+        activeModelMd5s: string[],
+    ): Promise<void> {
+        const dedupedTaskMap = new Map<string, {
+            modelId: string;
+            modelMd5: string;
+            modelName: string;
+            modelDescription: string;
+        }>();
 
-        for (const model of data) {
-            // 跳过没有md5的模型
-            if (!model.md5) continue;
-
-            // 跳过已存在或已在任务队列中的模型
-            if (existingModelSet.has(model.md5) || currentTaskModelSet.has(model.md5)) continue;
-
-            modelTasks.push({
-                modelMd5: model.md5,
-                modelName: model.name,
-                modelDescription: model.description,
-                textToEmbed: `model_name: ${model.name}. model_description: ${model.description}.`
-            });
-
-            currentTaskModelSet.add(model.md5);
+        for (const task of tasks) {
+            if (!task.modelId || !task.modelMd5) {
+                continue;
+            }
+            dedupedTaskMap.set(task.modelId, task);
         }
 
-        if (modelTasks.length === 0) {
-            console.log("没有检测到新模型，无需更新向量数据。");
+        const dedupedTasks = Array.from(dedupedTaskMap.values());
+
+        if (dedupedTasks.length > 0) {
+            const CHUNK_SIZE = 50;
+            for (let i = 0; i < dedupedTasks.length; i += CHUNK_SIZE) {
+                try {
+                    const chunk = dedupedTasks.slice(i, i + CHUNK_SIZE);
+                    const texts = chunk.map((task) =>
+                        `model_name: ${task.modelName}. model_description: ${task.modelDescription}.`,
+                    );
+
+                    const vectors = await this.genAIService.generateEmbeddings(texts);
+
+                    if (!vectors || !Array.isArray(vectors) || vectors.length !== chunk.length) {
+                        this.logger.error(`⚠️ 批次索引 ${i} 失败：API 返回数据无效或受限。跳过此批次。`);
+                        await new Promise((resolve) => setTimeout(resolve, 60000));
+                        continue;
+                    }
+
+                    const writeOperations = chunk.map((task, index) => ({
+                        updateOne: {
+                            filter: {
+                                $or: [
+                                    { modelId: task.modelId },
+                                    { modelMd5: task.modelMd5, embeddingSource: this.embeddingSource },
+                                ],
+                            },
+                            update: {
+                                $set: {
+                                    modelId: task.modelId,
+                                    modelMd5: task.modelMd5,
+                                    modelName: task.modelName,
+                                    modelDescription: task.modelDescription,
+                                    embeddingSource: this.embeddingSource,
+                                    embedding: vectors[index],
+                                },
+                            },
+                            upsert: true,
+                        },
+                    }));
+
+                    await this.ModelEmbeddingModel.bulkWrite(writeOperations, { ordered: false });
+                    await new Promise((resolve) => setTimeout(resolve, 30000));
+                } catch (error) {
+                    this.logger.error(`处理模型向量批次（起始索引 ${i}）时出错: ${error}`);
+                }
+            }
+        } else {
+            this.logger.log('没有检测到需要更新的模型向量。');
+        }
+
+        if (activeModelIds.length === 0 && activeModelMd5s.length === 0) {
+            this.logger.warn('门户模型列表为空，跳过向量清理。');
             return;
         }
 
-        // 分批生成 embedding
-        const CHUNK_SIZE = 50;
-        for (let i = 0; i < modelTasks.length; i += CHUNK_SIZE) {
-            try {
-                const chunk = modelTasks.slice(i, i + CHUNK_SIZE);
-                const texts = chunk.map(t => t.textToEmbed);
+        await this.ModelEmbeddingModel.deleteMany({
+            embeddingSource: this.embeddingSource,
+            $or: [
+                { modelId: { $exists: true, $nin: activeModelIds } },
+                { modelId: { $exists: false }, modelMd5: { $nin: activeModelMd5s } },
+            ],
+        }).exec();
+    }
 
-                const vectors = await this.genAIService.generateEmbeddings(texts);
+    public async initResourceModelVectorData() {
+        const data = await this.modelResourceModel
+            .find({}, { id: 1, md5: 1, name: 1, description: 1 })
+            .lean();
+        console.log(`查找到 ${data.length} 条模型资源数据`);
 
-                if (!vectors || !Array.isArray(vectors) || vectors.length !== chunk.length) {
-                    console.error(`⚠️ 批次索引 ${i} 失败：API 返回数据无效或受限。跳过此批次。`);
-                    await new Promise(r => setTimeout(r, 60000)); 
-                    continue;
-                }
+        await this.ModelEmbeddingModel.updateMany(
+            {
+                embeddingSource: { $exists: false },
+                indicatorEnName: { $exists: false },
+                categoryEnName: { $exists: false },
+                sphereEnName: { $exists: false },
+            },
+            {
+                $set: { embeddingSource: this.embeddingSource },
+            },
+        ).exec();
 
-                const modelVectors = chunk.map((t, idx) => ({
-                    modelMd5: t.modelMd5,
-                    modelName: t.modelName,
-                    modelDescription: t.modelDescription,
-                    embedding: vectors[idx]
-                }));
+        const existingEmbeddingDocs = await this.ModelEmbeddingModel
+            .find(
+                { embeddingSource: this.embeddingSource },
+                { modelId: 1, modelMd5: 1, modelName: 1, modelDescription: 1, embedding: 1 },
+            )
+            .lean();
 
-                await this.ModelEmbeddingModel.insertMany(modelVectors);
-                await new Promise(r => setTimeout(r, 30000));
-            } catch (error) {
-                console.log(`处理批次起始索引为 ${i} 的数据时出错:`, error);
+        const embeddingByModelId = new Map<string, any>();
+        for (const item of existingEmbeddingDocs) {
+            const modelId = this.normalizeText(item.modelId);
+            if (modelId) {
+                embeddingByModelId.set(modelId, item);
             }
         }
-        
-        console.log(`✅ 成功写入 ${modelTasks.length} 条模型 embedding`);
+
+        const activeModelIds: string[] = [];
+        const activeModelMd5s: string[] = [];
+        const modelTasks: Array<{
+            modelId: string;
+            modelMd5: string;
+            modelName: string;
+            modelDescription: string;
+        }> = [];
+
+        for (const model of data) {
+            const modelId = this.normalizeText(model.id);
+            if (!modelId) {
+                continue;
+            }
+
+            activeModelIds.push(modelId);
+
+            const modelMd5 = this.normalizeText(model.md5);
+            if (modelMd5) {
+                activeModelMd5s.push(modelMd5);
+            }
+
+            if (!modelMd5) {
+                continue;
+            }
+
+            const modelName = this.normalizeText(model.name);
+            const modelDescription = this.normalizeText(model.description);
+            const existingEmbedding = embeddingByModelId.get(modelId);
+            const hasValidVector =
+                existingEmbedding &&
+                Array.isArray(existingEmbedding.embedding) &&
+                existingEmbedding.embedding.length > 0;
+
+            const needRefresh =
+                !hasValidVector ||
+                this.normalizeText(existingEmbedding.modelMd5) !== modelMd5 ||
+                this.normalizeText(existingEmbedding.modelName) !== modelName ||
+                this.normalizeText(existingEmbedding.modelDescription) !== modelDescription;
+
+            if (!needRefresh) {
+                continue;
+            }
+
+            modelTasks.push({
+                modelId,
+                modelMd5,
+                modelName,
+                modelDescription,
+            });
+        }
+
+        await this.upsertResourceEmbeddings(modelTasks, activeModelIds, activeModelMd5s);
+        console.log(`✅ 资源模型向量同步完成，本次更新 ${modelTasks.length} 条`);
     }
 }

@@ -349,7 +349,8 @@ def infer_temporal_from_candidates(candidate_files: List[str]) -> Dict[str, Any]
     return {
         "Has_time": has_time,
         "Years": years,
-        "Time_range": [years[0], years[-1]] if years else None,
+        "Start_time": years[0] if years else None,
+        "End_time": years[-1] if years else None,
         "Frequency_hint": frequency,
         "Confidence": 0.85 if has_time else (0.4 if years else 0.2),
     }
@@ -538,17 +539,9 @@ def analyze_dataset(file_path: str) -> Dict[str, Any]:
         merged_years = sorted(list(all_years))
 
         temporal_summary["Years"] = merged_years
-        temporal_summary["Time_range"] = [merged_years[0], merged_years[-1]] if merged_years else None
+        temporal_summary["Start_time"] = merged_years[0] if merged_years else None
+        temporal_summary["End_time"] = merged_years[-1] if merged_years else None
         temporal_summary["Has_time"] = temporal_summary.get("Has_time", False) or len(merged_years) >= 2
-
-        crs_tokens: List[str] = []
-        for source in analyzed_sources:
-            spatial = source.get("spatial") or {}
-            crs = spatial.get("Crs") if isinstance(spatial, dict) else None
-            if isinstance(crs, dict):
-                token = crs.get("EPSG") or crs.get("Name")
-                if token and token not in crs_tokens:
-                    crs_tokens.append(str(token))
 
         first_source = analyzed_sources[0] if analyzed_sources else {}
         first_form = first_source.get("form") if first_source else "Unknown"
@@ -578,10 +571,6 @@ def analyze_dataset(file_path: str) -> Dict[str, Any]:
             "Resolution": first_source.get("resolution"),
             "Temporal": temporal_summary,
             "Quality": first_source.get("quality"),
-            "Spatial_overview": {
-                "CRS_list": crs_tokens,
-                "Has_mixed_crs": len(crs_tokens) > 1,
-            },
             "Source_count": len(analyzed_sources),
             **first_source_summary,
         }
@@ -628,8 +617,21 @@ def validate_profile_consistency(profile: Dict[str, Any]) -> Dict[str, Any]:
         if source.get("form") == "Raster" and not source.get("resolution"):
             warnings.append(f"栅格缺少分辨率信息: {source.get('file_path')}")
 
-    spatial_overview = profile.get("Spatial_overview", {}) or {}
-    if spatial_overview.get("Has_mixed_crs") is True:
+    crs_tokens: List[str] = []
+    spatial_candidates: List[Any] = []
+    if data_sources:
+        spatial_candidates.extend(source.get("spatial") for source in data_sources)
+    else:
+        spatial_candidates.append(profile.get("Spatial"))
+
+    for spatial in spatial_candidates:
+        crs = spatial.get("Crs") if isinstance(spatial, dict) else None
+        if isinstance(crs, dict):
+            token = crs.get("EPSG") or crs.get("Name")
+            if token and str(token) not in crs_tokens:
+                crs_tokens.append(str(token))
+
+    if len(crs_tokens) > 1:
         warnings.append("检测到数据源存在混合CRS，可能影响空间叠置分析")
 
     years = temporal.get("Years", []) or []

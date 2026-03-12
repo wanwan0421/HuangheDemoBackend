@@ -545,6 +545,15 @@ def analyze_dataset(file_path: str) -> Dict[str, Any]:
 
         first_source = analyzed_sources[0] if analyzed_sources else {}
         first_form = first_source.get("form") if first_source else "Unknown"
+
+        source_count = len(analyzed_sources)
+        normalized_forms = sorted({str(form) for form in source_forms if form})
+        overall_form = first_form
+
+        if "Timeseries" in normalized_forms:
+            overall_form = "Timeseries"
+        elif source_count > 1 and normalized_forms == ["Raster"] and temporal_summary.get("Has_time"):
+            overall_form = "Timeseries"
         first_source_summary = {
             key: value
             for key, value in first_source.items()
@@ -562,7 +571,7 @@ def analyze_dataset(file_path: str) -> Dict[str, Any]:
         }
 
         profile_data = {
-            "Form": first_form,
+            "Form": overall_form,
             "Source_forms": source_forms,
             "primary_file": listing.get("primary_file"),
             "Source_type": listing.get("source_type"),
@@ -571,7 +580,7 @@ def analyze_dataset(file_path: str) -> Dict[str, Any]:
             "Resolution": first_source.get("resolution"),
             "Temporal": temporal_summary,
             "Quality": first_source.get("quality"),
-            "Source_count": len(analyzed_sources),
+            "Source_count": source_count,
             **first_source_summary,
         }
 

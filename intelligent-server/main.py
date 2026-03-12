@@ -430,11 +430,6 @@ async def align_session(request: AlignSessionRequest):
             "session_id": request.session_id,
             "alignment_result": alignment_result,
             "alignment_status": session.status.value,
-            "go_no_go": alignment_result.get("go_no_go", "no-go"),
-            "can_run_now": alignment_result.get("can_run_now", False),
-            "recommended_actions": alignment_result.get("recommended_actions", []),
-            "minimal_runnable_inputs": alignment_result.get("minimal_runnable_inputs", []),
-            "mapping_plan": alignment_result.get("mapping_plan_draft", [])
         }
     
     except HTTPException:

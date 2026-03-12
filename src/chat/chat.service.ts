@@ -170,34 +170,11 @@ export class ChatService {
             throw new HttpException('Task spec or model contract is missing', HttpStatus.BAD_REQUEST);
         }
 
-        // 从数据库中读取数据扫描结果
-        const dataScanResults = await this.dataScanResultModel
-            .find({ sessionId: sessionId, status: 'completed' })
-            .sort({ createdAt: -1 })
-            .exec();
-
-        // 同一输入槽只保留最新一条（回退到文件路径），避免历史脏数据干扰对齐
-        const latestBySlotOrPath = new Map<string, DataScanResultDocument>();
-        for (const result of dataScanResults) {
-            const key = (result as any).slotKey || result.filePath;
-            if (!latestBySlotOrPath.has(key)) {
-                latestBySlotOrPath.set(key, result);
-            }
-        }
-        const latestResults = Array.from(latestBySlotOrPath.values()).reverse();
-
-        // 组装文件类 data_profiles
-        const scannedProfiles = latestResults.map((result, index) => ({
-            file_id: `node_${sessionId}_${(result as any).slotKey || index}`,
-            file_path: result.filePath,
-            slot_key: (result as any).slotKey || null,
-            profile: result.profile || {},
-            timestamp: new Date().toISOString(),
-            status: 'active',
-        }));
+        // 优先使用 session 中已保存的扫描结果，避免重复查询；若不存在则回退到 dataScanResults 集合
+        const scannedProfiles = await this.buildScannedProfiles(sessionId, session.profile);
 
         // 组装前端输入框参数类 data_profiles（例如阈值、系数、开关等）
-        const manualProfiles = this.buildManualParameterProfiles(session.context, sessionId);
+        const manualProfiles = this.buildManualParameterProfiles(session.context, sessionId, session.modelContract);
         const dataProfiles = [...scannedProfiles, ...manualProfiles];
 
         try {
@@ -214,15 +191,24 @@ export class ChatService {
             });
 
             const result = response.data || {};
+            const alignmentResult = result.alignment_result || {};
+            const normalizedGoNoGo = result.go_no_go ?? alignmentResult.go_no_go;
+            const normalizedCanRunNow = result.can_run_now ?? alignmentResult.can_run_now;
+
             await this.sessionModel.findByIdAndUpdate(sessionId, {
-                alignmentResult: result.alignment_result || {},
+                alignmentResult: alignmentResult,
                 alignmentStatus: result.alignment_status,
-                goNoGo: result.go_no_go,
-                canRunNow: result.can_run_now,
+                goNoGo: normalizedGoNoGo,
+                canRunNow: normalizedCanRunNow,
                 updatedAt: new Date(),
             }).exec();
 
-            return result;
+            return {
+                status: result.status || 'success',
+                session_id: result.session_id || sessionId,
+                alignment_status: result.alignment_status,
+                alignment_result: alignmentResult,
+            };
         } catch (error) {
             const detail = error?.response?.data?.detail || error?.message || 'Align session failed';
             const statusCode = error?.response?.status || HttpStatus.BAD_GATEWAY;
@@ -230,7 +216,98 @@ export class ChatService {
         }
     }
 
-    private buildManualParameterProfiles(context: any, sessionId: string): any[] {
+    private async buildScannedProfiles(sessionId: string, sessionProfileStore: any): Promise<any[]> {
+        const sessionProfiles = this.normalizeSessionProfileStore(sessionId, sessionProfileStore);
+        if (sessionProfiles.length > 0) {
+            return sessionProfiles;
+        }
+
+        const dataScanResults = await this.dataScanResultModel
+            .find({ sessionId: sessionId, status: 'completed' })
+            .sort({ createdAt: -1 })
+            .exec();
+
+        const latestBySlotOrPath = new Map<string, DataScanResultDocument>();
+        for (const result of dataScanResults) {
+            const key = (result as any).slotKey || result.filePath;
+            if (!latestBySlotOrPath.has(key)) {
+                latestBySlotOrPath.set(key, result);
+            }
+        }
+
+        return Array.from(latestBySlotOrPath.values())
+            .reverse()
+            .map((result, index) => ({
+                file_id: `node_${sessionId}_${(result as any).slotKey || index}`,
+                file_path: result.filePath,
+                slot_key: (result as any).slotKey || null,
+                profile: result.profile || {},
+                timestamp: new Date().toISOString(),
+                status: 'active',
+            }));
+    }
+
+    private normalizeSessionProfileStore(sessionId: string, sessionProfileStore: any): any[] {
+        let entries: any[] = [];
+
+        if (Array.isArray(sessionProfileStore)) {
+            entries = sessionProfileStore;
+        } else if (Array.isArray(sessionProfileStore?.data_profiles)) {
+            entries = sessionProfileStore.data_profiles;
+        } else if (sessionProfileStore && typeof sessionProfileStore === 'object') {
+            entries = [sessionProfileStore];
+        }
+
+        return entries
+            .map((entry, index) => this.toScannedProfileEntry(entry, sessionId, index))
+            .filter(Boolean);
+    }
+
+    private toScannedProfileEntry(entry: any, sessionId: string, index: number): any | null {
+        if (!entry || typeof entry !== 'object') {
+            return null;
+        }
+
+        const slotKey = entry.slot_key || entry.slotKey || entry.profile?.slot_key || entry.profile?.slotKey || null;
+        const profile = entry.profile && typeof entry.profile === 'object'
+            ? entry.profile
+            : entry;
+        const filePath = this.resolveProfileFilePath(entry) || this.resolveProfileFilePath(profile) || `session://profile/${slotKey || index}`;
+
+        return {
+            file_id: entry.file_id || entry.fileId || `node_${sessionId}_${slotKey || index}`,
+            file_path: filePath,
+            slot_key: slotKey,
+            profile,
+            timestamp: entry.timestamp || new Date().toISOString(),
+            status: entry.status || 'active',
+        };
+    }
+
+    private resolveProfileFilePath(profileEntry: any): string | null {
+        if (!profileEntry || typeof profileEntry !== 'object') {
+            return null;
+        }
+
+        const directPath =
+            profileEntry.file_path ||
+            profileEntry.filePath ||
+            profileEntry.primary_file ||
+            profileEntry.primaryFile ||
+            profileEntry.path;
+
+        if (typeof directPath === 'string' && directPath.trim()) {
+            return directPath;
+        }
+
+        const firstSource = Array.isArray(profileEntry.data_sources)
+            ? profileEntry.data_sources.find((item: any) => typeof item?.file_path === 'string' && item.file_path.trim())
+            : null;
+
+        return firstSource?.file_path || null;
+    }
+
+    private buildManualParameterProfiles(context: any, sessionId: string, modelContract?: any): any[] {
         if (!context || typeof context !== 'object') {
             return [];
         }
@@ -240,13 +317,14 @@ export class ChatService {
             context.manual_inputs ||
             context.inputParams ||
             context.inputs ||
-            [];
+            context;
 
-        const normalized = this.normalizeManualInputs(candidates);
+        const normalized = this.normalizeManualInputs(candidates, modelContract);
 
         return normalized.map((item, index) => ({
             file_id: `manual_${sessionId}_${index}`,
             file_path: `manual://input/${item.name}`,
+            slot_key: item.name,
             profile: {
                 Form: 'Parameter',
                 Value_type: item.valueType,
@@ -256,7 +334,9 @@ export class ChatService {
                     value: item.value,
                 },
                 Semantic: {
-                    Abstract: `用户输入参数 ${item.name}`,
+                    Abstract: item.semanticRequirement
+                        ? `用户输入参数 ${item.name}。语义要求：${item.semanticRequirement}`
+                        : `用户输入参数 ${item.name}`,
                     Applications: ['模型运行输入'],
                     Tags: ['manual', 'parameter'],
                 },
@@ -266,29 +346,83 @@ export class ChatService {
         }));
     }
 
-    private normalizeManualInputs(source: any): Array<{ name: string; value: any; unit?: string; valueType: string }> {
+    private normalizeManualInputs(source: any, modelContract?: any): Array<{ name: string; value: any; unit?: string; valueType: string; semanticRequirement?: string }> {
+        const parameterContractMap = new Map<string, any>();
+        const requiredSlots = Array.isArray(modelContract?.Required_slots) ? modelContract.Required_slots : [];
+
+        for (const slot of requiredSlots) {
+            if (String(slot?.Data_type || '').toLowerCase() === 'parameter' && slot?.Input_name) {
+                parameterContractMap.set(slot.Input_name, slot);
+            }
+        }
+
         if (Array.isArray(source)) {
             return source
                 .map((item, idx) => {
                     const name = item?.name || item?.key || `manual_input_${idx + 1}`;
                     const value = item?.value;
                     const unit = item?.unit;
+                    const slotMeta = parameterContractMap.get(name);
                     return {
                         name,
                         value,
                         unit,
                         valueType: this.inferValueType(value),
+                        semanticRequirement: slotMeta?.Semantic_requirement,
                     };
                 })
-                .filter((item) => item.value !== undefined && item.value !== null);
+                .filter((item) => {
+                    if (item.value === undefined || item.value === null) {
+                        return false;
+                    }
+                    if (parameterContractMap.size === 0) {
+                        return true;
+                    }
+                    return parameterContractMap.has(item.name);
+                });
         }
 
         if (source && typeof source === 'object') {
-            return Object.entries(source).map(([name, value]) => ({
-                name,
-                value,
-                valueType: this.inferValueType(value),
-            }));
+            return Object.entries(source)
+                .map(([name, rawValue]) => {
+                    if (parameterContractMap.size > 0 && !parameterContractMap.has(name)) {
+                        return null;
+                    }
+
+                    const slotMeta = parameterContractMap.get(name);
+                    if (rawValue && typeof rawValue === 'object' && !Array.isArray(rawValue)) {
+                        const rawValueObject = rawValue as Record<string, any>;
+                        const value =
+                            rawValueObject.value ??
+                            rawValueObject.defaultValue ??
+                            rawValueObject.currentValue ??
+                            rawValueObject.inputValue;
+
+                        if (value === undefined || value === null) {
+                            return null;
+                        }
+
+                        return {
+                            name: rawValueObject.name || rawValueObject.key || name,
+                            value,
+                            unit: rawValueObject.unit,
+                            valueType: this.inferValueType(value),
+                            semanticRequirement: slotMeta?.Semantic_requirement,
+                        };
+                    }
+
+                    if (rawValue === undefined || rawValue === null || Array.isArray(rawValue)) {
+                        return null;
+                    }
+
+                    return {
+                        name,
+                        value: rawValue,
+                        valueType: this.inferValueType(rawValue),
+                        semanticRequirement: slotMeta?.Semantic_requirement,
+                    };
+                })
+                .filter(Boolean) as Array<{ name: string; value: any; unit?: string; valueType: string; semanticRequirement?: string }>;
         }
 
         return [];

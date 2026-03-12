@@ -359,7 +359,8 @@ def get_model_details(model_md5: str) -> Dict[str, Any]:
                         inputs.append({
                             "name": event_data.get("eventDataName") or event.get("eventName", ""),
                             "type": "FILE",
-                            "description": event_data.get("exentDataDesc", "")
+                            "description": event_data.get("exentDataDesc", ""),
+                            "nodeList": event_data.get("nodeList", [])
                         })
                     
                     events.append({

@@ -243,6 +243,7 @@ def alignment_node(state: AlignmentState) -> Dict[str, Any]:
 2) 给出每个输入槽位（Required_slots）的对齐结果
 3) 给出全局总结、阻塞问题、可选修复建议
 4) 评分区间为 0~1；status 仅允许: match | partial | mismatch
+5) 当模型契约中的 CRS 描述为“推荐使用”而非“必须/严格要求”时，CRS 不一致默认判为 non_blocking_issues（警告）而非 blocking_issues；只有出现无法投影、空间参考缺失且无法推断、或会直接导致模型无法运行时，才可判为阻塞问题
 
 JSON 结构示例（必须遵循）：
 {

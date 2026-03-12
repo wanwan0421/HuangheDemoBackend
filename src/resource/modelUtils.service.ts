@@ -81,24 +81,22 @@ export class ModelUtilsService {
                 if (item.type === "external") {
                     root.externalId = item.externalId?.toLowerCase() || item.EXTERNAL?.toLowerCase() || "";
                     root.parentId = "null";
+
+                    const udxChildren = this.getUdxChildren(item.UdxDeclaration || item.UDXDeclaration || item);
+                    if (udxChildren.length > 0) {
+                        root.nodes = [];
+                        this.parseUdxNodes(udxChildren, root);
+                    }
+
                     datasetArray.push(root);
                 } else {
-                    const Udx = item.UdxDeclaration || item.UDXDeclaration;
+                    const Udx = item.UdxDeclaration || item.UDXDeclaration || {};
 
                     const rootId = Udx.id ? "root" + Udx.id : "root" + crypto.randomUUID();
                     root.internalId = rootId;
                     root.parentId = "null";
 
-                    let udxNode = Udx.UDXNode || Udx.UdxNode;
-
-                    // 先检查Udx.UDXNode是否是一个包裹对象，里面又嵌套了UDXNode属性
-                    if (udxNode && !Array.isArray(udxNode) && (udxNode.UDXNode || udxNode.UdxNode)) {
-                        udxNode = udxNode.UDXNode || udxNode.UdxNode;
-                    }
-
-                    const udxChildren = Array.isArray(udxNode)
-                        ? udxNode
-                        : udxNode ? [udxNode] : [];
+                    const udxChildren = this.getUdxChildren(Udx);
 
                     root.schema = this.extractUdxSchema(mdlXml, root.name);
                     root.nodes = [];
@@ -184,6 +182,23 @@ export class ModelUtilsService {
         } catch (error) {
             throw new Error(`Error parsing MDL XML: ${error}`);
         }
+    }
+
+    private getUdxChildren(source: any): any[] {
+        if (!source) {
+            return [];
+        }
+
+        let udxNode = source.UDXNode || source.UdxNode;
+
+        // 先检查 UDXNode 是否是一个包裹对象，里面又嵌套了 UDXNode/UdxNode 属性
+        if (udxNode && !Array.isArray(udxNode) && (udxNode.UDXNode || udxNode.UdxNode)) {
+            udxNode = udxNode.UDXNode || udxNode.UdxNode;
+        }
+
+        return Array.isArray(udxNode)
+            ? udxNode
+            : udxNode ? [udxNode] : [];
     }
 
     // 递归解析UDX节点

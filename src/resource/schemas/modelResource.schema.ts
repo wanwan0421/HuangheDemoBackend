@@ -45,7 +45,7 @@ export class ModelResource {
     type: ResourceType; // 资源类型：模型方法或数据方法
 
     // 模型方法属性
-    @Prop({ required: true, index: true })
+    @Prop({ index: true })
     md5?: string; // 模型文件md5值
 
     @Prop({ type: String })
@@ -61,14 +61,14 @@ export class ModelResource {
     @Prop()
     uuid?: string; // 数据方法的uuid
 
-    // @Prop({ type: [Object] })
-    // params?: ModelItemParamDto[];
+    @Prop({ type: [Object] })
+    params?: ModelItemParamDto[];
 
-    // @Prop({ type: [Object] })
-    // inputParams?: ModelItemParamDto[];
+    @Prop({ type: [Object] })
+    inputParams?: ModelItemParamDto[];
 
-    // @Prop({ type: [Object] })
-    // outputParams?: ModelItemParamDto[];
+    @Prop({ type: [Object] })
+    outputParams?: ModelItemParamDto[];
 
     // 模型绑定的测试数据
     @Prop({ type: [Object], default: [] })

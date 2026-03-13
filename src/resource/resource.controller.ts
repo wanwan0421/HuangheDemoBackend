@@ -18,6 +18,16 @@ export class ResourceController {
         }
     }
 
+    @Post('synchronizeDataMethods')
+    @HttpCode(HttpStatus.OK)
+    async synchronizeDataMethods(): Promise<void> {
+        try {
+            await this.resourceService.synchronizeDataMethods();
+        } catch (error) {
+            throw new Error(`Failed to synchronize data methods: ${error.message}`);
+        }
+    }
+
     @Get('findModels')
     @HttpCode(HttpStatus.OK)
     async findModels(@Query() filter: ResourceFilter): Promise<ResourceItem[]> {
@@ -70,5 +80,34 @@ export class ResourceController {
         })
 
         return resourceModelList;
+    }
+
+    @Get('findMethods')
+    @HttpCode(HttpStatus.OK)
+    async findMethods(@Query() filter: ResourceFilter): Promise<ResourceItem[]> {
+        const { categoryId, keyword } = filter;
+        const categoryIdArray = categoryId ? categoryId.split(',') : [];
+        const methodResults = await this.resourceService.findMethods({ categoryId: categoryIdArray, keyword: keyword });
+
+        return methodResults.map((item) => {
+                        const dateValue = item.createTime;
+            let formattedDate = '';
+
+            if (dateValue) {
+                const dateObj = new Date(dateValue);
+                if (!isNaN(dateObj.getTime())) {
+                    formattedDate = dateObj.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+                }
+            }
+
+            return {
+                name: item.name,
+                description: item?.description ?? '',
+                type: item.type,
+                author: item?.author ?? '',
+                keywords: [],
+                createdTime: formattedDate,
+            };
+        });
     }
 }

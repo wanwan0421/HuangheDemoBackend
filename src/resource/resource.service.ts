@@ -14,6 +14,7 @@ import { ModelUtilsService } from './modelUtils.service';
 import { ModelItemEventDataDto } from './dto/modelItemEventData.dto';
 import { ModelItemEventDataNodeDto } from './dto/modelItemEventDataNode.dto';
 import { ModelItemEventDto } from './dto/modelItemEvent.dto';
+import { ModelItemParamDto } from './dto/modelResourceIO.dto';
 import { GenAIService } from 'src/genai/genai.service';
 import { Cron, CronExpression } from '@nestjs/schedule';
 
@@ -22,6 +23,8 @@ export class ResourceService {
     private readonly logger = new Logger(ResourceService.name); // 日志记录器
     private readonly portalLocation: string;
     private readonly portalToken: string;
+    private readonly dataServerLocation: string;
+    private readonly dataServerToken: string;
     private readonly pageSize = 20;
     private readonly embeddingSource = 'resource-sync';
 
@@ -36,6 +39,8 @@ export class ResourceService {
     ) {
         this.portalLocation = this.configService.get<string>('portalLocation')!;
         this.portalToken = this.configService.get<string>('portalToken')!;
+        this.dataServerLocation = this.configService.get<string>('dataServerLocation') ?? '';
+        this.dataServerToken = this.configService.get<string>('dataServerToken') ?? '';
     }
 
     async onModuleInit() {
@@ -109,6 +114,113 @@ export class ResourceService {
         return modelsMd5List;
     }
 
+    private async getHealthyDataMethodList(page: number, pageSize: number): Promise<{ totalNumber: number; methodList: Record<string, any>[] }> {
+        const url = `http://${this.dataServerLocation}/container/method/listWithStringTag?page=${page}&limit=${pageSize}`;
+
+        try {
+            const response = await firstValueFrom(
+                this.httpService.get<any>(url, {
+                    headers: {
+                        token: this.dataServerToken,
+                    },
+                }),
+            );
+
+            if (response.status !== 200 || !response.data) {
+                this.logger.error(`Failed to fetch method data from portal, status: ${response.status}`);
+                throw new Error(`Failed to fetch method data from portal, status: ${response.status}`);
+            }
+
+            const pageNode = response.data?.page;
+            const totalNumber = Number(pageNode?.totalCount || 0);
+            const methodList = Array.isArray(pageNode?.list) ? pageNode.list : [];
+
+            return {
+                totalNumber,
+                methodList,
+            };
+        } catch (error) {
+            this.logger.error(`Error fetching method data from portal: ${error}`);
+            throw new Error(`Error fetching method data from portal: ${error}`);
+        }
+    }
+
+    private extractStringValues(input: any): string[] {
+        if (input === null || input === undefined) {
+            return [];
+        }
+
+        if (typeof input === 'string' || typeof input === 'number' || typeof input === 'boolean') {
+            return [String(input)];
+        }
+
+        if (Array.isArray(input)) {
+            return input.flatMap((item) => this.extractStringValues(item)).filter((item) => item.length > 0);
+        }
+
+        if (typeof input === 'object') {
+            return Object.values(input)
+                .flatMap((value) => this.extractStringValues(value))
+                .filter((item) => item.length > 0);
+        }
+
+        return [];
+    }
+
+    private hasKeyDeep(input: any, key: string): boolean {
+        if (!input || typeof input !== 'object') {
+            return false;
+        }
+
+        if (Array.isArray(input)) {
+            return input.some((item) => this.hasKeyDeep(item, key));
+        }
+
+        if (Object.prototype.hasOwnProperty.call(input, key)) {
+            return true;
+        }
+
+        return Object.values(input).some((value) => this.hasKeyDeep(value, key));
+    }
+
+    private parseMethodParams(paramsNode: any): { params: ModelItemParamDto[]; inputParams: ModelItemParamDto[]; outputParams: ModelItemParamDto[] } {
+        const params: ModelItemParamDto[] = [];
+        const inputParams: ModelItemParamDto[] = [];
+        const outputParams: ModelItemParamDto[] = [];
+
+        const paramsArray = Array.isArray(paramsNode) ? paramsNode : [];
+
+        for (const node of paramsArray) {
+            const parameterTypeValues = this.extractStringValues(node?.parameter_type);
+            const type = parameterTypeValues.length > 0 ? parameterTypeValues.join('|') : 'Unknown';
+
+            const param = plainToInstance(ModelItemParamDto, {
+                name: node?.Name || '',
+                type,
+                description: node?.Description || '',
+            });
+
+            params.push(param);
+
+            if (this.hasKeyDeep(node?.parameter_type, 'NewFile')) {
+                outputParams.push(param);
+            } else {
+                inputParams.push(param);
+            }
+        }
+
+        return { params, inputParams, outputParams };
+    }
+
+    private parseMethodDate(value: unknown): Date | undefined {
+        if (typeof value !== 'string' || !value.trim()) {
+            return undefined;
+        }
+
+        const parsed = new Date(value.replace(' ', 'T'));
+        return Number.isNaN(parsed.getTime()) ? undefined : parsed;
+    }
+
     // 主入口：获取门户模型并同步到本地
     // 每小时更新一次
     @Cron(CronExpression.EVERY_DAY_AT_1AM)
@@ -167,6 +279,60 @@ export class ResourceService {
         } catch (error) {
             this.logger.error(`Error synchronizing model embeddings: ${error}`);
         }
+    }
+
+    // 每小时更新一次
+    @Cron(CronExpression.EVERY_5_MINUTES)
+    public async synchronizeDataMethods(): Promise<void> {
+        this.logger.log('Start synchronizing data methods...');
+
+        const pageSize = this.pageSize;
+        let firstPageResult = await this.getHealthyDataMethodList(1, pageSize);
+        const allMethods: Record<string, any>[] = [...firstPageResult.methodList];
+
+        const totalMethods = firstPageResult.totalNumber;
+        const totalPages = Math.ceil(totalMethods / pageSize);
+
+        for (let page = 2; page <= totalPages; page++) {
+            try {
+                firstPageResult = await this.getHealthyDataMethodList(page, pageSize);
+                allMethods.push(...firstPageResult.methodList);
+            } catch (error) {
+                this.logger.error(`Error fetching method data on page ${page}: ${error}`);
+            }
+        }
+
+        for (const methodItem of allMethods) {
+            try {
+                const id = methodItem?.id ? String(methodItem.id) : '';
+                if (!id) {
+                    continue;
+                }
+
+                const { params, inputParams, outputParams } = this.parseMethodParams(methodItem?.params);
+
+                const methodData: Partial<ModelResource> = {
+                    id,
+                    name: methodItem?.name || '',
+                    description: methodItem?.description || '',
+                    author: 'opengms@126.com',
+                    type: ResourceType.METHOD,
+                    uuid: methodItem?.uuid ? String(methodItem.uuid) : '',
+                    normalTags: this.extractStringValues(methodItem?.tagIdList),
+                    params,
+                    inputParams,
+                    outputParams,
+                    createTime: this.parseMethodDate(methodItem?.createTime),
+                    updateTime: this.parseMethodDate(methodItem?.updateTime),
+                };
+
+                await this.saveModel(methodData);
+            } catch (error) {
+                this.logger.error(`Error processing method item ${methodItem?.id || 'unknown'}: ${error}`);
+            }
+        }
+
+        this.logger.log(`Data method synchronization completed, total processed: ${allMethods.length}`);
     }
 
     // 从解析后的MDL中的states中提取输入/输出数据结构
@@ -308,7 +474,7 @@ export class ResourceService {
         const query: any = {type: ResourceType.MODEL};
 
         // 根据分类过滤
-        if (categoryId?.length !== 0) {
+        if (categoryId && categoryId.length > 0) {
             query.normalTags = { $in: categoryId } // 使用 $in 操作符查找normalTags数组中包含任一指定ID(类别)的资源
 
         }
@@ -334,6 +500,31 @@ export class ResourceService {
             return results;
         } catch(error) {
             throw new Error("Faild to fetch model resources.");
+        }
+    }
+
+    public async findMethods(filter: { categoryId?: string[]; keyword?: string}): Promise<ModelResource[]> {
+        const { categoryId, keyword } = filter;
+        const query: any = { type: ResourceType.METHOD };
+
+        if (categoryId && categoryId.length > 0) {
+            query.normalTags = { $in: categoryId };
+        }
+
+        if (keyword) {
+            const regex = new RegExp(keyword, 'i');
+            Object.assign(query, {
+                $or: [
+                    { name: { $regex: regex } },
+                    { description: { $regex: regex } },
+                ],
+            });
+        }
+
+        try {
+            return await this.modelResourceModel.find(query).exec();
+        } catch (error) {
+            throw new Error('Faild to fetch method resources.');
         }
     }
 
@@ -440,7 +631,7 @@ export class ResourceService {
 
     public async initResourceModelVectorData() {
         const data = await this.modelResourceModel
-            .find({}, { id: 1, md5: 1, name: 1, description: 1 })
+            .find({ type: ResourceType.MODEL }, { id: 1, md5: 1, name: 1, description: 1 })
             .lean();
         console.log(`查找到 ${data.length} 条模型资源数据`);
 

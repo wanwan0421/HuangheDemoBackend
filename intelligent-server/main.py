@@ -389,6 +389,7 @@ class AlignSessionRequest(BaseModel):
     task_spec: Dict[str, Any]
     model_contract: Dict[str, Any]
     data_profiles: List[Dict[str, Any]] = Field(default_factory=list)
+    auto_transform: bool = True
 
 @app.post("/api/agent/align-session")
 async def align_session(request: AlignSessionRequest):
@@ -422,7 +423,7 @@ async def align_session(request: AlignSessionRequest):
         session.data_profiles = request.data_profiles
         
         # 执行对齐
-        session = await coordinator.execute_alignment(request.session_id)
+        session = await coordinator.execute_alignment(request.session_id, auto_transform=request.auto_transform)
         alignment_result = session.alignment_result or {}
         
         return {
@@ -430,6 +431,11 @@ async def align_session(request: AlignSessionRequest):
             "session_id": request.session_id,
             "alignment_result": alignment_result,
             "alignment_status": session.status.value,
+            "go_no_go": alignment_result.get("go_no_go", "no-go"),
+            "can_run_now": alignment_result.get("can_run_now", False),
+            "recommended_actions": alignment_result.get("recommended_actions", []),
+            "minimal_runnable_inputs": alignment_result.get("minimal_runnable_inputs", []),
+            "mapping_plan": alignment_result.get("mapping_plan_draft", [])
         }
     
     except HTTPException:

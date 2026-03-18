@@ -4,7 +4,7 @@ from fastapi.responses import StreamingResponse
 from agents.model_recommend.graph import agent, ModelState
 from agents.alignment.graph import alignment_agent, AlignmentState
 from agents.data_scan.graph import DataScanState, data_scan_agent
-from agents.triangle_coordinator import get_coordinator, TriangleMatchingCoordinator
+from agents.triangle_coordinator import get_coordinator
 from agents.data_monitor import get_data_scanner
 from langchain.messages import HumanMessage, AIMessageChunk, AnyMessage, ToolMessage
 from typing import Any, Dict, List, Optional
@@ -381,6 +381,39 @@ def merge_state(old, update):
         old.update(v)
     return old
 
+
+def merge_data_profiles_for_alignment(data_profiles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not data_profiles:
+        return {}
+
+    if len(data_profiles) == 1:
+        return data_profiles[0].get("profile", {})
+
+    merged_profile: Dict[str, Any] = {
+        "data_sources": [],
+        "spatial_union": {},
+        "temporal_union": {},
+        "forms": [],
+    }
+
+    for data_profile in data_profiles:
+        profile = data_profile.get("profile", {})
+        merged_profile["data_sources"].append(
+            {
+                "file_id": data_profile.get("file_id"),
+                "file_path": data_profile.get("file_path"),
+                "form": profile.get("Form"),
+                "spatial": profile.get("Spatial"),
+                "temporal": profile.get("Temporal"),
+            }
+        )
+
+        form = profile.get("Form")
+        if form and form not in merged_profile["forms"]:
+            merged_profile["forms"].append(form)
+
+    return merged_profile
+
 # ============= 数据驱动三角检验API（流式闭环） =============
 
 class AlignSessionRequest(BaseModel):
@@ -391,55 +424,89 @@ class AlignSessionRequest(BaseModel):
     data_profiles: List[Dict[str, Any]] = Field(default_factory=list)
     auto_transform: bool = True
 
-@app.post("/api/agent/align-session")
-async def align_session(request: AlignSessionRequest):
+@app.post("/api/agent/align-session/stream")
+async def align_session_stream(request: AlignSessionRequest):
     """
-    一键对齐：接收完整数据执行三角检验
-    
-    前端流程闭环：
-    1. GET /api/agent/stream?query=xxx → Node 存入 MongoDB
-    2. GET /api/agent/data-scan/stream?file_path=xxx → Node 存入 MongoDB
-    3. POST /api/agent/align-session（body 带完整数据）→ 执行对齐
-    
-    Args:
-        request: 包含 session_id、task_spec、model_contract、data_profiles
-    
-    Returns:
-        对齐结果、Go/No-Go决策、建议操作列表
+    流式对齐与转换执行：作为第三智能体对外提供SSE。
+
+    事件类型：
+    - status: 阶段状态
+    - alignment_done: 对齐与转换完成
+    - final: 最终可供前端渲染的返回体
+    - error: 执行错误
     """
-    try:
-        if not request.task_spec or not request.model_contract:
-            raise HTTPException(
-                status_code=400,
-                detail="缺少必要数据：task_spec 或 model_contract 为空"
-            )
-        
+    if not request.task_spec or not request.model_contract:
+        raise HTTPException(status_code=400, detail="缺少必要数据：task_spec 或 model_contract 为空")
+
+    async def event_generator():
         coordinator = get_coordinator()
-        
-        # 临时创建或更新会话（用于执行对齐）
         session = coordinator._get_or_create_session(request.session_id)
         session.task_spec = request.task_spec
         session.model_contract = request.model_contract
         session.data_profiles = request.data_profiles
-        
-        # 执行对齐
-        session = await coordinator.execute_alignment(request.session_id, auto_transform=request.auto_transform)
-        alignment_result = session.alignment_result or {}
-        
-        return {
-            "status": "success",
-            "session_id": request.session_id,
-            "alignment_result": alignment_result,
-            "alignment_status": session.status.value,
-            "go_no_go": alignment_result.get("go_no_go", "no-go"),
-            "can_run_now": alignment_result.get("can_run_now", False),
-            "recommended_actions": alignment_result.get("recommended_actions", []),
-            "minimal_runnable_inputs": alignment_result.get("minimal_runnable_inputs", []),
-            "mapping_plan": alignment_result.get("mapping_plan_draft", [])
+
+        initial_state: AlignmentState = {
+            "messages": [],
+            "Task_spec": request.task_spec,
+            "Model_contract": request.model_contract,
+            "Data_profile": merge_data_profiles_for_alignment(request.data_profiles),
+            "Data_profiles": request.data_profiles,
+            "auto_transform": request.auto_transform,
+            "Alignment_result": {},
+            "alignment_status": "processing",
+            "status": "processing",
         }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"对齐失败: {e}")
-        raise HTTPException(status_code=500, detail=f"对齐执行失败: {str(e)}")
+
+        latest_result: Dict[str, Any] = {}
+        latest_status = "processing"
+
+        try:
+            yield f"data: {json.dumps({'type': 'status', 'message': '对齐智能体开始执行', 'session_id': request.session_id}, ensure_ascii=False)}\n\n"
+
+            async for mode, chunk in alignment_agent.astream(initial_state, stream_mode=["updates"]):
+                if mode != "updates" or not isinstance(chunk, dict):
+                    continue
+
+                for node_name, node_output in chunk.items():
+                    if "alignment_status" in node_output:
+                        latest_status = node_output.get("alignment_status", latest_status)
+                    if "Alignment_result" in node_output:
+                        latest_result = node_output.get("Alignment_result", latest_result) or {}
+
+                    if node_name == "alignment_node":
+                        yield f"data: {json.dumps({'type': 'status', 'stage': 'alignment', 'message': '对齐分析完成，正在生成决策包'}, ensure_ascii=False)}\n\n"
+
+                    elif node_name == "decision_package_node":
+                        yield f"data: {json.dumps({'type': 'status', 'stage': 'decision', 'message': '决策包已生成，检查是否需要自动转换'}, ensure_ascii=False)}\n\n"
+
+                    elif node_name == "auto_transform_node":
+                        yield f"data: {json.dumps({'type': 'alignment_done', 'alignment_status': latest_status, 'alignment_result': latest_result}, ensure_ascii=False)}\n\n"
+
+            final_payload = {
+                "status": "success",
+                "session_id": request.session_id,
+                "alignment_result": latest_result,
+                "alignment_status": latest_status,
+                "go_no_go": latest_result.get("go_no_go", "no-go"),
+                "can_run_now": latest_result.get("can_run_now", False),
+                "recommended_actions": latest_result.get("recommended_actions", []),
+                "minimal_runnable_inputs": latest_result.get("minimal_runnable_inputs", []),
+                "mapping_plan": latest_result.get("mapping_plan_draft", []),
+            }
+
+            session.alignment_result = latest_result
+            session.status = coordinator._status_from_text(latest_status)
+            yield f"data: {json.dumps({'type': 'final', 'data': final_payload}, ensure_ascii=False)}\n\n"
+
+        except Exception as exc:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )

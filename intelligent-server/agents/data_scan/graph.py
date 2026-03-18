@@ -115,7 +115,7 @@ def llm_node(state: DataScanState) -> Dict[str, Any]:
 }
 
 要求：
-1) Abstract 1-2句，数据摘要，简要描述数据内容,必须引用已有字段（如Form、Source_forms、Temporal、Validation）
+1) Abstract 1-2句，数据摘要，简要描述数据内容
 2) Applications 适用场景，列出数据可能的应用领域，必须基于已有字段推断，不得凭空想象
 3) Tags 3-5个关键词标签，帮助快速理解数据主题
 4) 仅输出JSON

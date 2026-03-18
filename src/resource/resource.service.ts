@@ -282,7 +282,7 @@ export class ResourceService {
     }
 
     // 每小时更新一次
-    @Cron(CronExpression.EVERY_5_MINUTES)
+    @Cron(CronExpression.EVERY_DAY_AT_1AM)
     public async synchronizeDataMethods(): Promise<void> {
         this.logger.log('Start synchronizing data methods...');
 

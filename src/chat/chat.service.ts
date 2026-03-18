@@ -178,19 +178,13 @@ export class ChatService {
         const dataProfiles = [...scannedProfiles, ...manualProfiles];
 
         try {
-            const response = await this.httpService.axiosRef({
-                url: `${process.env.agentUrl}/align-session`,
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                data: {
-                    session_id: sessionId,
-                    task_spec: session.taskSpec,
-                    model_contract: session.modelContract,
-                    data_profiles: dataProfiles,
-                },
+            const result = await this.readAlignStreamFinal({
+                session_id: sessionId,
+                task_spec: session.taskSpec,
+                model_contract: session.modelContract,
+                data_profiles: dataProfiles,
             });
 
-            const result = response.data || {};
             const alignmentResult = result.alignment_result || {};
             const normalizedGoNoGo = result.go_no_go ?? alignmentResult.go_no_go;
             const normalizedCanRunNow = result.can_run_now ?? alignmentResult.can_run_now;
@@ -214,6 +208,88 @@ export class ChatService {
             const statusCode = error?.response?.status || HttpStatus.BAD_GATEWAY;
             throw new HttpException(detail, statusCode);
         }
+    }
+
+    private async readAlignStreamFinal(requestBody: Record<string, any>): Promise<any> {
+        return new Promise((resolve, reject) => {
+            this.httpService
+                .axiosRef({
+                    url: `${process.env.agentUrl}/align-session/stream`,
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Accept: 'text/event-stream',
+                    },
+                    responseType: 'stream',
+                    data: requestBody,
+                })
+                .then((response) => {
+                    let buffer = '';
+                    let finalPayload: any = null;
+
+                    response.data.on('data', (chunk: Buffer) => {
+                        buffer += chunk.toString();
+
+                        while (true) {
+                            const nn = buffer.indexOf('\n\n');
+                            const rrnn = buffer.indexOf('\r\n\r\n');
+                            const sepIndex = nn === -1 ? rrnn : rrnn === -1 ? nn : Math.min(nn, rrnn);
+                            if (sepIndex < 0) {
+                                break;
+                            }
+
+                            const block = buffer.slice(0, sepIndex);
+                            const sepLen = buffer.startsWith('\r\n', sepIndex) ? 4 : 2;
+                            buffer = buffer.slice(sepIndex + sepLen);
+
+                            const dataLines: string[] = [];
+                            block.split(/\r?\n/).forEach((rawLine) => {
+                                const line = rawLine.trim();
+                                if (!line) {
+                                    return;
+                                }
+                                if (line.startsWith('data:')) {
+                                    dataLines.push(line.replace(/^data:\s*/, ''));
+                                }
+                            });
+
+                            if (!dataLines.length) {
+                                continue;
+                            }
+
+                            const jsonStr = dataLines.join('\n');
+                            try {
+                                const payload = JSON.parse(jsonStr);
+                                if (payload?.type === 'error') {
+                                    reject(new HttpException(payload?.message || 'Align session stream error', HttpStatus.BAD_GATEWAY));
+                                    response.data.destroy();
+                                    return;
+                                }
+                                if (payload?.type === 'final' && payload?.data) {
+                                    finalPayload = payload.data;
+                                }
+                            } catch (err) {
+                                console.warn('alignSession SSE JSON parse error:', err);
+                            }
+                        }
+                    });
+
+                    response.data.on('end', () => {
+                        if (finalPayload) {
+                            resolve(finalPayload);
+                            return;
+                        }
+                        reject(new HttpException('Align session stream ended without final payload', HttpStatus.BAD_GATEWAY));
+                    });
+
+                    response.data.on('error', (err) => {
+                        reject(new HttpException(err?.message || 'Align session stream failed', HttpStatus.BAD_GATEWAY));
+                    });
+                })
+                .catch((err) => {
+                    reject(err);
+                });
+        });
     }
 
     private async buildScannedProfiles(sessionId: string, sessionProfileStore: any): Promise<any[]> {
@@ -472,7 +548,6 @@ export class ChatService {
                 next: (event) => {
                     observer.next(event);
                     const payload = event.data;
-                    console.log('Received payload:', payload);
                     if (payload?.type === 'token') {
                         aiResponse += payload.message || '';
                     }
@@ -511,7 +586,6 @@ export class ChatService {
                     observer.complete();
                 },
                 error: async (err) => {
-                    console.error('SSE Stream Interrupted:', err.message);
                     // 即便断开了，也要把已经拿到的部分 AI 回答存入数据库
                     await this.persistFinalData(sessionId, aiResponse, tools, finalModelData, taskSpecData, modelContractData);
                     observer.error(err);

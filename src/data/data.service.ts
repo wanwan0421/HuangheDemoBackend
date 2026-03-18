@@ -38,13 +38,11 @@ export class DataService {
 
     for (const pythonPath of possiblePaths) {
       if (fs.existsSync(pythonPath)) {
-        this.logger.log(`找到 Python 可执行文件: ${pythonPath}`);
         return pythonPath;
       }
     }
 
     // 如果虚拟环境不存在，尝试使用系统 Python
-    this.logger.warn(`未找到虚拟环境的 Python，将尝试使用系统 Python`);
     return process.platform === 'win32' ? 'python.exe' : 'python';
   }
 
@@ -204,7 +202,6 @@ export class DataService {
       const timeout = setTimeout(() => {
         if (!hasErrored) {
           hasErrored = true;
-          this.logger.error(`Python 脚本执行超时（>5分钟），正在终止...`);
           python.kill('SIGTERM');
           reject(new Error(`Python 脚本执行超时，请检查文件大小或服务器资源`));
         }
@@ -212,14 +209,10 @@ export class DataService {
 
       python.stdout.on('data', (data) => {
         stdoutData += data.toString();
-        // 打印 stdout（用于调试）
-        this.logger.debug(`[Python stdout]: ${data.toString().trim()}`);
       });
 
       python.stderr.on('data', (data) => {
         stderrData += data.toString();
-        // 打印 stderr（包括 [DEBUG] 日志）
-        this.logger.debug(`[Python stderr]: ${data.toString().trim()}`);
       });
 
       python.on('close', (code) => {
@@ -230,9 +223,6 @@ export class DataService {
         }
 
         if (code !== 0) {
-          this.logger.error(
-            `地理数据转换失败，退出码: ${code}, 错误: ${stderrData}`,
-          );
           reject(
             new Error(
               `地理数据转换失败: ${stderrData || '未知错误'}`,
@@ -242,7 +232,6 @@ export class DataService {
           try {
             const lines = stdoutData.trim().split('\n');
             const lastLine = lines[lines.length - 1];
-            this.logger.log(`Python 脚本完成，输出最后一行: ${lastLine}`);
             
             const result = JSON.parse(lastLine);
 
@@ -252,8 +241,6 @@ export class DataService {
               resolve(result);
             }
           } catch (error) {
-            this.logger.error(`解析转换结果时出错: ${error.message}`);
-            this.logger.error(`完整输出: ${stdoutData}`);
             reject(new Error(`解析转换结果失败: ${error.message}`));
           }
         }
@@ -264,10 +251,6 @@ export class DataService {
         
         if (!hasErrored) {
           hasErrored = true;
-          this.logger.error(`执行转换脚本时出错: ${error.message}`);
-          this.logger.error(`Python 可执行文件: ${this.pythonExe}`);
-          this.logger.error(`Python 文件是否存在: ${fs.existsSync(this.pythonExe)}`);
-          this.logger.error(`脚本是否存在: ${fs.existsSync(this.pythonConverterScript)}`);
           reject(
             new Error(
               `执行转换脚本时出错: ${error.message}。` +
@@ -299,7 +282,6 @@ export class DataService {
           ...result,
         });
       } catch (error) {
-        this.logger.error(`转换文件 ${filePath} 失败: ${error.message}`);
         results.push({
           filePath,
           success: false,

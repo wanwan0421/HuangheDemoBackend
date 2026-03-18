@@ -8,10 +8,9 @@ from langgraph.graph import StateGraph, START, END
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
 
-load_dotenv()
-AIHUBMIX_API_KEY = os.getenv("AIHUBMIX_API_KEY")
-AIHUBMIX_BASE_URL = "https://aihubmix.com/v1"
+from agents.execute.graph import execute_agent
 
+load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 alignment_model = ChatGoogleGenerativeAI(
@@ -22,14 +21,20 @@ alignment_model = ChatGoogleGenerativeAI(
     google_api_key=GOOGLE_API_KEY,
 )
 
-class AlignmentState(TypedDict):
+
+def _replace_state_value(current: Any, incoming: Any) -> Any:
+    return current if incoming is None else incoming
+
+class AlignmentState(TypedDict, total=False):
     messages: Annotated[List[AnyMessage], operator.add]
     Task_spec: Annotated[Dict[str, Any], operator.or_]
     Model_contract: Annotated[Dict[str, Any], operator.or_]
     Data_profile: Annotated[Dict[str, Any], operator.or_]
+    Data_profiles: Annotated[List[Dict[str, Any]], _replace_state_value]
     Alignment_result: Annotated[Dict[str, Any], operator.or_]
+    alignment_status: str
+    auto_transform: bool
     status: str
-
 
 def extract_text_content(content: Any) -> str:
     if isinstance(content, str):
@@ -198,7 +203,10 @@ def _apply_rule_validation(
             slot_item.setdefault("actions", []).append("请上传符合格式要求的数据，或进行格式转换")
             blocking_issues.append(f"{input_name}: {gap_text}")
 
-        if expected_crs:
+        # CRS 检查仅对非参数槽位进行，且跳过 N/A 类型。参数槽位无需空间参考系统检查。
+        data_type = _normalize_text(slot.get("Data_type"))
+        expected_crs_text = _normalize_text(expected_crs) if expected_crs else ""
+        if expected_crs and data_type != "parameter" and expected_crs_text not in ["n/a", "na", "不适用"]:
             norm_expected = _normalize_text(expected_crs)
             crs_match = any(norm_expected in token or token in norm_expected for token in crs_tokens if token)
             if not crs_match:
@@ -223,10 +231,157 @@ def _apply_rule_validation(
     return alignment_result
 
 
+def _alignment_status_from_score(overall_score: float) -> str:
+    if overall_score >= 0.9:
+        return "matched"
+    if overall_score >= 0.5:
+        return "partial"
+    return "mismatch"
+
+
+def _merge_data_profiles(data_profiles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not data_profiles:
+        return {}
+
+    if len(data_profiles) == 1:
+        return data_profiles[0].get("profile", {})
+
+    merged_profile: Dict[str, Any] = {
+        "data_sources": [],
+        "spatial_union": {},
+        "temporal_union": {},
+        "forms": [],
+    }
+
+    for data_profile in data_profiles:
+        profile = data_profile.get("profile", {})
+        merged_profile["data_sources"].append(
+            {
+                "file_id": data_profile.get("file_id"),
+                "file_path": data_profile.get("file_path"),
+                "form": profile.get("Form"),
+                "spatial": profile.get("Spatial"),
+                "temporal": profile.get("Temporal"),
+            }
+        )
+
+        form = profile.get("Form")
+        if form and form not in merged_profile["forms"]:
+            merged_profile["forms"].append(form)
+
+    return merged_profile
+
+
+def _build_decision_package(
+    alignment_result: Dict[str, Any],
+    model_contract: Optional[Dict[str, Any]],
+    status: str,
+) -> Dict[str, Any]:
+    blocking_issues = alignment_result.get("blocking_issues", []) or []
+    non_blocking_issues = alignment_result.get("non_blocking_issues", []) or []
+    per_slot = alignment_result.get("per_slot", []) or []
+    suggested_transformations = alignment_result.get("suggested_transformations", []) or []
+
+    warnings = list(non_blocking_issues)
+    minimal_runnable_inputs: List[str] = []
+    mapping_plan_draft: List[Dict[str, Any]] = []
+
+    for slot in per_slot:
+        input_name = slot.get("input_name", "unknown")
+        slot_status = slot.get("overall_status") or slot.get("spec_alignment", {}).get("status", "partial")
+
+        if slot_status in ["match", "partial"]:
+            minimal_runnable_inputs.append(input_name)
+
+        if slot_status == "partial":
+            warnings.append(f"{input_name}: 存在部分不匹配，建议先执行映射")
+
+        actions = slot.get("actions", []) or []
+        if actions:
+            mapping_plan_draft.append(
+                {
+                    "input_name": input_name,
+                    "priority": "high" if slot_status == "mismatch" else "medium",
+                    "actions": actions,
+                }
+            )
+
+    for transformation in suggested_transformations:
+        mapping_plan_draft.append(
+            {
+                "input_name": "global",
+                "priority": "medium",
+                "actions": [transformation],
+            }
+        )
+
+    required_slots = (model_contract or {}).get("Required_slots", []) or []
+    file_estimate = len(minimal_runnable_inputs)
+    required_count = len(required_slots)
+
+    if blocking_issues:
+        can_run_now = False
+        go_no_go = "no-go"
+        risk_level = "high"
+    elif status in ["matched", "partial"]:
+        can_run_now = True
+        go_no_go = "go"
+        risk_level = "medium" if warnings else "low"
+    else:
+        can_run_now = False
+        go_no_go = "no-go"
+        risk_level = "medium"
+
+    recommended_actions: List[str] = []
+    if blocking_issues:
+        recommended_actions.append("存在阻塞问题，请先执行数据映射或补齐缺失输入后再运行模型")
+    elif warnings:
+        recommended_actions.append("可先用最小可运行输入集试跑，再迭代修复告警项")
+    else:
+        recommended_actions.append("可直接进入模型执行阶段")
+
+    recommended_actions.append("修复后建议调用增量重扫接口，仅重扫变更文件并查看前后差异")
+
+    estimated_minutes = max(2, required_count * 2)
+    if required_count >= 8 or file_estimate >= 10:
+        estimated_minutes = max(estimated_minutes, 20)
+
+    return {
+        "can_run_now": can_run_now,
+        "go_no_go": go_no_go,
+        "risk_level": risk_level,
+        "warnings": warnings,
+        "recommended_actions": recommended_actions,
+        "minimal_runnable_inputs": list(dict.fromkeys(minimal_runnable_inputs)),
+        "mapping_plan_draft": mapping_plan_draft,
+        "execution_estimate": {
+            "estimated_minutes": estimated_minutes,
+            "required_slot_count": required_count,
+            "available_input_count": file_estimate,
+        },
+    }
+
+
+def _need_auto_transform(alignment_result: Dict[str, Any], alignment_status: str) -> bool:
+    if alignment_status in ["partial", "mismatch"]:
+        return True
+
+    per_slot = alignment_result.get("per_slot", []) or []
+    for slot in per_slot:
+        slot_status = _normalize_text(slot.get("overall_status") or slot.get("spec_alignment", {}).get("status"))
+        if slot_status in ["partial", "mismatch", "missing"]:
+            return True
+
+    return False
+
+
 def alignment_node(state: AlignmentState) -> Dict[str, Any]:
     task_spec = state.get("Task_spec", {}) or {}
     model_contract = state.get("Model_contract", {}) or {}
+    data_profiles = state.get("Data_profiles", []) or []
     data_profile = state.get("Data_profile", {}) or {}
+    if not data_profile and data_profiles:
+        data_profile = _merge_data_profiles(data_profiles)
 
     system_prompt = """你是Alignment Agent。你的任务是对齐三方信息：
 1) Task_spec（任务规范）
@@ -314,19 +469,98 @@ Data_profile:
 
     alignment_result = alignment.get("Alignment_result", alignment)
     alignment_result = _apply_rule_validation(alignment_result, model_contract, data_profile)
+    alignment_status = _alignment_status_from_score(float(alignment_result.get("overall_score", 0.0)))
 
     return {
         "messages": [response],
         "Alignment_result": alignment_result,
-        "status": "completed"
+        "alignment_status": alignment_status,
+        "status": "aligned",
+    }
+
+
+def decision_package_node(state: AlignmentState) -> Dict[str, Any]:
+    alignment_result = state.get("Alignment_result", {}) or {}
+    model_contract = state.get("Model_contract", {}) or {}
+    alignment_status = state.get("alignment_status") or _alignment_status_from_score(
+        float(alignment_result.get("overall_score", 0.0))
+    )
+
+    existing_actions = alignment_result.get("recommended_actions", []) or []
+    decision = _build_decision_package(alignment_result, model_contract, alignment_status)
+    decision_actions = decision.get("recommended_actions", []) or []
+    decision["recommended_actions"] = list(dict.fromkeys([*existing_actions, *decision_actions]))
+    alignment_result.update(decision)
+
+    return {
+        "Alignment_result": alignment_result,
+        "alignment_status": alignment_status,
+        "status": "decision_ready",
+    }
+
+
+async def auto_transform_node(state: AlignmentState) -> Dict[str, Any]:
+    # 自动转换阶段只在存在不匹配时触发，且执行逻辑委托给 execute 智能体。
+    alignment_result = state.get("Alignment_result", {}) or {}
+    alignment_status = state.get("alignment_status") or _alignment_status_from_score(
+        float(alignment_result.get("overall_score", 0.0))
+    )
+
+    auto_transform = bool(state.get("auto_transform", False))
+    if not auto_transform or not _need_auto_transform(alignment_result, alignment_status):
+        return {
+            "Alignment_result": alignment_result,
+            "alignment_status": alignment_status,
+            "status": "completed",
+        }
+
+    data_profiles = state.get("Data_profiles", []) or []
+    if not data_profiles:
+        recommended_actions = alignment_result.get("recommended_actions", []) or []
+        recommended_actions.append("缺少 Data_profiles（含 file_path/data_id），已跳过自动转换")
+        alignment_result["recommended_actions"] = list(dict.fromkeys(recommended_actions))
+        return {
+            "Alignment_result": alignment_result,
+            "alignment_status": alignment_status,
+            "status": "completed",
+        }
+
+    try:
+        execute_state = {
+            "messages": [],
+            "alignment_result": alignment_result,
+            "model_contract": state.get("Model_contract", {}) or {},
+            "data_profiles": data_profiles,
+            "status": "started",
+        }
+        execute_result = await execute_agent.ainvoke(execute_state)
+        alignment_result = execute_result.get("alignment_result", alignment_result) or alignment_result
+    except Exception as exc:
+        recommended_actions = alignment_result.get("recommended_actions", []) or []
+        alignment_result["recommended_actions"] = list(dict.fromkeys(recommended_actions))
+        alignment_result["auto_transform_summary"] = {
+            "attempted": 0,
+            "success": 0,
+            "failed": 0,
+            "error": str(exc),
+        }
+
+    return {
+        "Alignment_result": alignment_result,
+        "alignment_status": alignment_status,
+        "status": "completed",
     }
 
 
 def build_alignment_graph():
     graph_builder = StateGraph(AlignmentState)
     graph_builder.add_node("alignment_node", alignment_node)
+    graph_builder.add_node("decision_package_node", decision_package_node)
+    graph_builder.add_node("auto_transform_node", auto_transform_node)
     graph_builder.add_edge(START, "alignment_node")
-    graph_builder.add_edge("alignment_node", END)
+    graph_builder.add_edge("alignment_node", "decision_package_node")
+    graph_builder.add_edge("decision_package_node", "auto_transform_node")
+    graph_builder.add_edge("auto_transform_node", END)
     return graph_builder.compile()
 
 

@@ -1,18 +1,16 @@
-from fastapi import FastAPI, WebSocket, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from agents.model_recommend.graph import agent, ModelState
 from agents.alignment.graph import alignment_agent, AlignmentState
 from agents.data_scan.graph import DataScanState, data_scan_agent
 from agents.triangle_coordinator import get_coordinator
-from agents.data_monitor import get_data_scanner
-from langchain.messages import HumanMessage, AIMessageChunk, AnyMessage, ToolMessage
+from langchain.messages import HumanMessage, AIMessageChunk, AnyMessage
 from typing import Any, Dict, List, Optional
 import uuid
 import json
 import asyncio
 from pydantic import BaseModel, Field
-import operator
 from pathlib import Path
 import logging
 
@@ -380,7 +378,6 @@ def merge_state(old, update):
     for _, v in update.items():
         old.update(v)
     return old
-
 
 def merge_data_profiles_for_alignment(data_profiles: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not data_profiles:

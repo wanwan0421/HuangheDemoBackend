@@ -90,7 +90,6 @@ class TriangleMatchingCoordinator:
             session.task_spec = task_spec
         if model_contract:
             session.model_contract = model_contract
-
         if session.task_spec and session.model_contract:
             session.status = MatchingStatus.PENDING
         else:

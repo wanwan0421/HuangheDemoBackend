@@ -1,15 +1,17 @@
 import os
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Annotated
 from langchain.tools import tool
 from langchain_openai import OpenAIEmbeddings,ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chat_models import init_chat_model
 from langchain_core.embeddings import Embeddings
+from langchain.messages import HumanMessage
 from pymongo import MongoClient
 import math
 import requests
 from dotenv import load_dotenv
 from google import genai
+from langgraph.prebuilt import InjectedState
 
 # 自定义Embeddings
 class CustomHTTPEmbeddings(Embeddings):
@@ -71,6 +73,57 @@ DB_NAME = "huanghe-demo"
 
 # MongoDB连接池
 _db_client = None
+
+
+def _latest_user_query_from_state(state: Optional[Dict[str, Any]]) -> str:
+    if not state:
+        return ""
+
+    direct = str(state.get("latest_user_query") or "").strip()
+    if direct:
+        return direct
+
+    for msg in reversed(state.get("messages", []) or []):
+        if not isinstance(msg, HumanMessage):
+            continue
+        content = getattr(msg, "content", "")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if isinstance(content, list):
+            text = "".join(
+                p.get("text", "") if isinstance(p, dict) else p
+                for p in content
+                if isinstance(p, str) or (isinstance(p, dict) and p.get("type") == "text")
+            ).strip()
+            if text:
+                return text
+
+    return ""
+
+
+def _model_md5s_from_state(state: Optional[Dict[str, Any]]) -> List[str]:
+    tool_results = (state or {}).get("tool_results", {}) or {}
+    models = (tool_results.get("search_relevant_models", {}) or {}).get("models", []) or []
+    return [m.get("modelMd5") for m in models if isinstance(m, dict) and m.get("modelMd5")]
+
+
+def _selected_model_md5_from_state(state: Optional[Dict[str, Any]]) -> str:
+    if not state:
+        return ""
+
+    selected = str(state.get("selected_model_md5") or "").strip()
+    if selected:
+        return selected
+
+    tool_results = state.get("tool_results", {}) or {}
+    for key in ["search_most_model", "search_relevant_models"]:
+        models = (tool_results.get(key, {}) or {}).get("models", []) or []
+        if models and isinstance(models[0], dict):
+            md5 = models[0].get("modelMd5")
+            if md5:
+                return md5
+
+    return ""
 
 def get_db():
     """获取 MongoDB 数据库连接"""
@@ -159,68 +212,12 @@ def search_relevant_indices(user_query_text: str, top_k: int = 5) -> Dict[str, A
             "message": f"搜索指标失败: {str(e)}"
         }
 
-# @tool
-# def search_relevant_models(user_query_text: str, model_ids: List[str], top_k: int = 10) -> Dict[str, Any]:
-#     """
-#     在给定的候选模型范围内，根据用户需求进行语义筛选。
-#     当指标关联的模型太多时，使用此工具找出最符合用户具体意图的模型。
-#     Args:
-#         user_query_text: 用户查询文本
-#         model_ids: 候选模型MD5值列表
-#         top_k: 返回的最相关模型数（默认 10）
-#     Returns:
-#         包含相关模型列表的字典
-#     """
-#     try:
-#         if not model_ids:
-#             return {
-#                 "status": "error",
-#                 "message": "模型 ID 列表为空"
-#             }
-        
-#         # query_vector = embedding_model.embed_query(user_query_text)
-#         query_vector = client.models.embed_content(
-#             model="gemini-embedding-001",
-#             contents=user_query_text
-#         ).embeddings[0].values
-
-#         db = get_db()
-#         model_embeddings_collection = db["modelembeddings"]
-
-#         # 查询指定MD5的所有模型
-#         all_models = list(
-#             model_embeddings_collection.find({"modelMd5": {"$in": model_ids}})
-#         )
-
-#         flattened_models = []
-        
-#         for model in all_models:
-#             if model.get("embedding") and len(model.get("embedding", [])) > 0:
-#                 score = cosine_similarity(query_vector, model["embedding"])
-#                 flattened_models.append({
-#                     "modelMd5": model.get("modelMd5"),
-#                     "modelName": model.get("modelName"),
-#                     "modelDescription": model.get("modelDescription", ""),
-#                     "score": score
-#                 })
-
-#         # 按相似度排序并取前top_k
-#         flattened_models.sort(key=lambda x: x["score"], reverse=True)
-#         result = flattened_models[:top_k]
-        
-#         return {
-#             "status": "success",
-#             "count": len(result),
-#             "models": result
-#         }
-#     except Exception as e:
-#         return {
-#             "status": "error",
-#             "message": f"搜索模型失败: {str(e)}"
-#         }
-
 @tool
-def search_relevant_models(user_query_text: str, top_k: int = 10) -> Dict[str, Any]:
+def search_relevant_models(
+    user_query_text: Optional[str] = None,
+    top_k: int = 10,
+    state: Annotated[Dict[str, Any], InjectedState] = None,
+) -> Dict[str, Any]:
     """
     根据用户查询文本，从所有模型中找出最相关的10个模型。
     计算余弦相似度，返回最相关的模型MD5和相似度分数。
@@ -230,7 +227,16 @@ def search_relevant_models(user_query_text: str, top_k: int = 10) -> Dict[str, A
     Returns:
         包含相关模型MD5和相似度分数的字典
     """
-    try:        
+    try:
+        if not user_query_text or not str(user_query_text).strip():
+            user_query_text = _latest_user_query_from_state(state)
+
+        if not user_query_text:
+            return {
+                "status": "error",
+                "message": "缺少 user_query_text，且无法从状态注入中推断。"
+            }
+
         # 生成用户查询向量
         query_vector = client.models.embed_content(
             model="gemini-embedding-001",
@@ -270,7 +276,10 @@ def search_relevant_models(user_query_text: str, top_k: int = 10) -> Dict[str, A
         }
 
 @tool
-def search_most_model(model_md5s: List[str]) -> Dict[str, Any]:
+def search_most_model(
+    model_md5s: Optional[List[str]] = None,
+    state: Annotated[Dict[str, Any], InjectedState] = None,
+) -> Dict[str, Any]:
     """
     根据给定的模型MD5列表，从数据库获取这些模型的详细信息。
     供LLM使用，让LLM基于详细信息来选择最相关的模型。
@@ -281,9 +290,12 @@ def search_most_model(model_md5s: List[str]) -> Dict[str, Any]:
     """
     try:
         if not model_md5s:
+            model_md5s = _model_md5s_from_state(state)
+
+        if not model_md5s:
             return {
                 "status": "error",
-                "message": "模型 MD5 列表为空"
+                "message": "模型 MD5 列表为空，且无法从状态注入中推断。"
             }
 
         db = get_db()
@@ -315,7 +327,10 @@ def search_most_model(model_md5s: List[str]) -> Dict[str, Any]:
         }
 
 @tool
-def get_model_details(model_md5: str) -> Dict[str, Any]:
+def get_model_details(
+    model_md5: Optional[str] = None,
+    state: Annotated[Dict[str, Any], InjectedState] = None,
+) -> Dict[str, Any]:
     """
     根据模型MD5值获取模型的详细信息和工作流
     Args:
@@ -324,6 +339,15 @@ def get_model_details(model_md5: str) -> Dict[str, Any]:
         模型详细信息和工作流
     """
     try:
+        if not model_md5:
+            model_md5 = _selected_model_md5_from_state(state)
+
+        if not model_md5:
+            return {
+                "status": "error",
+                "message": "缺少 model_md5，且无法从状态注入中推断。"
+            }
+
         db = get_db()
         model_collection = db["modelResource"]
 

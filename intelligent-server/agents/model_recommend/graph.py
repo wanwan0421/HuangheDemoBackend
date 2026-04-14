@@ -1,12 +1,14 @@
 from . import tools
-from typing import TypedDict, List, Dict, Any, Literal, Annotated
+from typing import TypedDict, Dict, Any, Annotated, Optional, get_type_hints, get_origin, get_args
 from langchain.messages import ToolMessage, HumanMessage, SystemMessage, AnyMessage
 from langgraph.graph import StateGraph, START, END
 import operator
 import json
+import inspect
 from pymongo import MongoClient
 from langgraph.checkpoint.mongodb import MongoDBSaver
-import re
+from pydantic import BaseModel, Field
+from langgraph.prebuilt import InjectedState
 
 # 连接配置
 MONGO_URI = "mongodb://localhost:27017/"
@@ -21,11 +23,54 @@ class ModelState(TypedDict):
     Model_contract: Annotated[Dict[str, Any], operator.or_]
     # 模型推荐详情
     recommended_model: Annotated[Dict[str, Any], operator.or_]
+    # 最近用户查询文本
+    latest_user_query: str
+    # 各工具最近一次结果
+    tool_results: Annotated[Dict[str, Any], operator.or_]
+    # 候选最优模型md5
+    selected_model_md5: str
+
+# 任务规范结构
+class TaskSpec(BaseModel):
+    Domain: str = Field(default="",description="地理建模领域，如水文、气象、土地利用等")
+    Target_object: str = Field(default="",description="具体研究对象，如径流量、土壤侵蚀度、降水、河流、植被等")
+    Spatial_scope: str = Field(default="",description="空间范围，如某流域、某省份、上游、具体经纬度等")
+    Temporal_scope: str = Field(default="",description="时间范围，如某年、某月、某日、某时间段等")
+    Resolution_requirements: str = Field(default="",description="分辨率要求，如空间分辨率、时间分辨率等")
+
+# 任务规范封装，用于绑定LLM输出结构
+class TaskSpecEnvelope(BaseModel):
+    Task_spec: TaskSpec = Field(default_factory=TaskSpec)
+
+# 模型契约中的空间要求细化
+class SpatialRequirement(BaseModel):
+    Region: str = Field(default="",description="地理区域")
+    Crs: str = Field(default="",description="坐标参考系统")
+
+# 模型契约中每个输入槽位的定义
+class RequiredSlot(BaseModel):
+    Input_name: str = Field(default="",description="输入参数名称")
+    Data_type: str = Field(default="",description="数据类型，如Raster, Vector, Table, Timeseries, Parameter")
+    Semantic_requirement: str = Field(default="",description="语义要求，如降水、温度、土地利用等")
+    Spatial_requirement: SpatialRequirement = Field(default_factory=SpatialRequirement)
+    Temporal_requirement: str = Field(default="",description="时间要求，如某年、某月、某日等")
+    Format_requirement: str = Field(default="",description="格式要求，如如TIFF、TIFF、Shapefile、NC、CSV等")
+
+# 模型契约封装，用于绑定LLM输出结构
+class ModelContractEnvelope(BaseModel):
+    Required_slots: list[RequiredSlot] = Field(default_factory=list)
+
+# 工具调用参数构建器，负责根据当前状态补全工具参数
+def to_dict(model_obj: Any) -> Dict[str, Any]:
+    if hasattr(model_obj, "model_dump"):
+        return model_obj.model_dump()
+    if hasattr(model_obj, "dict"):
+        return model_obj.dict()
+    if isinstance(model_obj, dict):
+        return model_obj
+    return {}
 
 def extract_text_content(content: Any) -> str:
-    """
-    兼容处理字符串格式和列表格式的 AIMessage content
-    """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -38,50 +83,61 @@ def extract_text_content(content: Any) -> str:
         return "".join(text_parts)
     return ""
 
-def extract_json_from_text(text: str) -> dict:
-    """
-    从文本中提取 JSON 对象，支持多种格式：
-    1. ```json {...} ``` 代码块
-    2. 直接的 {...} JSON 对象
-    3. 文本中嵌入的 JSON（前后有其他文字）
-    
-    返回提取的 JSON 对象，如果失败返回 None
-    """
-    # 方法1：尝试提取 markdown 代码块
-    json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
-    if json_match:
-        try:
-            return json.loads(json_match.group(1))
-        except json.JSONDecodeError:
-            pass
-    
-    # 方法2：尝试从 { 到 } 的最外层 JSON 对象
-    # 找到第一个 { 和最后一个 }
-    first_brace = text.find('{')
-    last_brace = text.rfind('}')
-    
-    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-        json_candidate = text[first_brace:last_brace+1]
-        try:
-            return json.loads(json_candidate)
-        except json.JSONDecodeError:
-            # 方法3：尝试嵌套匹配，从 { 开始逐层匹配到对应的 }
-            for i in range(first_brace, len(text)):
-                if text[i] == '{':
-                    # 尝试匹配这个开始位置
-                    brace_count = 0
-                    for j in range(i, len(text)):
-                        if text[j] == '{':
-                            brace_count += 1
-                        elif text[j] == '}':
-                            brace_count -= 1
-                            if brace_count == 0:
-                                try:
-                                    return json.loads(text[i:j+1])
-                                except json.JSONDecodeError:
-                                    break
-    
-    return None
+def get_latest_user_query(messages: list[AnyMessage]) -> str:
+    for msg in reversed(messages or []):
+        if isinstance(msg, HumanMessage):
+            text = extract_text_content(getattr(msg, "content", ""))
+            if text.strip():
+                return text.strip()
+    return ""
+
+
+def get_model_md5_list_from_result(result: Dict[str, Any]) -> list[str]:
+    models = (result or {}).get("models", []) or []
+    return [m.get("modelMd5") for m in models if isinstance(m, dict) and m.get("modelMd5")]
+
+
+def is_injected_state_annotation(annotation: Any) -> bool:
+    if annotation is InjectedState:
+        return True
+    origin = get_origin(annotation)
+    if origin is Annotated:
+        metas = get_args(annotation)[1:]
+        for meta in metas:
+            if meta is InjectedState or meta.__class__.__name__ == "InjectedState":
+                return True
+    return False
+
+
+def inject_state_for_tool(tool_obj: Any, raw_args: Dict[str, Any], state: ModelState) -> Dict[str, Any]:
+    args = dict(raw_args or {})
+
+    callable_fn = getattr(tool_obj, "func", None)
+    if callable_fn is None:
+        return args
+
+    try:
+        hints = get_type_hints(callable_fn, include_extras=True)
+    except Exception:
+        hints = getattr(callable_fn, "__annotations__", {}) or {}
+
+    signature = inspect.signature(callable_fn)
+    for param_name in signature.parameters:
+        annotation = hints.get(param_name)
+        if annotation is not None and is_injected_state_annotation(annotation):
+            args[param_name] = state
+
+    return args
+
+
+def render_recent_context(messages: list[AnyMessage], limit: int = 6) -> str:
+    rows = []
+    for msg in messages[-limit:]:
+        role = type(msg).__name__
+        text = extract_text_content(getattr(msg, "content", "")).strip()
+        if text:
+            rows.append(f"[{role}] {text[:300]}")
+    return "\n".join(rows)
 
 def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
     """
@@ -96,78 +152,57 @@ def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
         if key not in current_task_spec:
             current_task_spec[key] = ""
 
-    system = SystemMessage(content=(
-        f"""你是任务需求解析器。请从用户最新的输入中提取或更新地理建模任务规范。
+    system = SystemMessage(content=f"""
+        # Role
+        你是一位资深的地理建模专家，擅长理解用户的时空需求并提炼成规范化的任务描述。
+        
+        # Task
+        请从用户的最新查询中提取或更新以下任务规范的字段：
+        - **Domain**: 任务所属领域，如水文、气象、土地利用等
+        - **Target_object**: 具体研究对象，如径流量、土壤侵蚀度、降水、河流、植被等
+        - **Spatial_scope**: 空间范围，如某流域、某省份、上游、具体经纬度等
+        - **Temporal_scope**: 时间范围，如某年、某月、某日、某时间段等
+        - **Resolution_requirements**: 分辨率要求，如空间分辨率、时间分辨率等
+                           
+        # Constraints
+        - 仅从最新用户查询中提取信息，避免重复或过时的内容。
+        - 如果某个字段在当前规范中已有值，只有当用户明确提出修改时才更新。
+        - 输出必须严格符合 `TaskSpecEnvelope` 定义的 JSON 结构，确保字段不缺失。
+    """)
 
-            **关键元数据解释**
-            Task_spec: 任务规范，包含以下字段：
-                -Domain: 任务领域（如气象、水文、土地利用等）
-                -Target_object: 具体研究对象（如径流量、土壤侵蚀度、降水、河流、植被等）
-                -Spatial_scope: 空间范围（如某流域、某省份、上游、具体经纬度等）
-                -Temporal_scope: 时间范围（如某年、某月、某日、某时间段等）
-                -Resolution_requirements: 分辨率要求（如空间分辨率、时间分辨率等）
-
-            **已有任务信息** (如果用户未提及修改，请保持原样):
-            {current_task_spec}
-
-            **输出要求：必须输出以下 JSON 格式（即使某些字段为空也必须包含）**：
-            ```json
-            {{
-            "Task_spec": {{
-                "Domain": "...",
-                "Target_object": "...",
-                "Spatial_scope": "...",
-                "Temporal_scope": "...",
-                "Resolution_requirements": "..."
-                }}
-            }}
-            ```
-            
-            **提取规则**：
-            1. 仅提取用户显式提及的变更或新增信息。
-            2. 如果用户只是在指令切换模型或者其他询问而没有修改任务属性（如时间、地点），则输出空JSON或保持原值。
-            3. 输出JSON格式，不要输出其他文字。
-            4. 如果某个字段无法从用户输入中确定，使用空字符串 ""。
-            """
+    context = HumanMessage(content=(
+        f"已有任务规范: {json.dumps(current_task_spec, ensure_ascii=False)}\n"
+        "请基于对话更新 Task_spec。"
     ))
 
-    messages = [system] + state["messages"]
+    messages = [system, context] + state["messages"]
+    latest_user_query = state.get("latest_user_query") or get_latest_user_query(state.get("messages", []))
 
     try:
-        response = tools.recommendation_model.invoke(messages)
-        raw_text = extract_text_content(response.content).strip()
-        task_spec = {}
-
-        # 使用增强的 JSON 提取函数
-        extracted_json = extract_json_from_text(raw_text)
-        
-        if extracted_json:
-            task_spec = extracted_json.get("Task_spec", {})
-            print(f"[parse_task_spec_node] ✅ JSON extracted successfully: {list(task_spec.keys())}")
-        else:
-            # 这种情况通常是 LLM 回复了 "好的，正在为您查找..." 这种废话
-            # 我们选择忽略这次解析，直接返回旧状态
-            print(f"[parse_task_spec_node] ❌ No JSON found, keeping previous state. Raw: {raw_text[:100]}...")
-            return {
-                "messages": [response], # 这里返回 response 是为了让 graph 记录 trace，但在 main.py 会被过滤
-                "Task_spec": current_task_spec
-            }
+        # 绑定结构化输出
+        structured_llm = tools.recommendation_model.with_structured_output(TaskSpecEnvelope)
+        # 直接获取Pydantic模型实例，避免手动解析
+        parsed = structured_llm.invoke(messages)
+        task_spec = to_dict(parsed).get("Task_spec", {}) or {}
 
         final_spec = current_task_spec.copy()
         for k, v in task_spec.items():
             if v and str(v).strip(): 
                 final_spec[k] = v
 
+        print(f"[parse_task_spec_node] ✅ Parsed Task_spec: {final_spec}")
         return {
-            "messages": [response],
-            "Task_spec": final_spec
+            "messages": [],
+            "Task_spec": final_spec,
+            "latest_user_query": latest_user_query
         }
 
     except Exception as e:
         print(f"[parse_task_spec_node] ❌ Unexpected error: {type(e).__name__}: {e}")
         return {
             "messages": [],
-            "Task_spec": current_task_spec
+            "Task_spec": current_task_spec,
+            "latest_user_query": latest_user_query
         }
 
 def recommend_model_node(state: ModelState) -> Dict[str, Any]:
@@ -177,22 +212,37 @@ def recommend_model_node(state: ModelState) -> Dict[str, Any]:
     如果需要调用工具，则返回工具调用指令
     """
     # 加入SystemMessage以约束模型行为（同时生成 Task Spec 与模型推荐）
-    system = SystemMessage(content=(
-        """你是用户任务需求解析+模型推荐一体化智能体.请根据用户需求，完成以下任务要求。
+    system = SystemMessage(content=f"""
+        # Role
+        你是一位资深的地理建模专家，擅长根据复杂的时空需求匹配最合适的数值模型或机器学习模型。
 
-        **工作流程**:
-        1.模型初选：更加用户查询文本，调用`search_relevant_models`方法检索相关模型列表。
-        2.模型评估：根据初选模型的`modelMd5`，调用`search_most_model`方法获取模型详细信息，选择最优模型。
-        3.详情确认：调用`get_model_details`获取最优模型的工作流。
+        # Context
+        - **任务规范**: {state['Task_spec']}
+        - **最近对话状态**: {render_recent_context(state['messages'])}
 
-        **输出与结束规则**
-        1.仅当你不再需要调用任何工具时，才进行最终的模型推荐总结。
-        2.最终推荐的模型必须基于用户需求与模型详情进行综合评估。
-        """
-    ))
+        # Reasoning Process (Chain of Thought)
+        在做出决定前，请按以下步骤思考：
+        1. **领域校验**: 分析任务所属领域（如水文、气象），判断是否需要调用 `search_relevant_indices`。
+        2. **初步筛选**: 使用 `search_relevant_models` 获取 MD5 候选池。
+        3. **深度比对**: 根据初选模型的`modelMd5`，调用`search_most_model`方法获取模型详细信息，选择最优模型。
+        4. **详情确认**: 调用 `get_model_details` 获取候选模型的详细工作流和输入要求，确认其是否满足任务规范。
+        5. **决策确认**: 如果模型满足任务需求，则停止调用工具并输出推荐结果。
+
+        # Constraints
+        - **Markdown 输出**: 你的非工具回复必须使用规范的 Markdown 格式。
+        - **参数完整性**: 调用工具时，若状态中已有 `selected_model_md5`，请优先使用。
+        - **禁止幻觉**: 严禁推荐数据库中不存在的 MD5。
+
+        # Output Guide
+        - 如果信息不足：请向用户提问或继续调用工具。
+        - 如果找到匹配：请清晰说明推荐理由、模型的优势及局限性。
+        """)
     messages = [system] + state["messages"]
 
     response = tools.model_with_tools.invoke(messages)
+
+    if hasattr(response, "tool_calls") and response.tool_calls:
+        response.tool_calls = [response.tool_calls[0]]
 
     return {"messages": [response]}
 
@@ -202,11 +252,9 @@ def model_contract_node(state: ModelState) -> Dict[str, Any]:
     """
     print("\n[model_contract_node] START")
     
-    # 寻找最近使用的模型详情数据
-    target_model_data = None
+    # 优先使用state里已缓存的推荐模型
+    target_model_data = state.get("recommended_model") or None
     messages = state.get("messages", [])
-    
-    print(f"[model_contract_node] Total messages: {len(messages)}")
     
     # 显示所有消息类型，便于诊断
     for i, msg in enumerate(reversed(messages)):
@@ -214,6 +262,9 @@ def model_contract_node(state: ModelState) -> Dict[str, Any]:
         tool_id = getattr(msg, "tool_name", None) or getattr(msg, "name", None)
         print(f"[model_contract_node] Message {i}: {msg_type}, tool_id={tool_id}")
         
+        if target_model_data:
+            break
+
         if isinstance(msg, ToolMessage) and tool_id == "get_model_details":
             print(f"[model_contract_node] Found get_model_details at index {i}")
             try:
@@ -245,62 +296,42 @@ def model_contract_node(state: ModelState) -> Dict[str, Any]:
             for input in event.get("inputs", []):
                 workflow_inputs.append(input)
     
-    prompt_content = f"""你是一个地理建模专家。请为以下模型参数生成数据准入契约。
+    prompt_content = f"""
+    # Role
+    你是一个地理建模数据契约审计员，负责定义模型运行的“数据准入标准”。
 
-    **用户任务需求**
-    {json.dumps(task_spec, ensure_ascii=False)}
+    # Task
+    将用户的“业务语言”转化为“机器语言”。
 
-    **模型输入定义**
-    {json.dumps(workflow_inputs, ensure_ascii=False)}
+    # Input Reference
+    - 业务需求: {task_spec}
+    - 模型原始输入流: {workflow_inputs}
 
-    **关键元数据解释**
-    1.Required_slots: 模型数据准入契约列表，包括以下字段：
-        -Input_name: 输入参数名称
-        -Semantic_requirement: 语义要求（如降水、温度、土地利用等）
-        -Data_type: 数据类型（Raster, Vector, Table, Timeseries, Parameter）
-        -Spatial_requirement: 空间要求（如某区域、某流域等，包含Region和Crs）
-        -Temporal_requirement: 时间要求（如某年、某月、某日等）
-        -Format_requirement: 格式要求（如TIFF、TIFF、Shapefile、NC、CSV等）
+    # Mapping Logic
+    请为每一个输入槽位生成以下信息：
+    1. **Semantic_requirement**: 不要只写名称，要描述该数据的地理学意义（如：年均径流量）。
+    2. **Spatial_requirement**: 
+        - 若用户未指定 CRS，默认推断为 `EPSG:4326` 或模型原定坐标系。
+        - 明确 Region 是点、线还是面范围。
+    3. **Temporal_requirement**: 明确数据的时间步长（如：日尺度、月尺度）。
 
-    **输出要求**
-    请基于上述定义，将原始参数转化为具体的 "Required_slots"。
-    必须返回标准的JSON格式，包含：Required_slots 列表。
-
-    示例格式：
-    {{
-    "Required_slots": [
-        {{
-        "Input_name": "...",
-        "Data_type": "...",
-        "Semantic_requirement": "...",
-        "Spatial_requirement": {{"Region": "...", "Crs": "..."}},
-        "Temporal_requirement": "...",
-        "Format_requirement": "..."
-        }}
-    ]
-    }}
+    # Constraint
+    输出必须严格符合 `ModelContractEnvelope` 定义的 JSON 结构，确保字段不缺失。
     """
 
     # 仅发送当前任务相关的 Prompt，不带state["messages"]里的历史聊天
     response = None
     try:
-        response = tools.recommendation_model.invoke([HumanMessage(content=prompt_content)])
-        raw_content = extract_text_content(response.content).strip()
-        
-        # 使用增强的 JSON 提取函数
-        contract = extract_json_from_text(raw_content) or {}
-        
-        if contract:
-            print(f"[model_contract_node] ✅ Contract JSON extracted: {list(contract.keys())}")
-        else:
-            print(f"[model_contract_node] ⚠️  No JSON found in response, using empty contract")
+        structured_llm = tools.recommendation_model.with_structured_output(ModelContractEnvelope)
+        response = structured_llm.invoke([HumanMessage(content=prompt_content)])
+        contract = to_dict(response)
             
     except Exception as e:
         print(f"[model_contract_node] ❌ LLM Generation/Parsing failed: {e}")
         contract = {}
 
     return {
-        "messages": [response] if response else [], 
+        "messages": [], 
         "recommended_model": target_model_data,
         "Model_contract": contract
     }
@@ -319,10 +350,22 @@ def tool_node(state: ModelState) -> Dict[str, Any]:
     tool_calls = getattr(last_message, "tool_calls", []) or []
 
     tool_messages = []
+    tool_results = state.get("tool_results", {}) or {}
+    selected_model_md5 = state.get("selected_model_md5", "")
 
     for tool_call in tool_calls:
         tool = tools.TOOLS_BY_NAME[tool_call["name"]]
-        observation = tool.invoke(tool_call["args"])
+        args_with_injected_state = inject_state_for_tool(tool, tool_call.get("args", {}), state)
+        observation = tool.invoke(args_with_injected_state)
+        tool_results[tool_call["name"]] = observation
+
+        if isinstance(observation, dict):
+            if observation.get("md5"):
+                selected_model_md5 = observation.get("md5")
+            else:
+                models = observation.get("models", []) or []
+                if models and isinstance(models[0], dict) and models[0].get("modelMd5"):
+                    selected_model_md5 = models[0]["modelMd5"]
 
         # Graph 内部只保留 ToolMessage
         tool_messages.append(ToolMessage(
@@ -333,7 +376,10 @@ def tool_node(state: ModelState) -> Dict[str, Any]:
 
     return {
         "messages": tool_messages,
-        "Task_spec": state.get("Task_spec", {})
+        "Task_spec": state.get("Task_spec", {}),
+        "latest_user_query": state.get("latest_user_query", ""),
+        "tool_results": tool_results,
+        "selected_model_md5": selected_model_md5,
     }
 
 def should_continue(state: ModelState) -> Any:

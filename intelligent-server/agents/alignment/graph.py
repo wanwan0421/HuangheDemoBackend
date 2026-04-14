@@ -10,6 +10,14 @@ from dotenv import load_dotenv
 
 from agents.execute.graph import execute_agent
 
+"""Alignment 图：负责对齐任务规范、模型契约与数据画像，并给出可执行决策包。
+
+整体流程：
+1) alignment_node：调用 LLM 生成初始对齐结果
+2) decision_package_node：补充可运行性判断和行动建议
+3) auto_transform_node：按需触发自动转换执行器
+"""
+
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
@@ -21,22 +29,28 @@ alignment_model = ChatGoogleGenerativeAI(
     google_api_key=GOOGLE_API_KEY,
 )
 
-
 def _replace_state_value(current: Any, incoming: Any) -> Any:
+    # LangGraph reducer：当新值为 None 时保留旧值，否则直接替换。
+    # 这里用于 Data_profiles，避免列表执行错误的“合并”语义。
     return current if incoming is None else incoming
 
 class AlignmentState(TypedDict, total=False):
+    # messages 采用追加语义，保留链路上的消息轨迹。
     messages: Annotated[List[AnyMessage], operator.add]
+    # 任务规范、模型契约与数据画像采用并集更新语义。
     Task_spec: Annotated[Dict[str, Any], operator.or_]
     Model_contract: Annotated[Dict[str, Any], operator.or_]
     Data_profile: Annotated[Dict[str, Any], operator.or_]
+    # 多文件场景下由外部传入完整列表，使用替换reducer。
     Data_profiles: Annotated[List[Dict[str, Any]], _replace_state_value]
+    # 对齐结果和状态，后续节点基于此进行决策和执行。
     Alignment_result: Annotated[Dict[str, Any], operator.or_]
     alignment_status: str
     auto_transform: bool
     status: str
 
 def extract_text_content(content: Any) -> str:
+    """兼容不同模型返回格式，提取可解析的纯文本。"""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -49,8 +63,14 @@ def extract_text_content(content: Any) -> str:
         return "".join(parts)
     return ""
 
-
 def parse_json_from_text(raw_text: str) -> Dict[str, Any]:
+    """从 LLM 输出中提取 JSON。
+
+    支持三种常见格式：
+    - ```json ... ``` 代码块
+    - 纯对象文本
+    - 文本中夹带的对象片段
+    """
     raw_text = raw_text.strip()
     if not raw_text:
         return {}
@@ -68,12 +88,12 @@ def parse_json_from_text(raw_text: str) -> Dict[str, Any]:
 
     return {}
 
-
 def _normalize_text(value: Any) -> str:
+    """统一做字符串化、去空白、小写，便于规则比较。"""
     return str(value or "").strip().lower()
 
-
 def _normalize_form(value: Any) -> str:
+    """将不同来源的数据形态别名归一到统一类别。"""
     raw = _normalize_text(value)
     if raw in ["raster", "grid"]:
         return "raster"
@@ -87,8 +107,8 @@ def _normalize_form(value: Any) -> str:
         return "parameter"
     return raw
 
-
 def _expected_forms_from_requirement(slot: Dict[str, Any]) -> Set[str]:
+    """根据模型输入数据槽位描述推断可接受的数据形态集合。"""
     combined = " ".join([
         _normalize_text(slot.get("Data_type")),
         _normalize_text(slot.get("Format_requirement")),
@@ -108,8 +128,8 @@ def _expected_forms_from_requirement(slot: Dict[str, Any]) -> Set[str]:
 
     return expected
 
-
 def _extract_expected_crs(slot: Dict[str, Any]) -> Optional[str]:
+    """从模型输入数据契约中Spatial_requirement中提取CRS。"""
     spatial_req = slot.get("Spatial_requirement") or {}
     if isinstance(spatial_req, dict):
         crs = spatial_req.get("Crs") or spatial_req.get("CRS") or spatial_req.get("crs")
@@ -119,6 +139,7 @@ def _extract_expected_crs(slot: Dict[str, Any]) -> Optional[str]:
 
 
 def _extract_data_sources(data_profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """统一取数源列表；单文件画像会被包装为一个虚拟 data_source。"""
     data_sources = data_profile.get("data_sources")
     if isinstance(data_sources, list) and data_sources:
         return data_sources
@@ -131,6 +152,7 @@ def _extract_data_sources(data_profile: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _source_form_set(data_profile: Dict[str, Any]) -> Set[str]:
+    """收集当前输入中实际可用的数据形态集合。"""
     forms: Set[str] = set()
     for source in _extract_data_sources(data_profile):
         form = _normalize_form(source.get("form"))
@@ -140,6 +162,7 @@ def _source_form_set(data_profile: Dict[str, Any]) -> Set[str]:
 
 
 def _source_crs_tokens(data_profile: Dict[str, Any]) -> Set[str]:
+    """将数据源 CRS 信息拆分为可比对 token（EPSG/Name/WKT 等）。"""
     tokens: Set[str] = set()
     for source in _extract_data_sources(data_profile):
         spatial = source.get("spatial") or {}
@@ -156,6 +179,7 @@ def _source_crs_tokens(data_profile: Dict[str, Any]) -> Set[str]:
 
 
 def _ensure_slot_item(alignment_result: Dict[str, Any], input_name: str) -> Dict[str, Any]:
+    """确保 per_slot 中存在指定槽位，若不存在则创建默认结构。"""
     per_slot = alignment_result.setdefault("per_slot", [])
     for item in per_slot:
         if _normalize_text(item.get("input_name")) == _normalize_text(input_name):
@@ -177,6 +201,12 @@ def _apply_rule_validation(
     model_contract: Dict[str, Any],
     data_profile: Dict[str, Any],
 ) -> Dict[str, Any]:
+    """在 LLM 结果上叠加确定性规则校验，降低幻觉风险。
+
+    规则目前覆盖：
+    - 格式/形态强校验（可阻塞）
+    - CRS 软校验（默认非阻塞，参数类型跳过）
+    """
     required_slots = model_contract.get("Required_slots", []) or []
     if not required_slots:
         return alignment_result
@@ -232,6 +262,7 @@ def _apply_rule_validation(
 
 
 def _alignment_status_from_score(overall_score: float) -> str:
+    """把 overall_score 映射为离散状态。"""
     if overall_score >= 0.9:
         return "matched"
     if overall_score >= 0.5:
@@ -240,6 +271,7 @@ def _alignment_status_from_score(overall_score: float) -> str:
 
 
 def _merge_data_profiles(data_profiles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """将多文件 Data_profiles 合并为统一视图，便于一次性对齐。"""
     if not data_profiles:
         return {}
 
@@ -277,6 +309,7 @@ def _build_decision_package(
     model_contract: Optional[Dict[str, Any]],
     status: str,
 ) -> Dict[str, Any]:
+    """基于对齐结果生成执行决策包（go/no-go、风险、最小输入集等）。"""
     blocking_issues = alignment_result.get("blocking_issues", []) or []
     non_blocking_issues = alignment_result.get("non_blocking_issues", []) or []
     per_slot = alignment_result.get("per_slot", []) or []
@@ -363,6 +396,7 @@ def _build_decision_package(
 
 
 def _need_auto_transform(alignment_result: Dict[str, Any], alignment_status: str) -> bool:
+    """判断是否需要进入自动转换阶段。"""
     if alignment_status in ["partial", "mismatch"]:
         return True
 
@@ -376,6 +410,7 @@ def _need_auto_transform(alignment_result: Dict[str, Any], alignment_status: str
 
 
 def alignment_node(state: AlignmentState) -> Dict[str, Any]:
+    """第一阶段：调用 LLM 生成 Alignment_result，并做解析兜底。"""
     task_spec = state.get("Task_spec", {}) or {}
     model_contract = state.get("Model_contract", {}) or {}
     data_profiles = state.get("Data_profiles", []) or []
@@ -468,6 +503,7 @@ Data_profile:
         }
 
     alignment_result = alignment.get("Alignment_result", alignment)
+    # LLM 结论后置规则校验：保证关键格式/CRS风险被稳定识别。
     alignment_result = _apply_rule_validation(alignment_result, model_contract, data_profile)
     alignment_status = _alignment_status_from_score(float(alignment_result.get("overall_score", 0.0)))
 
@@ -480,6 +516,7 @@ Data_profile:
 
 
 def decision_package_node(state: AlignmentState) -> Dict[str, Any]:
+    """第二阶段：补充决策信息，并与既有 recommended_actions 去重合并。"""
     alignment_result = state.get("Alignment_result", {}) or {}
     model_contract = state.get("Model_contract", {}) or {}
     alignment_status = state.get("alignment_status") or _alignment_status_from_score(
@@ -500,6 +537,7 @@ def decision_package_node(state: AlignmentState) -> Dict[str, Any]:
 
 
 async def auto_transform_node(state: AlignmentState) -> Dict[str, Any]:
+    """第三阶段：按需触发 execute_agent 做自动转换，并回填结果摘要。"""
     # 自动转换阶段只在存在不匹配时触发，且执行逻辑委托给 execute 智能体。
     alignment_result = state.get("Alignment_result", {}) or {}
     alignment_status = state.get("alignment_status") or _alignment_status_from_score(
@@ -548,11 +586,12 @@ async def auto_transform_node(state: AlignmentState) -> Dict[str, Any]:
     return {
         "Alignment_result": alignment_result,
         "alignment_status": alignment_status,
-        "status": "completed",
+        "status": "completed", 
     }
 
 
 def build_alignment_graph():
+    """组装 LangGraph 拓扑：START -> 对齐 -> 决策 -> 自动转换 -> END。"""
     graph_builder = StateGraph(AlignmentState)
     graph_builder.add_node("alignment_node", alignment_node)
     graph_builder.add_node("decision_package_node", decision_package_node)

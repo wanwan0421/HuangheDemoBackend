@@ -282,7 +282,7 @@ def search_most_model(
 ) -> Dict[str, Any]:
     """
     根据给定的模型MD5列表，从数据库获取这些模型的详细信息。
-    供LLM使用，让LLM基于详细信息来选择最相关的模型。
+    供LLM使用，让LLM基于详细信息来选择最适合的一个模型。
     Args:
         model_md5s: 模型MD5值列表
     Returns:

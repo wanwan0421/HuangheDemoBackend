@@ -190,7 +190,6 @@ def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
             if v and str(v).strip(): 
                 final_spec[k] = v
 
-        print(f"[parse_task_spec_node] ✅ Parsed Task_spec: {final_spec}")
         return {
             "messages": [],
             "Task_spec": final_spec,
@@ -198,7 +197,6 @@ def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
         }
 
     except Exception as e:
-        print(f"[parse_task_spec_node] ❌ Unexpected error: {type(e).__name__}: {e}")
         return {
             "messages": [],
             "Task_spec": current_task_spec,
@@ -225,7 +223,7 @@ def recommend_model_node(state: ModelState) -> Dict[str, Any]:
         1. **领域校验**: 分析任务所属领域（如水文、气象），判断是否需要调用 `search_relevant_indices`。
         2. **初步筛选**: 使用 `search_relevant_models` 获取 MD5 候选池。
         3. **深度比对**: 根据初选模型的`modelMd5`，调用`search_most_model`方法获取模型详细信息，选择最优模型。
-        4. **详情确认**: 调用 `get_model_details` 获取候选模型的详细工作流和输入要求，确认其是否满足任务规范。
+        4. **详情确认**: 根据选择的最优模型调用 `get_model_details` 获取候选模型的详细工作流和输入要求，确认其是否满足任务规范。
         5. **决策确认**: 如果模型满足任务需求，则停止调用工具并输出推荐结果。
 
         # Constraints
@@ -241,16 +239,12 @@ def recommend_model_node(state: ModelState) -> Dict[str, Any]:
 
     response = tools.model_with_tools.invoke(messages)
 
-    if hasattr(response, "tool_calls") and response.tool_calls:
-        response.tool_calls = [response.tool_calls[0]]
-
     return {"messages": [response]}
 
 def model_contract_node(state: ModelState) -> Dict[str, Any]:
     """
     负责根据推荐模型详情数据，生成模型契约
     """
-    print("\n[model_contract_node] START")
     
     # 优先使用state里已缓存的推荐模型
     target_model_data = state.get("recommended_model") or None
@@ -260,36 +254,29 @@ def model_contract_node(state: ModelState) -> Dict[str, Any]:
     for i, msg in enumerate(reversed(messages)):
         msg_type = type(msg).__name__
         tool_id = getattr(msg, "tool_name", None) or getattr(msg, "name", None)
-        print(f"[model_contract_node] Message {i}: {msg_type}, tool_id={tool_id}")
         
         if target_model_data:
             break
 
         if isinstance(msg, ToolMessage) and tool_id == "get_model_details":
-            print(f"[model_contract_node] Found get_model_details at index {i}")
             try:
                 data = json.loads(msg.content)
                 if data.get("status") == "success":
                     target_model_data = data
-                    print(f"[model_contract_node] ✅ Extracted model data: {data.get('name')}")
                     break
             except Exception as e:
-                print(f"[model_contract_node] ❌ Failed to parse get_model_details: {e}")
                 continue
 
     if not target_model_data:
-        print("[model_contract_node] ❌ No get_model_details found in messages, returning empty contract")
         return {
             "messages": [],
             "Model_contract": {}
         }
     
     task_spec = state.get("Task_spec", {})
-    print(f"[model_contract_node] Task_spec: {task_spec}")
     
     workflow_inputs = []
     workflow = target_model_data.get("workflow", [])
-    print(f"[model_contract_node] Workflow steps: {len(workflow)}")
     
     for state_item in workflow:
         for event in state_item.get("events", []):
@@ -327,7 +314,6 @@ def model_contract_node(state: ModelState) -> Dict[str, Any]:
         contract = to_dict(response)
             
     except Exception as e:
-        print(f"[model_contract_node] ❌ LLM Generation/Parsing failed: {e}")
         contract = {}
 
     return {
@@ -352,6 +338,7 @@ def tool_node(state: ModelState) -> Dict[str, Any]:
     tool_messages = []
     tool_results = state.get("tool_results", {}) or {}
     selected_model_md5 = state.get("selected_model_md5", "")
+    recommended_model = state.get("recommended_model", {}) or {}
 
     for tool_call in tool_calls:
         tool = tools.TOOLS_BY_NAME[tool_call["name"]]
@@ -367,6 +354,9 @@ def tool_node(state: ModelState) -> Dict[str, Any]:
                 if models and isinstance(models[0], dict) and models[0].get("modelMd5"):
                     selected_model_md5 = models[0]["modelMd5"]
 
+            if tool_call["name"] == "get_model_details" and observation.get("status") == "success":
+                recommended_model = observation
+
         # Graph 内部只保留 ToolMessage
         tool_messages.append(ToolMessage(
             content=json.dumps(observation, ensure_ascii=False),
@@ -380,6 +370,7 @@ def tool_node(state: ModelState) -> Dict[str, Any]:
         "latest_user_query": state.get("latest_user_query", ""),
         "tool_results": tool_results,
         "selected_model_md5": selected_model_md5,
+        "recommended_model": recommended_model,
     }
 
 def should_continue(state: ModelState) -> Any:
@@ -392,17 +383,20 @@ def should_continue(state: ModelState) -> Any:
     
     if not last_message:
         return END
-    
-    # 检查是否已有完整的推荐（Task_spec + model_details 都有）
+
     task_spec = state.get("Task_spec", {})
     has_task_spec = bool(task_spec and any(task_spec.values()))
     
     # 反向查找是否已有get_model_details的结果
-    has_model_details = False
+    has_model_details = bool(state.get("recommended_model"))
     for msg in reversed(messages):
         if isinstance(msg, ToolMessage) and msg.tool_name == "get_model_details":
             has_model_details = True
             break
+
+    if has_task_spec and not has_model_details:
+        print(f"[should_continue] 🔍 Task_spec is ready but model details are missing: {task_spec}")
+        return "tool_node"
     
     # 如果工作流已完整，进入合约生成阶段
     if has_task_spec and has_model_details:
@@ -432,6 +426,7 @@ agent_builder.add_conditional_edges(
     "recommend_model_node",
     should_continue,
     {
+        "recommend_model_node": "recommend_model_node",
         "tool_node": "tool_node",
         "model_contract_node": "model_contract_node",
         END: END

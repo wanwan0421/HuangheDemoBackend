@@ -21,7 +21,7 @@ export class GenAIService {
             setGlobalDispatcher(dispatcher);
             console.log("🚀 [GenAI] Global Proxy Dispatcher set to:", proxyUrl);
         } catch (err) {
-            console.warn("⚠️ [GenAI] Failed to set proxy:", err.message);
+            console.warn("⚠️ [GenAI] Failed to set proxy:", err);
         }
     }
 

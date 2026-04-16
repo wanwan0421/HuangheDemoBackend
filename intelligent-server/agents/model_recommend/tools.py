@@ -8,63 +8,28 @@ from langchain_core.embeddings import Embeddings
 from langchain.messages import HumanMessage
 from pymongo import MongoClient
 import math
-import requests
 from dotenv import load_dotenv
 from google import genai
 from langgraph.prebuilt import InjectedState
-
-# 自定义Embeddings
-class CustomHTTPEmbeddings(Embeddings):
-    def __init__(
-        self,
-        api_key: str,
-        base_url: str,
-        model: str
-    ):
-        self.api_key = api_key
-        self.base_url = base_url
-        self.model = model
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return [self.embed_query(t) for t in texts]
-
-    def embed_query(self, text: str) -> List:
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
-        payload = {
-            "model": self.model,
-            "input": text,
-        }
-
-        resp = requests.post(
-            self.base_url,
-            json=payload,
-            headers=headers,
-            timeout=30
-        )
-
-        resp.raise_for_status()
-
-        data = resp.json()
-
-        return data["data"][0]["embedding"]
+from openai import OpenAI
 
 # 初始化模型
 load_dotenv()
 AIHUBMIX_API_KEY = os.getenv("AIHUBMIX_API_KEY")
-AIHUBMIX_BASE_URL = "https://aihubmix.com/v1"
+AIHUBMIX_BASE_URL = os.getenv("AIHUBMIX_BASE_URL")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-client = genai.Client(api_key=GOOGLE_API_KEY )
+client = OpenAI(
+    api_key=AIHUBMIX_API_KEY,
+    base_url=AIHUBMIX_BASE_URL
+)
 
-recommendation_model = ChatGoogleGenerativeAI(
+recommendation_model = ChatOpenAI(
     model= "gemini-2.5-flash",
     temperature=1.0,
     max_retries=2,
     streaming=True,
-    google_api_key=GOOGLE_API_KEY ,
+    openai_api_key=AIHUBMIX_API_KEY,
+    openai_api_base="https://aihubmix.com/v1",
 )
 
 # 连接配置
@@ -73,7 +38,6 @@ DB_NAME = "huanghe-demo"
 
 # MongoDB连接池
 _db_client = None
-
 
 def _latest_user_query_from_state(state: Optional[Dict[str, Any]]) -> str:
     if not state:
@@ -158,11 +122,15 @@ def search_relevant_indices(user_query_text: str, top_k: int = 5) -> Dict[str, A
         包含相关指标列表的字典
     """
     try:
-        # query_vector = embedding_model.embed_query(user_query_text)
-        query_vector = client.models.embed_content(
+        query_vector = client.embeddings.create(
             model="gemini-embedding-001",
-            contents=user_query_text
-        ).embeddings[0].values
+            input=user_query_text
+        ).data[0].embedding
+
+        # query_vector = client.models.embed_content(
+        #     model="gemini-embedding-001",
+        #     contents=user_query_text
+        # ).embeddings[0].values
 
         db = get_db()
         index_collection = db["indexSystem"]
@@ -238,10 +206,14 @@ def search_relevant_models(
             }
 
         # 生成用户查询向量
-        query_vector = client.models.embed_content(
+        query_vector = client.embeddings.create(
             model="gemini-embedding-001",
-            contents=user_query_text
-        ).embeddings[0].values
+            input=user_query_text
+        ).data[0].embedding
+        # query_vector = client.models.embed_content(
+        #     model="gemini-embedding-001",
+        #     contents=user_query_text
+        # ).embeddings[0].values
 
         db = get_db()
         model_embeddings_collection = db["modelembeddings"]
@@ -418,7 +390,6 @@ def get_model_details(
 # ============================================================================
 
 tools = [
-    search_relevant_indices,
     search_relevant_models,
     search_most_model,
     get_model_details

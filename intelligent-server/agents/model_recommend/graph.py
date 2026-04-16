@@ -23,8 +23,6 @@ class ModelState(TypedDict):
     Model_contract: Annotated[Dict[str, Any], operator.or_]
     # 模型推荐详情
     recommended_model: Annotated[Dict[str, Any], operator.or_]
-    # 最近用户查询文本
-    latest_user_query: str
     # 各工具最近一次结果
     tool_results: Annotated[Dict[str, Any], operator.or_]
     # 候选最优模型md5
@@ -83,15 +81,6 @@ def extract_text_content(content: Any) -> str:
         return "".join(text_parts)
     return ""
 
-def get_latest_user_query(messages: list[AnyMessage]) -> str:
-    for msg in reversed(messages or []):
-        if isinstance(msg, HumanMessage):
-            text = extract_text_content(getattr(msg, "content", ""))
-            if text.strip():
-                return text.strip()
-    return ""
-
-
 def get_model_md5_list_from_result(result: Dict[str, Any]) -> list[str]:
     models = (result or {}).get("models", []) or []
     return [m.get("modelMd5") for m in models if isinstance(m, dict) and m.get("modelMd5")]
@@ -139,6 +128,12 @@ def render_recent_context(messages: list[AnyMessage], limit: int = 6) -> str:
             rows.append(f"[{role}] {text[:300]}")
     return "\n".join(rows)
 
+def get_latest_user_query(messages):
+    for msg in reversed(messages or []):
+        if isinstance(msg, HumanMessage):
+            return msg.content
+    return ""
+
 def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
     """
     负责从用户最新输入中提取或更新地理建模任务规范
@@ -151,6 +146,7 @@ def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
     for key in default_keys:
         if key not in current_task_spec:
             current_task_spec[key] = ""
+
 
     system = SystemMessage(content=f"""
         # Role
@@ -190,6 +186,7 @@ def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
             if v and str(v).strip(): 
                 final_spec[k] = v
 
+        print(f"[parse_task_spec_node] ✅ Parsed Task_spec: {final_spec}")
         return {
             "messages": [],
             "Task_spec": final_spec,
@@ -197,6 +194,7 @@ def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
         }
 
     except Exception as e:
+        print(f"[parse_task_spec_node] ❌ Unexpected error: {type(e).__name__}: {e}")
         return {
             "messages": [],
             "Task_spec": current_task_spec,
@@ -229,6 +227,8 @@ def recommend_model_node(state: ModelState) -> Dict[str, Any]:
         # Constraints
         - **Markdown 输出**: 你的非工具回复必须使用规范的 Markdown 格式。
         - **参数完整性**: 调用工具时，若状态中已有 `selected_model_md5`，请优先使用。
+        - **最优模型唯一性**: 根据`search_most_model`方法获取模型详细信息后，选择最优模型。
+        - **结果完整性**: 如果获取到最合适的模型，必须调用`get_model_details`工具获取模型详情，并根据模型要求进一步细化任务规范。
         - **禁止幻觉**: 严禁推荐数据库中不存在的 MD5。
 
         # Output Guide
@@ -252,7 +252,6 @@ def model_contract_node(state: ModelState) -> Dict[str, Any]:
     
     # 显示所有消息类型，便于诊断
     for i, msg in enumerate(reversed(messages)):
-        msg_type = type(msg).__name__
         tool_id = getattr(msg, "tool_name", None) or getattr(msg, "name", None)
         
         if target_model_data:
@@ -367,7 +366,6 @@ def tool_node(state: ModelState) -> Dict[str, Any]:
     return {
         "messages": tool_messages,
         "Task_spec": state.get("Task_spec", {}),
-        "latest_user_query": state.get("latest_user_query", ""),
         "tool_results": tool_results,
         "selected_model_md5": selected_model_md5,
         "recommended_model": recommended_model,
@@ -414,13 +412,14 @@ def should_continue(state: ModelState) -> Any:
 
 agent_builder = StateGraph(ModelState)
 
-agent_builder.add_node("parse_task_spec_node", parse_task_spec_node)
+# agent_builder.add_node("parse_task_spec_node", parse_task_spec_node)
 agent_builder.add_node("recommend_model_node", recommend_model_node)
 agent_builder.add_node("model_contract_node", model_contract_node)
 agent_builder.add_node("tool_node", tool_node)
 
-agent_builder.add_edge(START, "parse_task_spec_node")
-agent_builder.add_edge("parse_task_spec_node", "recommend_model_node")
+# agent_builder.add_edge(START, "parse_task_spec_node")
+# agent_builder.add_edge("parse_task_spec_node", "recommend_model_node")
+agent_builder.add_edge(START, "recommend_model_node")
 
 agent_builder.add_conditional_edges(
     "recommend_model_node",

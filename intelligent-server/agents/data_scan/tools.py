@@ -14,7 +14,7 @@ import shutil
 import re
 from langchain.tools import tool
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from langchain.messages import AnyMessage
 import operator
 from pyproj import CRS
@@ -25,14 +25,16 @@ ARCHIVE_EXTENSIONS = ['.zip', '.tar', '.gz', '.rar']
 
 # 初始化模型
 load_dotenv()
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+AIHUBMIX_API_KEY = os.getenv("AIHUBMIX_API_KEY")
+AIHUBMIX_BASE_URL = os.getenv("AIHUBMIX_BASE_URL")
 
-data_scan_model = ChatGoogleGenerativeAI(
-    model= "gemini-2.5-flash",
+data_scan_model = ChatOpenAI(
+    model="gpt-5.4-nano",
     temperature=0,
     max_retries=2,
     streaming=True,
-    google_api_key=GOOGLE_API_KEY ,
+    openai_api_key=AIHUBMIX_API_KEY,
+    openai_api_base=AIHUBMIX_BASE_URL,
 )
 
 class DataScanState(TypedDict):

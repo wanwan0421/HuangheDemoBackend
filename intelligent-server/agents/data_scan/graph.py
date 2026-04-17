@@ -1,42 +1,29 @@
 import json
-import re
-from typing import Dict, Any
+from typing import Dict, Any, List
 from langchain.messages import HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END
+from pydantic import BaseModel, Field
 from . import tools
 from .tools import DataScanState, data_scan_model
 
 
-def extract_text_content(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        text_parts = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                text_parts.append(part.get("text", ""))
-            elif isinstance(part, str):
-                text_parts.append(part)
-        return "".join(text_parts)
-    return ""
+class SemanticPayload(BaseModel):
+    Abstract: str = Field(default="基于规则扫描生成的数据画像")
+    Applications: List[str] = Field(default_factory=lambda: ["数据入模前质检"])
+    Tags: List[str] = Field(default_factory=lambda: ["gis", "data-scan", "validation"])
 
 
-def parse_json_from_text(raw_text: str) -> Dict[str, Any]:
-    raw_text = (raw_text or "").strip()
-    if not raw_text:
-        return {}
+class SemanticEnvelope(BaseModel):
+    Semantic: SemanticPayload = Field(default_factory=SemanticPayload)
 
-    json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_text, re.DOTALL)
-    if json_match:
-        raw_text = json_match.group(1)
 
-    if raw_text.startswith("{") and raw_text.endswith("}"):
-        return json.loads(raw_text)
-
-    fallback_match = re.search(r"(\{.*\})", raw_text, re.DOTALL)
-    if fallback_match:
-        return json.loads(fallback_match.group(1))
-
+def to_dict(model_obj: Any) -> Dict[str, Any]:
+    if hasattr(model_obj, "model_dump"):
+        return model_obj.model_dump()
+    if hasattr(model_obj, "dict"):
+        return model_obj.dict()
+    if isinstance(model_obj, dict):
+        return model_obj
     return {}
 
 
@@ -104,54 +91,49 @@ def llm_node(state: DataScanState) -> Dict[str, Any]:
     """
     profile = state.get("profile", {}) or {}
 
-    system_prompt = """你是GIS数据解释专家。基于已给出的结构化扫描结果生成语义信息，不得臆造事实。\n
-请输出JSON，且只包含以下结构：
-{
-  "Semantic": {
-    "Abstract": "...",
-    "Applications": ["..."],
-    "Tags": ["...", "...", "..."]
-  }
-}
+    system_prompt = """你是GIS数据解释专家，负责把结构化扫描结果转成可读语义信息。
 
-要求：
-1) Abstract 1-2句，数据摘要，简要描述数据内容
-2) Applications 适用场景，列出数据可能的应用领域，必须基于已有字段推断，不得凭空想象
-3) Tags 3-5个关键词标签，帮助快速理解数据主题
-4) 仅输出JSON
-"""
+    任务目标：
+    1) 只基于输入画像生成 Semantic，不得虚构任何未出现的信息。
+    2) 语义需可追溯到已有字段，例如：Form、Source_forms、Spatial、Temporal、Quality、Validation、data_sources。
+    3) 若关键信息缺失，使用保守表述（如“未明确提供时间分辨率”），不要猜测。
+
+    输出要求（你将被结构化输出约束）：
+    - Semantic.Abstract: 1-2句中文摘要，优先覆盖数据形态、时空特征、质量状态。
+    - Semantic.Applications: 2-5个应用场景短语，必须由已有事实支持；避免空泛词和重复项。
+    - Semantic.Tags: 3-5个主题标签，优先使用领域词、数据形态词、时空词（例如 hydrology, raster, timeseries, validation）。
+
+    质量约束：
+    - 不要输出与输入冲突的描述。
+    - 若 Validation 中存在 issues/warnings，Abstract 中应简要体现风险。
+    - 若 Temporal.Has_time 为 false，不要写“长期序列”“多年变化”等时间序列结论。
+    - 若 Source_count > 1，可体现“多源数据”特征；否则避免“多源融合”措辞。
+    """
 
     user_prompt = f"""请基于以下结构化数据画像补全Semantic：
-{json.dumps(profile, ensure_ascii=False)}
-"""
+        {json.dumps(profile, ensure_ascii=False)}
+    """
 
-    semantic_data = {
-        "Abstract": "基于规则扫描生成的数据画像",
-        "Applications": ["数据入模前质检"],
-        "Tags": ["gis", "data-scan", "validation"],
-    }
-
-    response = data_scan_model.invoke([
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=user_prompt),
-    ])
-
-    raw_text = extract_text_content(response.content)
+    structured_llm = data_scan_model.with_structured_output(SemanticEnvelope)
     try:
-        payload = parse_json_from_text(raw_text)
+        response = structured_llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
+        ])
+        payload = to_dict(response)
         semantic_candidate = payload.get("Semantic", payload)
         if isinstance(semantic_candidate, dict):
             semantic_data = {
-                "Abstract": semantic_candidate.get("Abstract") or semantic_data["Abstract"],
-                "Applications": semantic_candidate.get("Applications") or semantic_data["Applications"],
-                "Tags": semantic_candidate.get("Tags") or semantic_data["Tags"],
+                "Abstract": semantic_candidate.get("Abstract"),
+                "Applications": semantic_candidate.get("Applications"),
+                "Tags": semantic_candidate.get("Tags"),
             }
     except Exception:
         pass
 
     merged_profile = {**profile, "Semantic": semantic_data}
     return {
-        "messages": [response],
+        "messages": [],
         "status": "completed",
         "profile": merged_profile,
     }

@@ -138,15 +138,8 @@ def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
     """
     负责从用户最新输入中提取或更新地理建模任务规范
     """
-    # 1. 获取上一轮的 Task_spec 作为基础 (实现记忆继承)
+    # 获取上一轮的 Task_spec 作为基础 (实现记忆继承)
     current_task_spec = state.get("Task_spec", {}) or {}
-
-    # 如果 current_task_spec 是空或者不完整，初始化默认结构
-    default_keys = ["Domain", "Target_object", "Spatial_scope", "Temporal_scope", "Resolution_requirements"]
-    for key in default_keys:
-        if key not in current_task_spec:
-            current_task_spec[key] = ""
-
 
     system = SystemMessage(content=f"""
         # Role
@@ -175,31 +168,18 @@ def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
     latest_user_query = state.get("latest_user_query") or get_latest_user_query(state.get("messages", []))
 
     try:
-        # 绑定结构化输出
         structured_llm = tools.recommendation_model.with_structured_output(TaskSpecEnvelope)
-        # 直接获取Pydantic模型实例，避免手动解析
-        parsed = structured_llm.invoke(messages)
-        task_spec = to_dict(parsed).get("Task_spec", {}) or {}
-
-        final_spec = current_task_spec.copy()
-        for k, v in task_spec.items():
-            if v and str(v).strip(): 
-                final_spec[k] = v
-
-        print(f"[parse_task_spec_node] ✅ Parsed Task_spec: {final_spec}")
-        return {
-            "messages": [],
-            "Task_spec": final_spec,
-            "latest_user_query": latest_user_query
-        }
-
+        response = structured_llm.invoke(messages)
+        contract = to_dict(response).get("Task_spec", {}) or {}
+            
     except Exception as e:
-        print(f"[parse_task_spec_node] ❌ Unexpected error: {type(e).__name__}: {e}")
-        return {
-            "messages": [],
-            "Task_spec": current_task_spec,
-            "latest_user_query": latest_user_query
-        }
+        contract = {}
+
+    return {
+        "messages": [], 
+        "Task_spec": contract,
+        "latest_user_query": latest_user_query
+    }
 
 def recommend_model_node(state: ModelState) -> Dict[str, Any]:
     """
@@ -393,18 +373,15 @@ def should_continue(state: ModelState) -> Any:
             break
 
     if has_task_spec and not has_model_details:
-        print(f"[should_continue] 🔍 Task_spec is ready but model details are missing: {task_spec}")
         return "tool_node"
     
     # 如果工作流已完整，进入合约生成阶段
     if has_task_spec and has_model_details:
-        print(f"[should_continue] ✅ Routing to model_contract_node: has_task_spec={has_task_spec}, has_model_details={has_model_details}")
         return "model_contract_node"
     
     # 检查是否还需要调用工具（但防止重复调用）
     # 只有当最后一条消息是 AIMessage 且有 tool_calls 时，才调用工具
     if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        print(f"[should_continue] 🔧 Routing to tool_node: calling {[c.get('name') for c in last_message.tool_calls]}")
         return "tool_node"
     
     # 否则结束
@@ -412,14 +389,13 @@ def should_continue(state: ModelState) -> Any:
 
 agent_builder = StateGraph(ModelState)
 
-# agent_builder.add_node("parse_task_spec_node", parse_task_spec_node)
+agent_builder.add_node("parse_task_spec_node", parse_task_spec_node)
 agent_builder.add_node("recommend_model_node", recommend_model_node)
 agent_builder.add_node("model_contract_node", model_contract_node)
 agent_builder.add_node("tool_node", tool_node)
 
-# agent_builder.add_edge(START, "parse_task_spec_node")
-# agent_builder.add_edge("parse_task_spec_node", "recommend_model_node")
-agent_builder.add_edge(START, "recommend_model_node")
+agent_builder.add_edge(START, "parse_task_spec_node")
+agent_builder.add_edge("parse_task_spec_node", "recommend_model_node")
 
 agent_builder.add_conditional_edges(
     "recommend_model_node",

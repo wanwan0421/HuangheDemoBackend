@@ -1,12 +1,12 @@
 import json
 import os
-import re
 import operator
 from typing import TypedDict, Dict, Any, List, Annotated, Optional, Set
 from langchain.messages import HumanMessage, SystemMessage, AnyMessage
 from langgraph.graph import StateGraph, START, END
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 
 from agents.execute.graph import execute_agent
 
@@ -19,15 +19,62 @@ from agents.execute.graph import execute_agent
 """
 
 load_dotenv()
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+AIHUBMIX_API_KEY = os.getenv("AIHUBMIX_API_KEY")
+AIHUBMIX_BASE_URL = os.getenv("AIHUBMIX_BASE_URL")
 
-alignment_model = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
+alignment_model = ChatOpenAI(
+    model="gpt-5.4-nano",
     temperature=0.2,
     max_retries=2,
     streaming=False,
-    google_api_key=GOOGLE_API_KEY,
+    openai_api_key=AIHUBMIX_API_KEY,
+    openai_api_base=AIHUBMIX_BASE_URL,
 )
+
+
+class AlignmentDimension(BaseModel):
+    score: float = Field(default=0.0)
+    status: str = Field(default="partial")
+    evidence: List[str] = Field(default_factory=list)
+    gaps: List[str] = Field(default_factory=list)
+
+
+class AlignmentPerSlot(BaseModel):
+    input_name: str = Field(default="unknown_input")
+    semantic_alignment: AlignmentDimension = Field(default_factory=AlignmentDimension)
+    spatiotemporal_alignment: AlignmentDimension = Field(default_factory=AlignmentDimension)
+    spec_alignment: AlignmentDimension = Field(default_factory=AlignmentDimension)
+    actions: List[str] = Field(default_factory=list)
+
+
+class AlignmentDimensions(BaseModel):
+    semantic: AlignmentDimension = Field(default_factory=lambda: AlignmentDimension(status="mismatch"))
+    spatiotemporal: AlignmentDimension = Field(default_factory=lambda: AlignmentDimension(status="mismatch"))
+    spec: AlignmentDimension = Field(default_factory=lambda: AlignmentDimension(status="mismatch"))
+
+
+class AlignmentResultSchema(BaseModel):
+    overall_score: float = Field(default=0.0)
+    summary: str = Field(default="")
+    dimensions: AlignmentDimensions = Field(default_factory=AlignmentDimensions)
+    per_slot: List[AlignmentPerSlot] = Field(default_factory=list)
+    blocking_issues: List[str] = Field(default_factory=list)
+    non_blocking_issues: List[str] = Field(default_factory=list)
+    suggested_transformations: List[str] = Field(default_factory=list)
+
+
+class AlignmentEnvelope(BaseModel):
+    Alignment_result: AlignmentResultSchema = Field(default_factory=AlignmentResultSchema)
+
+
+def to_dict(model_obj: Any) -> Dict[str, Any]:
+    if hasattr(model_obj, "model_dump"):
+        return model_obj.model_dump()
+    if hasattr(model_obj, "dict"):
+        return model_obj.dict()
+    if isinstance(model_obj, dict):
+        return model_obj
+    return {}
 
 def _replace_state_value(current: Any, incoming: Any) -> Any:
     # LangGraph reducer：当新值为 None 时保留旧值，否则直接替换。
@@ -48,45 +95,6 @@ class AlignmentState(TypedDict, total=False):
     alignment_status: str
     auto_transform: bool
     status: str
-
-def extract_text_content(content: Any) -> str:
-    """兼容不同模型返回格式，提取可解析的纯文本。"""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                parts.append(part.get("text", ""))
-            elif isinstance(part, str):
-                parts.append(part)
-        return "".join(parts)
-    return ""
-
-def parse_json_from_text(raw_text: str) -> Dict[str, Any]:
-    """从 LLM 输出中提取 JSON。
-
-    支持三种常见格式：
-    - ```json ... ``` 代码块
-    - 纯对象文本
-    - 文本中夹带的对象片段
-    """
-    raw_text = raw_text.strip()
-    if not raw_text:
-        return {}
-
-    json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_text, re.DOTALL)
-    if json_match:
-        raw_text = json_match.group(1)
-
-    if raw_text.startswith("{") and raw_text.endswith("}"):
-        return json.loads(raw_text)
-
-    fallback_match = re.search(r"(\{.*\})", raw_text, re.DOTALL)
-    if fallback_match:
-        return json.loads(fallback_match.group(1))
-
-    return {}
 
 def _normalize_text(value: Any) -> str:
     """统一做字符串化、去空白、小写，便于规则比较。"""
@@ -418,47 +426,31 @@ def alignment_node(state: AlignmentState) -> Dict[str, Any]:
     if not data_profile and data_profiles:
         data_profile = _merge_data_profiles(data_profiles)
 
-    system_prompt = """你是Alignment Agent。你的任务是对齐三方信息：
+    system_prompt = """你是 Alignment Agent，负责对齐三方信息：
 1) Task_spec（任务规范）
 2) Model_contract（模型输入契约）
-3) Data_profile（Scanner 产出的数据画像）
+3) Data_profile（Scanner 数据画像）
 
-请基于三大维度生成对齐结果：
-- 语义对齐（Semantic）：任务目标/模型语义 与 数据语义是否一致
-- 时空对齐（Spatiotemporal）：空间范围、CRS、分辨率、时间范围/频率是否匹配
-- 规格对齐（Spec）：数据形式、格式、字段/变量、数据类型是否满足模型契约
+请输出“证据驱动”的对齐结论，禁止臆造：
+- 只可引用输入中出现的字段、值和关系。
+- 结论必须可追溯：每条 evidence/gap 都应能在输入里找到依据。
+- 若信息不足，使用保守表达并在 gaps 中说明，不得猜测。
 
-输出要求：
-1) 仅输出 JSON
-2) 给出每个输入槽位（Required_slots）的对齐结果
-3) 给出全局总结、阻塞问题、可选修复建议
-4) 评分区间为 0~1；status 仅允许: match | partial | mismatch
-5) 当模型契约中的 CRS 描述为“推荐使用”而非“必须/严格要求”时，CRS 不一致默认判为 non_blocking_issues（警告）而非 blocking_issues；只有出现无法投影、空间参考缺失且无法推断、或会直接导致模型无法运行时，才可判为阻塞问题
+对齐维度：
+- semantic: 任务目标与数据语义一致性
+- spatiotemporal: 空间范围/CRS/分辨率/时间范围与频率一致性
+- spec: 数据形态/格式/字段/类型是否满足 Required_slots
 
-JSON 结构示例（必须遵循）：
-{
-  "Alignment_result": {
-    "overall_score": 0.0,
-    "summary": "...",
-    "dimensions": {
-      "semantic": {"score": 0.0, "status": "partial", "evidence": [], "gaps": []},
-      "spatiotemporal": {"score": 0.0, "status": "partial", "evidence": [], "gaps": []},
-      "spec": {"score": 0.0, "status": "partial", "evidence": [], "gaps": []}
-    },
-    "per_slot": [
-      {
-        "input_name": "...",
-        "semantic_alignment": {"score": 0.0, "status": "partial", "evidence": [], "gaps": []},
-        "spatiotemporal_alignment": {"score": 0.0, "status": "partial", "evidence": [], "gaps": []},
-        "spec_alignment": {"score": 0.0, "status": "partial", "evidence": [], "gaps": []},
-        "actions": ["..."]
-      }
-    ],
-    "blocking_issues": ["..."],
-    "non_blocking_issues": ["..."],
-    "suggested_transformations": ["..."]
-  }
-}
+输出约束：
+- 分数范围必须是 0~1。
+- status 仅允许: match | partial | mismatch。
+- per_slot 必须覆盖 Model_contract.Required_slots 中每个输入槽位。
+- blocking_issues 仅包含会直接阻断模型运行的问题。
+- non_blocking_issues 放可修复但不阻断的问题（例如“推荐 CRS”不一致）。
+
+判定补充：
+- 若 CRS 是“推荐使用”而非“必须/严格要求”，默认归入 non_blocking_issues。
+- 只有无法投影、空间参考缺失且无法推断、或确定导致运行失败时，才可列入 blocking_issues。
 """
 
     user_prompt = f"""请对齐以下三方信息：
@@ -473,34 +465,15 @@ Data_profile:
 {json.dumps(data_profile, ensure_ascii=False)}
 """
 
-    response = alignment_model.invoke([
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=user_prompt)
-    ])
-
-    raw_text = extract_text_content(response.content)
+    structured_llm = alignment_model.with_structured_output(AlignmentEnvelope)
     try:
-        alignment = parse_json_from_text(raw_text)
+        response = structured_llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt)
+        ])
+        alignment = to_dict(response)
     except Exception:
         alignment = {}
-
-    if "Alignment_result" not in alignment:
-        alignment = {
-            "Alignment_result": {
-                "overall_score": 0.0,
-                "summary": "对齐结果解析失败",
-                "dimensions": {
-                    "semantic": {"score": 0.0, "status": "mismatch", "evidence": [], "gaps": ["LLM输出无法解析"]},
-                    "spatiotemporal": {"score": 0.0, "status": "mismatch", "evidence": [], "gaps": ["LLM输出无法解析"]},
-                    "spec": {"score": 0.0, "status": "mismatch", "evidence": [], "gaps": ["LLM输出无法解析"]}
-                },
-                "per_slot": [],
-                "blocking_issues": ["LLM输出无法解析"],
-                "non_blocking_issues": [],
-                "suggested_transformations": []
-            },
-            "raw": raw_text
-        }
 
     alignment_result = alignment.get("Alignment_result", alignment)
     # LLM 结论后置规则校验：保证关键格式/CRS风险被稳定识别。
@@ -508,7 +481,7 @@ Data_profile:
     alignment_status = _alignment_status_from_score(float(alignment_result.get("overall_score", 0.0)))
 
     return {
-        "messages": [response],
+        "messages": [],
         "Alignment_result": alignment_result,
         "alignment_status": alignment_status,
         "status": "aligned",

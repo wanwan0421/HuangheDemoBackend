@@ -24,12 +24,12 @@ client = OpenAI(
 )
 
 recommendation_model = ChatOpenAI(
-    model= "gemini-2.5-flash",
+    model= "gpt-5-mini",
     temperature=1.0,
     max_retries=2,
     streaming=True,
     openai_api_key=AIHUBMIX_API_KEY,
-    openai_api_base="https://aihubmix.com/v1",
+    openai_api_base=AIHUBMIX_BASE_URL,
 )
 
 # 连接配置

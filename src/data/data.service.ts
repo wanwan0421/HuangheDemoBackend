@@ -241,7 +241,7 @@ export class DataService {
               resolve(result);
             }
           } catch (error) {
-            reject(new Error(`解析转换结果失败: ${error.message}`));
+            reject(new Error(`解析转换结果失败: ${error}`));
           }
         }
       });
@@ -285,7 +285,7 @@ export class DataService {
         results.push({
           filePath,
           success: false,
-          error: error.message,
+          error: error,
         });
       }
     }

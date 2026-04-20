@@ -32,6 +32,7 @@ export class ModelRunnerController {
     @Body() body: any,
     @UploadedFiles() files: Array<ExpressMulter.File>) {
     try {
+      console.log("Received body:", JSON.stringify(body, null, 2));
       // 获取基础配置
       const info = JSON.parse(body.info);
 
@@ -69,12 +70,14 @@ export class ModelRunnerController {
         });
       }
 
-      // console.log("formattedRequest:", JSON.stringify(formattedRequest, null, 2));
+      console.log("formattedRequest:", JSON.stringify(formattedRequest, null, 2));
 
       const result = await this.modelRunnerService.createAndRunModel(formattedRequest);
       return { success: true, data: result };
     } catch (error) {
-      throw new HttpException(error.message, HttpStatus.BAD_REQUEST);
+      throw new HttpException(
+        error || '模型运行失败', 
+        HttpStatus.BAD_REQUEST);
     }
   }
 
@@ -96,7 +99,7 @@ export class ModelRunnerController {
       };
     } catch (error) {
       throw new HttpException(
-        error.message || '获取任务状态失败',
+        error || '获取任务状态失败',
         HttpStatus.BAD_REQUEST,
       );
     }
@@ -115,7 +118,7 @@ export class ModelRunnerController {
       };
     } catch (error) {
       throw new HttpException(
-        error.message || '获取任务结果失败',
+        error || '获取任务结果失败',
         HttpStatus.BAD_REQUEST,
       );
     }
@@ -134,7 +137,7 @@ export class ModelRunnerController {
       };
     } catch (error) {
       throw new HttpException(
-        error.message || '获取任务列表失败',
+        error || '获取任务列表失败',
         HttpStatus.BAD_REQUEST,
       );
     }

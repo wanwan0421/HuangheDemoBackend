@@ -11,22 +11,46 @@ from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
 from dotenv import load_dotenv
 from langchain.messages import AnyMessage, HumanMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
+from pydantic import BaseModel, Field
 
 load_dotenv()
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+AIHUBMIX_API_KEY = os.getenv("AIHUBMIX_API_KEY")
+AIHUBMIX_BASE_URL = os.getenv("AIHUBMIX_BASE_URL")
 DATA_METHOD_BASE_URL = (os.getenv("DATA_METHOD_BASE_URL") or "http://172.21.252.222:8080").rstrip("/")
 DATA_METHOD_TOKEN = os.getenv("DATA_METHOD_TOKEN") or ""
 
-execute_model = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
+execute_model = ChatOpenAI(
+    model="gpt-5-mini",
     temperature=0.2,
     max_retries=2,
     streaming=False,
-    google_api_key=GOOGLE_API_KEY,
+    openai_api_key=AIHUBMIX_API_KEY,
+    openai_api_base=AIHUBMIX_BASE_URL or "https://aihubmix.com/v1",
 )
+
+
+class ExecutionPlanItem(BaseModel):
+    input_name: str = Field(default="")
+    method_name: str = Field(default="")
+    reason: str = Field(default="")
+
+
+class ExecutionPlanEnvelope(BaseModel):
+    plans: List[ExecutionPlanItem] = Field(default_factory=list)
+    notes: List[str] = Field(default_factory=list)
+
+
+def to_dict(model_obj: Any) -> Dict[str, Any]:
+    if hasattr(model_obj, "model_dump"):
+        return model_obj.model_dump()
+    if hasattr(model_obj, "dict"):
+        return model_obj.dict()
+    if isinstance(model_obj, dict):
+        return model_obj
+    return {}
 
 
 def _replace_state_value(current: Any, incoming: Any) -> Any:
@@ -42,39 +66,6 @@ class ExecuteState(TypedDict, total=False):
     execution_targets: Annotated[List[Dict[str, Any]], _replace_state_value]
     execution_plan: Annotated[List[Dict[str, Any]], _replace_state_value]
     status: str
-
-
-def extract_text_content(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: List[str] = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                parts.append(str(part.get("text", "")))
-            elif isinstance(part, str):
-                parts.append(part)
-        return "".join(parts)
-    return ""
-
-
-def parse_json_from_text(raw_text: str) -> Dict[str, Any]:
-    text = str(raw_text or "").strip()
-    if not text:
-        return {}
-
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if fenced:
-        text = fenced.group(1)
-
-    if text.startswith("{") and text.endswith("}"):
-        return json.loads(text)
-
-    fallback = re.search(r"(\{.*\})", text, re.DOTALL)
-    if fallback:
-        return json.loads(fallback.group(1))
-
-    return {}
 
 
 def _normalize_text(value: Any) -> str:
@@ -307,31 +298,34 @@ def plan_execution_node(state: ExecuteState) -> Dict[str, Any]:
         for item in available_methods[:40]
     ]
 
-    system_prompt = """你是数据转换方法规划智能体。\n
-    你会根据待修复槽位和候选方法列表，给每个槽位选择一个最合适的方法名。\n\n
-    输出必须是 JSON，结构如下：\n
-    {\n  \"plans\": 
-        [\n    
-            {\n
-                \"input_name\": \"...\",\n
-                \"method_name\": \"...\",\n
-                \"reason\": \"...\"\n
-            }\n  
-        ],\n
-        \"notes\":
-        [\"...\"]
-        \n}\n\n
-        约束：\n
-        1) method_name 必须来自候选方法列表。\n
-        2) 若找不到合适方法，不要编造，可不返回该槽位。\n
-        3) 优先考虑语义匹配和参数数量可执行性。
-        """
+    system_prompt = """你是数据转换执行规划器。你的任务是为每个待修复槽位从候选方法中选择最可执行的方法。
+
+规则：
+1) 只能从候选方法列表中选择 method_name，严禁编造。
+2) 若某槽位没有合适方法，可以不返回该槽位，不要硬选。
+3) 优先级：语义匹配 > 参数可执行性 > 描述相似度。
+4) reason 需要简短说明“为何该方法适配该槽位”。
+5) 输出保持保守，不确定时宁可少选。
+
+你将以结构化方式输出：
+- plans: [{input_name, method_name, reason}]
+- notes: [规划说明]
+"""
 
     user_prompt = f"""待修复槽位：\n{json.dumps(targets, ensure_ascii=False)}\n\n候选方法列表：\n{json.dumps(method_index, ensure_ascii=False)}"""
 
-    response = execute_model.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
-    raw_text = extract_text_content(response.content)
-    parsed = parse_json_from_text(raw_text)
+    structured_llm = execute_model.with_structured_output(
+        ExecutionPlanEnvelope,
+        method="function_calling",
+    )
+    try:
+        response = structured_llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
+        ])
+        parsed = to_dict(response)
+    except Exception:
+        parsed = {"plans": [], "notes": ["LLM规划失败，返回空计划"]}
 
     valid_names = {str(item.get("name") or "").strip() for item in available_methods}
     valid_slots = {item["input_name"] for item in targets}
@@ -352,7 +346,7 @@ def plan_execution_node(state: ExecuteState) -> Dict[str, Any]:
     print(f"生成的执行计划: {json.dumps(plans, ensure_ascii=False, indent=2)}")
 
     return {
-        "messages": [response],
+        "messages": [],
         "execution_targets": targets,
         "execution_plan": plans,
         "status": "plan_ready",

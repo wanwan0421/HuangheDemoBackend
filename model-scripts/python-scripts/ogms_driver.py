@@ -31,6 +31,20 @@ def run():
         result = taskServer.createTaskWithURL(params_with_url=lists)
         print("result:", result)
 
+        # createTaskWithURL 失败时通常以 ResultUtils(code != 1) 返回，而不是抛异常。
+        result_code = getattr(result, "code", None)
+        if result_code is not None and result_code != 1:
+            result_msg = str(getattr(result, "msg", "参数有误") or "参数有误")
+            result_data = getattr(result, "data", None)
+            if isinstance(result_data, list) and result_data:
+                detail = " | ".join(str(item) for item in result_data)
+                result_msg = f"{result_msg}: {detail}"
+            elif result_data:
+                result_msg = f"{result_msg}: {result_data}"
+
+            print(json.dumps({"status": "error", "message": result_msg}, ensure_ascii=False))
+            sys.exit(1)
+
         # 下载结果
         # download_result = taskServer.downloadAllData()
         final_output = {

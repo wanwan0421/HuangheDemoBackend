@@ -12,9 +12,11 @@ import { ModelRunRecord, ModelRunRecordDocument } from './schemas/model-run-reco
 @Injectable()
 export class ModelRunnerService {
   private readonly logger = new Logger(ModelRunnerService.name);
+  private readonly projectRoot = process.cwd();
   private readonly modelDataDir = path.join(process.cwd(), 'model-scripts');
   private readonly jsonScriptsDir = path.join(this.modelDataDir, 'json-scripts');
   private readonly driverScriptsPath = path.join(this.modelDataDir, 'python-scripts', 'ogms_driver.py');
+  private readonly pythonExe = this.findPythonExecutable();
 
   constructor(
     @InjectModel(ModelRunRecord.name) private modelRunRecordModel: Model<ModelRunRecordDocument>,
@@ -36,6 +38,30 @@ export class ModelRunnerService {
     if (!fs.existsSync(this.driverScriptsPath)) {
       this.logger.warn(`警告: Python驱动脚本未找到，请确保文件存在于: ${this.driverScriptsPath}`);
     }
+
+    this.logger.log(`ModelRunner Python解释器: ${this.pythonExe}`);
+  }
+
+  /**
+   * 优先使用项目虚拟环境中的 Python，避免落到系统 Python 导致依赖缺失。
+   */
+  private findPythonExecutable(): string {
+    const possiblePaths = [
+      path.join(this.projectRoot, 'intelligent-server', 'intelligent-server', 'Scripts', 'python.exe'),
+      path.join(this.projectRoot, 'intelligent-server', 'intelligent-server', 'bin', 'python'),
+      path.join(this.projectRoot, '.venv', 'Scripts', 'python.exe'),
+      path.join(this.projectRoot, '.venv', 'bin', 'python'),
+      path.join(this.projectRoot, 'venv', 'Scripts', 'python.exe'),
+      path.join(this.projectRoot, 'venv', 'bin', 'python'),
+    ];
+
+    for (const pythonPath of possiblePaths) {
+      if (fs.existsSync(pythonPath)) {
+        return pythonPath;
+      }
+    }
+
+    return process.platform === 'win32' ? 'python.exe' : 'python';
   }
 
   /**
@@ -44,9 +70,6 @@ export class ModelRunnerService {
   async createAndRunModel(request: CreateModelRunRequest) {
     const taskId = crypto.randomUUID();
     this.logger.log(`创建新模型任务: ${taskId}, 模型: ${request.modelName}`);
-
-    // 验证请求数据，后续扩展更多验证逻辑（数据检查+AI）
-    this.validateRequest(request);
 
     // 准备数据文件，生成JSON数据（替代原来的Python代码）
     const jsonPath = await this.generateInputJson(taskId, request);
@@ -147,15 +170,19 @@ export class ModelRunnerService {
         }
         // 数值 / 字符串参数
         else if (eventData.value !== undefined) {
-          const xmlFileUrl = await this.uploadValueAsXml(eventName, 'String', eventData.value);
+          const inputName = eventData.name || eventName;
+          const valueFileName = inputName.includes('.') ? inputName : `${inputName}.xml`;
+          const xmlFileUrl = await this.uploadValueAsXml(inputName, 'string', eventData.value);
           run[stateName][eventName] = {
-            name: eventData.name,
+            name: valueFileName,
             url: xmlFileUrl,
             value: eventData.value,
           };
         }
       }
     }
+
+    console.log("构建的run对象:", JSON.stringify(run, null, 2));
 
     return run;
   }
@@ -185,7 +212,7 @@ export class ModelRunnerService {
         throw new Error(`上传文件失败: ${responseData.data.message || '未知错误'}`);
       }
     } catch (error) {
-      throw new Error(`上传文件异常: ${error.message}`);
+      throw new Error(`上传文件异常: ${error}`);
     }
   }
 
@@ -270,14 +297,14 @@ export class ModelRunnerService {
 
         this.logger.log(`模型任务完成: ${taskId}`);
       } catch (error) {
-        this.logger.error(`模型任务失败: ${taskId}, 错误: ${error.message}`);
+        this.logger.error(`模型任务失败: ${taskId}, 错误: ${error}`);
 
         // 更新状态为失败
         await this.modelRunRecordModel.updateOne(
           { _id: recordId },
           {
             status: 'Error',
-            error: error.message,
+            error: error,
             FinishedAt: new Date(),
           },
         );
@@ -298,9 +325,9 @@ export class ModelRunnerService {
       }
 
       // 运行python：ogms_driver.py
-      const python = spawn('python', [this.driverScriptsPath, jsonPath], {
+      const python = spawn(this.pythonExe, [this.driverScriptsPath, jsonPath], {
         cwd: path.dirname(this.driverScriptsPath),
-        env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+        env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
       });
 
       let stdoutData = '';
@@ -317,7 +344,31 @@ export class ModelRunnerService {
 
       python.on('close', (code) => {
         if (code !== 0) {
-          reject(new Error(`Python驱动脚本执行失败，退出码: ${code}, 错误: ${stderrData}`));
+          const stderrText = stderrData.trim();
+          const stdoutText = stdoutData.trim();
+
+          // ogms_driver.py 在异常时通常把 JSON 错误写到 stdout，这里优先提取 message。
+          let pythonMessage = '';
+          if (stdoutText) {
+            try {
+              const lines = stdoutText.split('\n').map(line => line.trim()).filter(Boolean);
+              const lastLine = lines[lines.length - 1];
+              const payload = JSON.parse(lastLine);
+              if (payload && typeof payload === 'object') {
+                pythonMessage = String(payload.message || payload.error || '').trim();
+              }
+            } catch {
+              // 非 JSON 输出保持原始文本回传即可。
+            }
+          }
+
+          const details = [
+            pythonMessage ? `python_message: ${pythonMessage}` : '',
+            stderrText ? `stderr: ${stderrText}` : '',
+            stdoutText ? `stdout: ${stdoutText}` : '',
+          ].filter(Boolean).join(' | ');
+
+          reject(new Error(`Python驱动脚本执行失败，退出码: ${code}${details ? `, 详情: ${details}` : ''}`));
         } else {
           try {
             const lines = stdoutData.trim().split('\n');
@@ -325,14 +376,14 @@ export class ModelRunnerService {
             const result = JSON.parse(lastLine);
             resolve(result);
           } catch (error) {
-            this.logger.error(`解析Python输出时出错: ${error.message}`);
+            this.logger.error(`解析Python输出时出错: ${error}`);
             resolve({ rawOutput: stdoutData });
           }
         }
       });
 
       python.on('error', (error) => {
-        reject(new Error(`执行Python驱动脚本时出错: ${error.message}`));
+        reject(new Error(`执行Python驱动脚本时出错: ${error}`));
       })
     })
   }

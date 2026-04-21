@@ -649,53 +649,7 @@ class OGMSTaskAccess(Service):
         else:
             print("Failed to download some files")
             return True
-        # downloadFilesNum = 0
-        # downlaodedFilesNum = 0
-        # if not self.outputs:
-        #     print("没有可下载的数据")
-        #     return False
-
-        # for output in self.outputs:
-        #     statename = output["statename"]
-        #     event = output["event"]
-        #     url = output["url"]
-        #     suffix = output["suffix"]
-        #     # 构建文件名
-        #     base_filename = f"{statename}-{event}"
-        #     filename = f"{base_filename}.{suffix}"
-        #     counter = 1
-        #     s_id = secrets.token_hex(8)
-        #     file_path = "./data/" + self.modelName + "_" + s_id + "/" + filename
-
-        #     dir_path = os.path.dirname(file_path)
-        #     if not os.path.exists(dir_path):
-        #         os.makedirs(dir_path)
-
-        #     # 检查文件是否存在
-        #     while os.path.exists(file_path):
-        #         filename = f"{base_filename}_{counter}.{suffix}"
-        #         file_path = "./data/" + self.modelName + "_" + s_id + "/" + filename
-        #         counter += 1
-        #     downloadFilesNum = downloadFilesNum + 1
-        #     # 下载文件并保存
-        #     content, cDisposition = HttpHelper.Request_get_url_sync(url)
-        #     if content:
-        #         with open("./data/" + filename, "wb") as f:
-        #             f.write(content)
-        #         print(f"Downloaded {filename}")
-        #         downlaodedFilesNum = downlaodedFilesNum + 1
-        #     else:
-        #         print(f"Failed to download {url}")
-        # if downlaodedFilesNum == 0:
-        #     print("Failed to download files")
-        #     return False
-        # if downloadFilesNum == downlaodedFilesNum:
-        #     print("All files downloaded successfully")
-        #     return True
-        # else:
-        #     print("Failed to download some files")
-        #     return True
-
+        
     def createTask(self, params: dict) -> ResultUtils:
         # create task
         task = OGMSTask()

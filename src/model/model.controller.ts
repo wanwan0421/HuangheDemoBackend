@@ -32,7 +32,6 @@ export class ModelRunnerController {
     @Body() body: any,
     @UploadedFiles() files: Array<ExpressMulter.File>) {
     try {
-      console.log("Received body:", JSON.stringify(body, null, 2));
       // 获取基础配置
       const info = JSON.parse(body.info);
 
@@ -69,8 +68,6 @@ export class ModelRunnerController {
           };
         });
       }
-
-      console.log("formattedRequest:", JSON.stringify(formattedRequest, null, 2));
 
       const result = await this.modelRunnerService.createAndRunModel(formattedRequest);
       return { success: true, data: result };

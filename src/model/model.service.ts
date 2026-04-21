@@ -14,6 +14,7 @@ export class ModelRunnerService {
   private readonly logger = new Logger(ModelRunnerService.name);
   private readonly projectRoot = process.cwd();
   private readonly modelDataDir = path.join(process.cwd(), 'model-scripts');
+  private readonly uploadsDir = path.join(this.modelDataDir, 'uploads');
   private readonly jsonScriptsDir = path.join(this.modelDataDir, 'json-scripts');
   private readonly driverScriptsPath = path.join(this.modelDataDir, 'python-scripts', 'ogms_driver.py');
   private readonly pythonExe = this.findPythonExecutable();
@@ -155,6 +156,7 @@ export class ModelRunnerService {
 
           const filePath = eventData.filePath;
           const fileUrl = await this.uploadFileToDataServer(filePath);
+          await this.cleanupUploadedLocalFile(filePath);
 
           run[stateName][eventName] = {
             name: eventData.name ?? path.basename(filePath),
@@ -182,8 +184,6 @@ export class ModelRunnerService {
       }
     }
 
-    console.log("构建的run对象:", JSON.stringify(run, null, 2));
-
     return run;
   }
 
@@ -204,7 +204,6 @@ export class ModelRunnerService {
       });
 
       const responseData = await response.json() as any;
-      console.log('上传文件响应:', responseData);
 
       if (responseData.code === 1 && responseData.data?.id) {
         return `http://geomodeling.njnu.edu.cn/dataTransferServer/data/${responseData.data.id}`;
@@ -213,6 +212,29 @@ export class ModelRunnerService {
       }
     } catch (error) {
       throw new Error(`上传文件异常: ${error}`);
+    }
+  }
+
+  /**
+   * 数据已上传到中转服务器后，清理本地上传缓存文件
+   */
+  private async cleanupUploadedLocalFile(filePath: string): Promise<void> {
+    try {
+      const resolvedFilePath = path.resolve(filePath);
+      const resolvedUploadsDir = path.resolve(this.uploadsDir);
+      const isInUploadsDir =
+        resolvedFilePath === resolvedUploadsDir ||
+        resolvedFilePath.startsWith(`${resolvedUploadsDir}${path.sep}`);
+
+      if (!isInUploadsDir) {
+        this.logger.warn(`跳过删除非上传目录文件: ${resolvedFilePath}`);
+        return;
+      }
+
+      await fs.promises.unlink(resolvedFilePath);
+      this.logger.log(`已删除本地上传缓存文件: ${resolvedFilePath}`);
+    } catch (error) {
+      this.logger.warn(`删除本地上传缓存文件失败: ${filePath}, 原因: ${error}`);
     }
   }
 
@@ -297,14 +319,14 @@ export class ModelRunnerService {
 
         this.logger.log(`模型任务完成: ${taskId}`);
       } catch (error) {
-        this.logger.error(`模型任务失败: ${taskId}, 错误: ${error}`);
+        const errorMessage = error instanceof Error ? error.message : String(error);
 
         // 更新状态为失败
         await this.modelRunRecordModel.updateOne(
           { _id: recordId },
           {
             status: 'Error',
-            error: error,
+            error: errorMessage,
             FinishedAt: new Date(),
           },
         );
@@ -405,6 +427,8 @@ export class ModelRunnerService {
       createdAt: record.createdAt,
       startedAt: record.startedAt,
       FinishedAt: record.FinishedAt,
+      error: record.error,
+      errorDetail: record.errorDetail,
     };
   }
 
@@ -423,7 +447,14 @@ export class ModelRunnerService {
     }
 
     if (record.status === 'Error') {
-      throw new Error(`任务执行失败: ${record.error}`);
+      return {
+        taskId: record.taskId,
+        modelName: record.modelName,
+        status: record.status,
+        error: record.error,
+        errorDetail: record.errorDetail,
+        FinishedAt: record.FinishedAt,
+      };
     }
 
     return {

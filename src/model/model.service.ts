@@ -232,7 +232,6 @@ export class ModelRunnerService {
       }
 
       await fs.promises.unlink(resolvedFilePath);
-      this.logger.log(`已删除本地上传缓存文件: ${resolvedFilePath}`);
     } catch (error) {
       this.logger.warn(`删除本地上传缓存文件失败: ${filePath}, 原因: ${error}`);
     }

@@ -12,6 +12,7 @@ import { ChatModule } from './chat/chat.module';
 import { ModelRunnerModule } from './model/model.module';
 import { DataMappingModule } from './data-mapping/data-mapping.module';
 import { DataModule } from './data/data.module';
+import { UserCenterModule } from './user-center/user-center.module';
 
 @Module({
   imports: [
@@ -35,6 +36,7 @@ import { DataModule } from './data/data.module';
     ModelRunnerModule,
     DataMappingModule,
     DataModule,
+    UserCenterModule,
   ],
   controllers: [AppController],
   providers: [AppService],

@@ -12,7 +12,8 @@ import { ChatModule } from './chat/chat.module';
 import { ModelRunnerModule } from './model/model.module';
 import { DataMappingModule } from './data-mapping/data-mapping.module';
 import { DataModule } from './data/data.module';
-import { UserCenterModule } from './user-center/user-center.module';
+import { AuthModule } from './auth/auth.module';
+import { UserModule } from './user/user.module';
 
 @Module({
   imports: [
@@ -36,7 +37,8 @@ import { UserCenterModule } from './user-center/user-center.module';
     ModelRunnerModule,
     DataMappingModule,
     DataModule,
-    UserCenterModule,
+    AuthModule,
+    UserModule,
   ],
   controllers: [AppController],
   providers: [AppService],

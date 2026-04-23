@@ -17,7 +17,7 @@ async function bootstrap() {
     // allowed methods
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
     // allowed headers
-    allowedHeaders: 'Content-Type, Accept, Authorization',
+    allowedHeaders: 'Content-Type, Accept, Authorization, X-Requested-With',
   });
 
   // 静态资源映射

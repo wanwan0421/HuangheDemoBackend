@@ -6,10 +6,12 @@ import { ChatService } from './chat.service';
 import { Session, SessionSchema } from './schemas/session.schema';
 import { Message, MessageSchema } from './schemas/message.schema';
 import { DataScanResult, DataScanResultSchema } from '../data-mapping/schemas/data-scan-result.schema';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
   imports: [
     HttpModule,
+    AuthModule,
     MongooseModule.forFeature([
       { name: Session.name, schema: SessionSchema },
       { name: Message.name, schema: MessageSchema },

@@ -8,25 +8,25 @@ export type MessageDocument = HydratedDocument<Message>;
 @Schema({ timestamps: true })
 export class Message {
     @Prop({ type: Types.ObjectId, ref: Session.name, index: true })
-    sessionId: Types.ObjectId;
+    sessionId!: Types.ObjectId;
 
     @Prop({ required: true, enum: ['user', 'AI'] })
-    role: 'user' | 'AI';
+    role!: 'user' | 'AI';
 
     @Prop()
     content?: string;
 
     @Prop({ default: 'text' })
-    type: 'text' | 'tool' | 'data';
+    type!: 'text' | 'tool' | 'data';
 
     @Prop({ type: Object })
     profile?: any;
 
-    @Prop({ type: Object })
+    @Prop({ type: [Object], default: [] })
     tools?: ToolDto[];
 
     @Prop({ default: Date.now })
-    timestamp: Date;
+    timestamp!: Date;
 }
 
 export const MessageSchema = SchemaFactory.createForClass(Message);

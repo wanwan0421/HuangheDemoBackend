@@ -16,6 +16,14 @@ export class ChatService {
         @InjectModel(DataScanResult.name) private readonly dataScanResultModel: Model<DataScanResultDocument>,
     ) { }
 
+    private async getOwnedSession(sessionId: string, userId: string): Promise<SessionDocument> {
+        const session = await this.sessionModel.findOne({ _id: sessionId, userId }).exec();
+        if (!session) {
+            throw new HttpException('Session not found', HttpStatus.NOT_FOUND);
+        }
+        return session;
+    }
+
     // ============ SSE 代理到 Python（带 thread_id） ============
     getSystemStream(query: string, sessionId?: string): Observable<{ event?: string; data: any }> {
         return new Observable((observer) => {
@@ -86,41 +94,49 @@ export class ChatService {
     }
 
     // ============ 会话管理 ============
-    async createSession(title?: string): Promise<Session> {
-        const session = new this.sessionModel({ title: title || '新对话', messageCount: 0 });
+    async createSession(title: string | undefined, userId: string): Promise<Session> {
+        const session = new this.sessionModel({ title: title || '新对话', userId, messageCount: 0 });
         return session.save();
     }
 
-    async getSessions(limit = 50): Promise<Session[]> {
-        return this.sessionModel.find().sort({ updatedAt: -1 }).limit(limit).exec();
+    async getSessions(userId: string, limit = 50): Promise<Session[]> {
+        return this.sessionModel.find({ userId }).sort({ updatedAt: -1 }).limit(limit).exec();
     }
 
-    async getSession(sessionId: string): Promise<Session | null> {
-        return this.sessionModel.findById(sessionId).exec();
+    async getSession(sessionId: string, userId: string): Promise<Session | null> {
+        return this.sessionModel.findOne({ _id: sessionId, userId }).exec();
     }
 
-    async updateSession(sessionId: string, updates: Partial<Session>): Promise<Session | null> {
+    async updateSession(sessionId: string, updates: Partial<Session>, userId: string): Promise<Session | null> {
         return this.sessionModel
-            .findByIdAndUpdate(sessionId, { ...updates, updatedAt: new Date() }, { new: true })
+            .findOneAndUpdate({ _id: sessionId, userId }, { ...updates, updatedAt: new Date() }, { new: true })
             .exec();
     }
 
-    async deleteSession(sessionId: string): Promise<void> {
+    async deleteSession(sessionId: string, userId: string): Promise<void> {
+        await this.getOwnedSession(sessionId, userId);
         await this.messageModel.deleteMany({ sessionId: new Types.ObjectId(sessionId) }).exec();
         await this.sessionModel.findByIdAndDelete(sessionId).exec();
     }
 
     async saveMessage(
         sessionId: string,
-        role: 'user' | 'AI' | 'system',
+        role: 'user' | 'AI',
         content: string,
         tools?: any,
     ): Promise<Message> {
+        const normalizedTools = Array.isArray(tools)
+            ? tools
+            : tools
+                ? [tools]
+                : [];
+
         const message = new this.messageModel({
             sessionId: new Types.ObjectId(sessionId),
             role,
             content,
-            tools,
+            type: normalizedTools.length > 0 ? 'tool' : 'text',
+            tools: normalizedTools,
         });
 
         const saved = await message.save();
@@ -135,12 +151,33 @@ export class ChatService {
         return saved;
     }
 
-    async getMessages(sessionId: string, limit = 100): Promise<Message[]> {
-        return this.messageModel
+    async getMessages(sessionId: string, userId: string, limit = 100): Promise<Message[]> {
+        await this.getOwnedSession(sessionId, userId);
+        const messages = await this.messageModel
             .find({ sessionId: new Types.ObjectId(sessionId) })
             .sort({ timestamp: 1 })
             .limit(limit)
+            .lean()
             .exec();
+
+        return messages.map((message: any) => {
+            let normalizedTools: any[] = [];
+
+            if (Array.isArray(message.tools)) {
+                normalizedTools = message.tools;
+            } else if (message.tools && typeof message.tools === 'object') {
+                normalizedTools = message.tools.tool ? [message.tools] : Object.values(message.tools);
+            }
+
+            const content = typeof message.content === 'string' ? message.content : '';
+
+            return {
+                ...message,
+                content,
+                tools: normalizedTools,
+                type: normalizedTools.length > 0 ? 'tool' : (message.type || 'text'),
+            };
+        }) as any;
     }
 
     async getRecentMessages(sessionId: string, count = 10): Promise<Message[]> {
@@ -153,18 +190,16 @@ export class ChatService {
         return messages.reverse();
     }
 
-    async clearMessages(sessionId: string): Promise<void> {
+    async clearMessages(sessionId: string, userId: string): Promise<void> {
+        await this.getOwnedSession(sessionId, userId);
         await this.messageModel.deleteMany({ sessionId: new Types.ObjectId(sessionId) }).exec();
         await this.sessionModel
             .findByIdAndUpdate(sessionId, { messageCount: 0, lastMessage: null })
             .exec();
     }
 
-    async alignSession(sessionId: string): Promise<any> {
-        const session = await this.sessionModel.findById(sessionId).exec();
-        if (!session) {
-            throw new HttpException('Session not found', HttpStatus.NOT_FOUND);
-        }
+    async alignSession(sessionId: string, userId: string): Promise<any> {
+        const session = await this.getOwnedSession(sessionId, userId);
 
         if (!session.taskSpec || !session.modelContract) {
             throw new HttpException('Task spec or model contract is missing', HttpStatus.BAD_REQUEST);
@@ -203,7 +238,7 @@ export class ChatService {
                 alignment_status: result.alignment_status,
                 alignment_result: alignmentResult,
             };
-        } catch (error) {
+        } catch (error: any) {
             const detail = error?.response?.data?.detail || error?.message || 'Align session failed';
             const statusCode = error?.response?.status || HttpStatus.BAD_GATEWAY;
             throw new HttpException(detail, statusCode);
@@ -527,7 +562,7 @@ export class ChatService {
     }
 
     // ============ 流式对话，记忆交给 LangGraph checkpointer ============
-    streamWithMemory(sessionId: string, query: string): Observable<{ event?: string; data: any }> {
+    streamWithMemory(sessionId: string, query: string, userId: string): Observable<{ event?: string; data: any }> {
         if (!query) {
             throw new HttpException('Query is required', HttpStatus.BAD_REQUEST);
         }
@@ -539,57 +574,61 @@ export class ChatService {
             let taskSpecData: any = null;
             let modelContractData: any = null;
 
-            // 记录用户消息（可选，用于历史查看；对话记忆交由 LangGraph）
-            void this.saveMessage(sessionId, 'user', query).catch(() => undefined);
+            this.getOwnedSession(sessionId, userId).then(() => {
+                // 记录用户消息（可选，用于历史查看；对话记忆交由 LangGraph）
+                void this.saveMessage(sessionId, 'user', query).catch(() => undefined);
 
-            // 调用Python，传入sessionId作为thread_id
-            // LangGraph会根据thread_id自动加载和保存对话记忆
-            this.getSystemStream(query, sessionId).subscribe({
-                next: (event) => {
-                    observer.next(event);
-                    const payload = event.data;
-                    if (payload?.type === 'token') {
-                        aiResponse += payload.message || '';
-                    }
-                    if (payload?.tool && payload.type === 'tool_result') {
-                        tools.push(payload);
-                    }
-                    if (payload.type === 'tool_result' && payload.tool === 'get_model_details' && payload.data) {
-                        finalModelData = payload.data;
-                        this.sessionModel.findByIdAndUpdate(sessionId, {
-                            recommendedModel: {
-                                name: finalModelData.name,
-                                md5: finalModelData.md5,
-                                description: finalModelData.description,
-                                workflow: finalModelData.workflow,
-                            },
-                            updatedAt: new Date(),
-                        }).exec().then(() => console.log('Model details pre-saved.')).catch(err => console.error('Pre-save error:', err));
-                    }
-                    if (payload.type === 'task_spec_generated' && payload.data) {
-                        taskSpecData = payload.data;
-                        this.sessionModel.findByIdAndUpdate(sessionId, {
-                            taskSpec: taskSpecData,
-                            updatedAt: new Date(),
-                        }).exec().then(() => console.log('Task spec pre-saved.')).catch(err => console.error('Pre-save error:', err));
-                    }
-                    if (payload.type === 'model_contract_generated' && payload.data) {
-                        modelContractData = payload.data;
-                        this.sessionModel.findByIdAndUpdate(sessionId, {
-                            modelContract: modelContractData,
-                            updatedAt: new Date(),
-                        }).exec().then(() => console.log('Model contract pre-saved.')).catch(err => console.error('Pre-save error:', err));
-                    }
-                },
-                complete: async () => {
-                    await this.persistFinalData(sessionId, aiResponse, tools, finalModelData, taskSpecData, modelContractData);
-                    observer.complete();
-                },
-                error: async (err) => {
-                    // 即便断开了，也要把已经拿到的部分 AI 回答存入数据库
-                    await this.persistFinalData(sessionId, aiResponse, tools, finalModelData, taskSpecData, modelContractData);
-                    observer.error(err);
-                },
+                // 调用Python，传入sessionId作为thread_id
+                // LangGraph会根据thread_id自动加载和保存对话记忆
+                this.getSystemStream(query, sessionId).subscribe({
+                    next: (event) => {
+                        observer.next(event);
+                        const payload = event.data;
+                        if (payload?.type === 'token') {
+                            aiResponse += payload.message || '';
+                        }
+                        if (payload?.tool && payload.type === 'tool_result') {
+                            tools.push(payload);
+                        }
+                        if (payload.type === 'tool_result' && payload.tool === 'get_model_details' && payload.data) {
+                            finalModelData = payload.data;
+                            this.sessionModel.findByIdAndUpdate(sessionId, {
+                                recommendedModel: {
+                                    name: finalModelData.name,
+                                    md5: finalModelData.md5,
+                                    description: finalModelData.description,
+                                    workflow: finalModelData.workflow,
+                                },
+                                updatedAt: new Date(),
+                            }).exec().then(() => console.log('Model details pre-saved.')).catch(err => console.error('Pre-save error:', err));
+                        }
+                        if (payload.type === 'task_spec_generated' && payload.data) {
+                            taskSpecData = payload.data;
+                            this.sessionModel.findByIdAndUpdate(sessionId, {
+                                taskSpec: taskSpecData,
+                                updatedAt: new Date(),
+                            }).exec().then(() => console.log('Task spec pre-saved.')).catch(err => console.error('Pre-save error:', err));
+                        }
+                        if (payload.type === 'model_contract_generated' && payload.data) {
+                            modelContractData = payload.data;
+                            this.sessionModel.findByIdAndUpdate(sessionId, {
+                                modelContract: modelContractData,
+                                updatedAt: new Date(),
+                            }).exec().then(() => console.log('Model contract pre-saved.')).catch(err => console.error('Pre-save error:', err));
+                        }
+                    },
+                    complete: async () => {
+                        await this.persistFinalData(sessionId, aiResponse, tools, finalModelData, taskSpecData, modelContractData);
+                        observer.complete();
+                    },
+                    error: async (err) => {
+                        // 即便断开了，也要把已经拿到的部分 AI 回答存入数据库
+                        await this.persistFinalData(sessionId, aiResponse, tools, finalModelData, taskSpecData, modelContractData);
+                        observer.error(err);
+                    },
+                });
+            }).catch((err) => {
+                observer.error(err);
             });
         });
     }

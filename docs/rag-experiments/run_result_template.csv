@@ -1,0 +1,4 @@
+run_id,date,commit_id,strategy,embedding_model,llm_model,prompt_version,dense_topk,keyword_topk,fusion_type,fusion_param,final_topk,recall_at_5,recall_at_10,recall_at_20,mrr_at_10,ndcg_at_10,success_at_1,accuracy,faithfulness,citation_support_rate,p50_ms,p95_ms,retrieval_ms,error_rate,cost_per_1k_query,notes
+run_001,2026-04-29,abcdef1,A-NoRAG,gemini-embedding-001,gpt-5-mini,v1,,,,,10,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+run_002,2026-04-29,abcdef1,B-VectorOnly,gemini-embedding-001,gpt-5-mini,v1,50,,,,10,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+run_003,2026-04-29,abcdef1,C-Hybrid,gemini-embedding-001,gpt-5-mini,v1,50,50,RRF,k=60,10,0,0,0,0,0,0,0,0,0,0,0,0,0,0,

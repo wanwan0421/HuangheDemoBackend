@@ -7,37 +7,37 @@ export class ModelEmbedding {
     modelId?: string;
 
     @Prop({ required: true, index: true })
-    modelMd5: string;
+    modelMd5!: string;
 
     @Prop({ required: true })
-    modelName: string;
+    modelName!: string;
 
     @Prop()
-    modelDescription: string;
+    modelDescription!: string;
 
     @Prop({ index: true })
-    indicatorEnName: string;
+    indicatorEnName!: string;
 
     @Prop({ index: true })
-    indicatorCnName: string;
+    indicatorCnName!: string;
 
     @Prop({ index: true })
-    categoryEnName: string;
+    categoryEnName!: string;
 
     @Prop({ index: true })
-    categoryCnName: string;
+    categoryCnName!: string;
 
     @Prop({ index: true })
-    sphereEnName: string;
+    sphereEnName!: string;
 
     @Prop({ index: true })
-    sphereCnName: string;
+    sphereCnName!: string;
 
     @Prop({ index: true })
     embeddingSource?: string;
 
     @Prop({ type: [Number], required: true })
-    embedding: number[];
+    embedding!: number[];
 }
 
 export const ModelEmbeddingSystemSchema = SchemaFactory.createForClass(ModelEmbedding);

@@ -1,0 +1,26 @@
+{
+  "vector_only": {
+    "strategy": "vector_only",
+    "runs": 1,
+    "total_queries": 100,
+    "recall_at_10": 0.855,
+    "recall_at_20": 0.855,
+    "ndcg_at_10": 1.2248143806260232,
+    "precision_at_5": 0.21200000000000002,
+    "success_at_1": 0.71,
+    "recall_at_5": 0.805,
+    "mrr_at_10": 0.7567619047619047,
+    "precision_at_10": 0.113,
+    "avg_time_seconds": 2238.2944445610046,
+    "avg_retrieval_time_seconds": 5.511904485225678,
+    "avg_generation_time_seconds": 15.415091354846954,
+    "avg_prompt_tokens": 51.14,
+    "avg_completion_tokens": 1014.27,
+    "avg_total_tokens": 1065.41,
+    "total_prompt_tokens": 5114,
+    "total_completion_tokens": 101427,
+    "total_tokens": 106541,
+    "retrieval_success_rate": 1.0,
+    "generation_success_rate": 0.03
+  }
+}

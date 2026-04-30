@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  # Milvus向量数据库
+  milvus:
+    image: milvusdb/milvus:v0.4.13
+    container_name: milvus-standalone
+    environment:
+      COMMON_STORAGETYPE: local
+      COMMON_DEFAULTINDEXSTATE: on_disk
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    volumes:
+      - milvus-data:/var/lib/milvus
+    networks:
+      - embedding-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: milvus run standalone
+
+  # MongoDB（如果使用）
+  mongodb:
+    image: mongo:6.0
+    container_name: mongodb-embedding
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: password
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb-data:/data/db
+    networks:
+      - embedding-network
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  milvus-data:
+    driver: local
+  mongodb-data:
+    driver: local
+
+networks:
+  embedding-network:
+    driver: bridge

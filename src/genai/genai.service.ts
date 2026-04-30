@@ -35,7 +35,7 @@ export class GenAIService {
             const response = await this.client.models.embedContent({
                 model: 'gemini-embedding-001',
                 contents: texts.map(text => ({ parts: [{ text }] })),
-                config: { taskType: 'RETRIEVAL_QUERY' }
+                config: { taskType: 'RETRIEVAL_DOCUMENT' }
             });
 
             const embeddings = response.embeddings
@@ -54,7 +54,7 @@ export class GenAIService {
             const response = await this.client.models.embedContent({
                 model: 'gemini-embedding-001',
                 contents: text,
-                config: { taskType: 'RETRIEVAL_QUERY' }
+                config: { taskType: 'RETRIEVAL_DOCUMENT' }
             });
             return response.embeddings?.[0]?.values || [];
         } catch (e) {

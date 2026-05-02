@@ -9,6 +9,7 @@ from pymongo import MongoClient
 from langgraph.checkpoint.mongodb import MongoDBSaver
 from pydantic import BaseModel, Field
 from langgraph.prebuilt import InjectedState
+from langchain_core.messages import AIMessage
 
 # 连接配置
 MONGO_URI = "mongodb://localhost:27017/"
@@ -188,6 +189,16 @@ def recommend_model_node(state: ModelState) -> Dict[str, Any]:
     如果需要调用工具，则返回工具调用指令
     """
     # 加入SystemMessage以约束模型行为（同时生成 Task Spec 与模型推荐）
+
+    tool_results = state.get("tool_results", {}) or {}
+    relevant_models = (tool_results.get("search_relevant_models", {}) or {}).get("models", []) or []
+    search_status = (tool_results.get("search_relevant_models", {}) or {}).get("status")
+
+    if search_status == "error" or (search_status == "success" and len(relevant_models) == 0):
+        return {
+            "messages": [AIMessage(content="未检索到可用的候选模型，请检查 Milvus 里的模型向量数据、collection schema 或输入查询。")],
+        }
+
     system = SystemMessage(content=f"""
         # Role
         你是一位资深的地理建模专家，擅长根据复杂的时空需求匹配最合适的数值模型或机器学习模型。
@@ -214,6 +225,10 @@ def recommend_model_node(state: ModelState) -> Dict[str, Any]:
         # Output Guide
         - 如果信息不足：请向用户提问或继续调用工具。
         - 如果找到匹配：请清晰说明推荐理由、模型的优势及局限性。
+
+        # Hard Constraint
+        - 只有在工具返回了真实候选模型后，才允许输出最终推荐。
+        - 如果候选池为空，必须直接结束，不得自行猜测或编造模型。
         """)
     messages = [system] + state["messages"]
 

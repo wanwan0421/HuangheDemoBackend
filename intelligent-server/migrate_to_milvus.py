@@ -36,19 +36,13 @@ from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
 
 # Milvus
+from pymilvus import connections, Collection, FieldSchema, CollectionSchema, DataType, utility
+
 try:
-    from pymilvus import (
-        connections,
-        Collection,
-        FieldSchema,
-        CollectionSchema,
-        DataType,
-        utility
-    )
+    from pymilvus import Function, FunctionType
     MILVUS_AVAILABLE = True
-except ImportError:
+except:
     MILVUS_AVAILABLE = False
-    logger.warning("⚠️  Milvus SDK not installed. Install with: pip install pymilvus")
 
 # GenAI - 通过HTTP调用NestJS服务
 import httpx
@@ -77,14 +71,14 @@ class MongoDBConnector:
     
     def get_embeddings_collection(self):
         """获取embeddings集合"""
-        if not self.db:
+        if self.db is None:
             return None
         return self.db['modelembeddings']
     
     def read_all_embeddings(self) -> List[Dict[str, Any]]:
         """读取所有embedding文档"""
         collection = self.get_embeddings_collection()
-        if not collection:
+        if collection is None:
             return []
         
         try:
@@ -126,7 +120,10 @@ class EmbeddingGenerator:
             
             if response.status_code == 200:
                 result = response.json()
-                return result.get("embeddings", [])
+                embeddings = result.get("embeddings", [])
+                if not embeddings:
+                    logger.warning(f"⚠️  GenAI返回空embeddings，原始响应: {result}")
+                return embeddings
             else:
                 logger.error(f"❌ GenAI服务返回错误: {response.status_code} - {response.text}")
                 return []
@@ -156,33 +153,43 @@ class EmbeddingGenerator:
         
         # 批量生成embedding
         new_docs = [doc.copy() for doc in docs]  # 复制一份，保留原有元数据
-        
-        embeddings_batch_list = []
-        for batch_start in tqdm(range(0, len(texts_to_embed), self.batch_size), 
+        regenerated_count = 0
+        kept_original_count = 0
+
+        for batch_start in tqdm(range(0, len(texts_to_embed), self.batch_size),
                                 desc="生成embedding"):
             batch_end = min(batch_start + self.batch_size, len(texts_to_embed))
             batch_texts = texts_to_embed[batch_start:batch_end]
+            batch_doc_indices = doc_indices[batch_start:batch_end]
             
             embeddings = await self.generate_embeddings_batch(batch_texts)
-            
-            if not embeddings:
-                logger.warning(f"⚠️  批次 {batch_start}-{batch_end} 生成失败，跳过")
-                embeddings = [[0.0] * 1536 for _ in batch_texts]  # 默认维度
-            
-            embeddings_batch_list.extend(embeddings)
+
+            if not embeddings or len(embeddings) != len(batch_texts):
+                logger.warning(
+                    f"⚠️  批次 {batch_start}-{batch_end} 生成失败，保留MongoDB原向量"
+                )
+                kept_original_count += len(batch_texts)
+            else:
+                for i, doc_idx in enumerate(batch_doc_indices):
+                    vec = embeddings[i]
+                    if isinstance(vec, list) and len(vec) == 3072:
+                        new_docs[doc_idx]['embedding'] = vec
+                        new_docs[doc_idx]['embeddingSource'] = 'RETRIEVAL_DOCUMENT'
+                        new_docs[doc_idx]['regeneratedAt'] = time.time()
+                        regenerated_count += 1
+                    else:
+                        kept_original_count += 1
+                        logger.warning(
+                            f"⚠️  文档索引 {doc_idx} 新向量维度异常，保留MongoDB原向量"
+                        )
             
             # 延迟，避免API限制
             if batch_end < len(texts_to_embed):
                 await asyncio.sleep(self.delay_per_batch)
-        
-        # 将新embedding更新到文档
-        for i, doc_idx in enumerate(doc_indices):
-            if i < len(embeddings_batch_list):
-                new_docs[doc_idx]['embedding'] = embeddings_batch_list[i]
-                new_docs[doc_idx]['embeddingSource'] = 'RETRIEVAL_DOCUMENT'
-                new_docs[doc_idx]['regeneratedAt'] = time.time()
-        
-        logger.info(f"✅ 成功生成 {len(embeddings_batch_list)} 条新embedding")
+
+        logger.info(
+            f"✅ embedding处理完成: 新生成 {regenerated_count} 条, 保留原向量 {kept_original_count} 条"
+        )
         
         return new_docs
     
@@ -197,7 +204,7 @@ class MilvusConnector:
     def __init__(self, 
                  host: str = "localhost",
                  port: int = 19530,
-                 collection_name: str = "model_embeddings"):
+                 collection_name: str = "modelembeddings"):
         self.host = host
         self.port = port
         self.collection_name = collection_name
@@ -239,6 +246,11 @@ class MilvusConnector:
                     auto_id=True
                 ),
                 FieldSchema(
+                    name="modelId",
+                    dtype=DataType.VARCHAR,
+                    max_length=255
+                ),
+                FieldSchema(
                     name="modelMd5",
                     dtype=DataType.VARCHAR,
                     max_length=255
@@ -254,52 +266,47 @@ class MilvusConnector:
                     max_length=8192
                 ),
                 FieldSchema(
-                    name="indicatorEnName",
+                    name="modelText",
                     dtype=DataType.VARCHAR,
-                    max_length=1024,
-                    nullable=True
+                    max_length=16384,
+                    enable_analyzer=True,
+                    enable_match=True,
+                    analyzer_params={
+                        "type": "chinese",
+                    },
                 ),
                 FieldSchema(
-                    name="indicatorCnName",
+                    name="embeddingSource",
                     dtype=DataType.VARCHAR,
-                    max_length=1024,
-                    nullable=True
-                ),
-                FieldSchema(
-                    name="categoryEnName",
-                    dtype=DataType.VARCHAR,
-                    max_length=1024,
-                    nullable=True
-                ),
-                FieldSchema(
-                    name="categoryCnName",
-                    dtype=DataType.VARCHAR,
-                    max_length=1024,
-                    nullable=True
-                ),
-                FieldSchema(
-                    name="sphereEnName",
-                    dtype=DataType.VARCHAR,
-                    max_length=1024,
-                    nullable=True
-                ),
-                FieldSchema(
-                    name="sphereCnName",
-                    dtype=DataType.VARCHAR,
-                    max_length=1024,
-                    nullable=True
+                    max_length=255
                 ),
                 FieldSchema(
                     name="embedding",
                     dtype=DataType.FLOAT_VECTOR,
-                    dim=1536  # Google Gemini embedding维度
+                    dim=3072  # Google Gemini embedding维度
+                ),
+                FieldSchema(
+                    name="sparse",
+                    dtype=DataType.SPARSE_FLOAT_VECTOR,
+                    is_function_output=True,
+                )
+            ]
+
+            functions = [
+                Function(
+                    name="model_text_bm25",
+                    function_type=FunctionType.BM25,
+                    input_field_names=["modelText"],
+                    output_field_names=["sparse"],
+                    params={},
                 )
             ]
             
             # 创建集合
             schema = CollectionSchema(
                 fields=fields,
-                description="Model embeddings for RAG retrieval"
+                description="Model embeddings for RAG retrieval",
+                functions=functions,
             )
             
             self.collection = Collection(
@@ -316,45 +323,101 @@ class MilvusConnector:
     
     def insert_documents(self, docs: List[Dict[str, Any]]) -> bool:
         """向Milvus插入文档"""
-        if not self.collection:
+        if self.collection is None:
             logger.error("❌ 集合未初始化")
             return False
         
         try:
-            # 准备插入数据
-            data = {
-                "modelMd5": [],
-                "modelName": [],
-                "modelDescription": [],
-                "indicatorEnName": [],
-                "indicatorCnName": [],
-                "categoryEnName": [],
-                "categoryCnName": [],
-                "sphereEnName": [],
-                "sphereCnName": [],
-                "embedding": []
-            }
-            
+            existing_md5_set = set()
+
+            existing_indexes = list(getattr(self.collection, "indexes", []) or [])
+
+            has_embedding_index = any(
+                getattr(index, "field_name", "") == "embedding"
+                for index in existing_indexes
+            )
+
+            if has_embedding_index:
+                try:
+                    self.collection.load()
+
+                    batch_size = 16000
+                    offset = 0
+
+                    while True:
+                        existing_rows = self.collection.query(
+                            expr='modelMd5 != ""',
+                            output_fields=["modelMd5"],
+                            offset=offset,
+                            limit=batch_size
+                        )
+
+                        if not existing_rows:
+                            break
+
+                        existing_md5_set.update(
+                            str(row.get("modelMd5", ""))
+                            for row in existing_rows
+                            if row.get("modelMd5")
+                        )
+
+                        offset += batch_size
+
+                    logger.info(
+                        f"ℹ️  已存在 {len(existing_md5_set)} 条 modelMd5，将执行增量迁移"
+                    )
+
+                except Exception as query_err:
+                    logger.warning(
+                        f"⚠️  增量检查失败，继续执行: {type(query_err).__name__}"
+                    )
+            else:
+                logger.info("ℹ️  新集合无索引，跳过增量检查")
+
+            seen_in_batch = set()
+
+            # 准备插入数据（行式写法）
+            rows = []
+
             for doc in docs:
-                data["modelMd5"].append(doc.get("modelMd5", ""))
-                data["modelName"].append(doc.get("modelName", ""))
-                data["modelDescription"].append(doc.get("modelDescription", ""))
-                data["indicatorEnName"].append(doc.get("indicatorEnName", "") or "")
-                data["indicatorCnName"].append(doc.get("indicatorCnName", "") or "")
-                data["categoryEnName"].append(doc.get("categoryEnName", "") or "")
-                data["categoryCnName"].append(doc.get("categoryCnName", "") or "")
-                data["sphereEnName"].append(doc.get("sphereEnName", "") or "")
-                data["sphereCnName"].append(doc.get("sphereCnName", "") or "")
-                
+                model_md5 = str(doc.get("modelMd5", "") or "")
+                if model_md5:
+                    if model_md5 in existing_md5_set:
+                        continue
+                    if model_md5 in seen_in_batch:
+                        continue
+                    seen_in_batch.add(model_md5)
+
                 embedding = doc.get("embedding", [])
-                if isinstance(embedding, list) and len(embedding) == 1536:
-                    data["embedding"].append(embedding)
+                if isinstance(embedding, list) and len(embedding) == 3072:
+                    vector = embedding
                 else:
                     # 如果embedding维度不对，使用零向量
-                    data["embedding"].append([0.0] * 1536)
+                    logger.warning(f"⚠️  跳过非法向量: {model_md5}")
+                    continue
+
+                model_name = doc.get("modelName", "") or ""
+                model_description = doc.get("modelDescription", "") or ""
+                model_text = doc.get("modelText")
+                if not model_text:
+                    model_text = f"model_name: {model_name}. model_description: {model_description}"
+
+                rows.append({
+                    "modelId": str(doc.get("modelId", "")),
+                    "modelMd5": model_md5,
+                    "modelName": model_name,
+                    "modelDescription": model_description,
+                    "modelText": model_text,
+                    "embeddingSource": doc.get("embeddingSource", "") or "",
+                    "embedding": vector,
+                })
+
+            if not rows:
+                logger.info("✅ 无新增数据需要写入Milvus")
+                return True
             
             # 批量插入
-            mr = self.collection.insert(data)
+            mr = self.collection.insert(rows)
             self.collection.flush()
             
             logger.info(f"✅ 成功插入 {mr.insert_count} 条数据到Milvus")
@@ -366,38 +429,70 @@ class MilvusConnector:
     
     def create_index(self) -> bool:
         """创建索引"""
-        if not self.collection:
+        if self.collection is None:
             logger.error("❌ 集合未初始化")
             return False
         
         try:
-            # 检查是否已有索引
-            if self.collection.has_index():
-                logger.info("✅ 索引已存在")
+            # 兼容已有多索引场景（如 embedding + sparse）
+            existing_indexes = list(getattr(self.collection, "indexes", []) or [])
+            existing_fields = {getattr(index, "field_name", "") for index in existing_indexes}
+
+            if {"embedding", "sparse"}.issubset(existing_fields):
+                logger.info("✅ embedding索引和sparse索引都已存在")
                 return True
-            
-            # 创建HNSW索引
-            index_params = {
-                "index_type": "HNSW",
-                "metric_type": "COSINE",
-                "params": {"M": 8, "efConstruction": 200}
-            }
-            
-            self.collection.create_index(
-                field_name="embedding",
-                index_params=index_params
-            )
-            
-            logger.info("✅ 成功创建向量索引")
+
+            if "embedding" not in existing_fields:
+                embedding_index_params = {
+                    "index_type": "HNSW",
+                    "metric_type": "COSINE",
+                    "params": {"M": 8, "efConstruction": 200},
+                }
+                self.collection.create_index(
+                    field_name="embedding",
+                    index_params=embedding_index_params
+                )
+                logger.info("✅ 成功创建embedding索引")
+
+            if "sparse" not in existing_fields:
+                sparse_index_params = {
+                    "index_type": "SPARSE_INVERTED_INDEX",
+                    "metric_type": "BM25",
+                    "params": {},
+                }
+                self.collection.create_index(
+                    field_name="sparse",
+                    index_params=sparse_index_params
+                )
+                logger.info("✅ 成功创建sparse索引")
+
+            try:
+                self.collection.load()
+            except Exception:
+                pass
+
             return True
             
         except Exception as e:
             logger.error(f"❌ 创建索引失败: {e}")
             return False
     
+    def load_collection(self):
+        """加载集合到内存"""
+        if self.collection is None:
+            return False
+
+        try:
+            self.collection.load()
+            logger.info("✅ 集合已加载")
+            return True
+        except Exception as e:
+            logger.error(f"❌ 加载集合失败: {e}")
+            return False
+
     def verify_data(self) -> Dict[str, Any]:
         """验证数据"""
-        if not self.collection:
+        if self.collection is None:
             logger.error("❌ 集合未初始化")
             return {}
         
@@ -409,7 +504,7 @@ class MilvusConnector:
             # 获取样本数据
             result = self.collection.query(
                 expr="",
-                output_fields=["modelMd5", "modelName", "embedding"],
+                output_fields=["modelId", "modelMd5", "modelName", "modelDescription", "modelText", "embeddingSource", "embedding"],
                 limit=3
             )
             
@@ -430,6 +525,37 @@ class MilvusConnector:
         except Exception as e:
             logger.error(f"❌ 关闭连接失败: {e}")
 
+
+def reset_milvus(milvus_host: str, milvus_port: int, collection_name: str = "modelembeddings"):
+    """重置Milvus集合（删除后重建）"""
+    logger.info("=" * 60)
+    logger.info("🔄 开始重置Milvus集合")
+    logger.info("=" * 60)
+    
+    milvus = MilvusConnector(host=milvus_host, port=milvus_port)
+    if not milvus.connect():
+        return
+    
+    try:
+        # 释放集合
+        if utility.has_collection(collection_name):
+            try:
+                connections.get_connection(alias="default").release_collection(
+                    collection_name=collection_name
+                )
+                logger.info(f"✅ 已释放集合: {collection_name}")
+            except:
+                pass
+            
+            # 删除集合
+            utility.drop_collection(collection_name)
+            logger.info(f"✅ 已删除集合: {collection_name}")
+        
+        logger.info("✅ Milvus集合重置完成")
+    except Exception as e:
+        logger.error(f"❌ 重置集合失败: {e}")
+    finally:
+        milvus.close()
 
 async def migrate_full(mongodb_uri: str, genai_url: str, milvus_host: str, milvus_port: int):
     """完整迁移：重新生成向量并迁移到Milvus"""
@@ -466,12 +592,14 @@ async def migrate_full(mongodb_uri: str, genai_url: str, milvus_host: str, milvu
         milvus.close()
         return
     
+    if not milvus.create_index():
+        logger.warning("⚠️  索引创建失败，但数据已插入")
+    
     if not milvus.insert_documents(docs):
         milvus.close()
         return
     
-    if not milvus.create_index():
-        logger.warning("⚠️  索引创建失败，但数据已插入")
+    milvus.load_collection()
     
     # 验证
     verification = milvus.verify_data()
@@ -544,8 +672,8 @@ def main():
     parser = argparse.ArgumentParser(description="MongoDB Embedding迁移到Milvus")
     parser.add_argument(
         "--mode",
-        choices=["full", "migrate-only", "verify"],
-        default="full",
+        choices=["full", "migrate-only", "verify", "reset"],
+        default="migrate-only",
         help="迁移模式"
     )
     parser.add_argument(
@@ -574,6 +702,11 @@ def main():
         default=19530,
         help="Milvus服务器端口"
     )
+    parser.add_argument(
+        "--reset-collection",
+        action="store_true",
+        help="在迁移前重置Milvus集合（删除所有现有数据）"
+    )
     
     args = parser.parse_args()
     
@@ -583,6 +716,14 @@ def main():
     logger.info(f"  - Milvus: {args.milvus_host}:{args.milvus_port}")
     if args.mode == "full":
         logger.info(f"  - GenAI服务: {args.genai_url}")
+    if args.reset_collection:
+        logger.info(f"  - 将重置Milvus集合")
+    
+    if args.reset_collection:
+        reset_milvus(
+            milvus_host=args.milvus_host,
+            milvus_port=args.milvus_port
+        )
     
     if args.mode == "full":
         asyncio.run(migrate_full(
@@ -599,6 +740,11 @@ def main():
         )
     elif args.mode == "verify":
         verify_milvus(
+            milvus_host=args.milvus_host,
+            milvus_port=args.milvus_port
+        )
+    elif args.mode == "reset":
+        reset_milvus(
             milvus_host=args.milvus_host,
             milvus_port=args.milvus_port
         )

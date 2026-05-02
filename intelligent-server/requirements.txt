@@ -1,30 +1,31 @@
-# 三角匹配系统依赖
+# Core dependencies
 
-# Web框架
+# Web framework
 fastapi>=0.104.0
 uvicorn>=0.24.0
 
-# LangGraph 和 LangChain
+# LangGraph and LangChain
 langgraph>=0.0.40
 langchain>=0.1.0
 langchain-google-genai>=1.0.0
 google-generativeai>=0.3.0
 
-# 地理空间数据处理
+# Geospatial processing
 rasterio>=1.3.0
 geopandas>=0.14.0
 xarray>=2023.0.0
 h5py>=3.10.0
 pyproj>=3.6.0
 
-# 数据处理
+# Data processing
 pandas>=2.0.0
 numpy>=1.24.0
 
-# 数据库
+# Database
 pymongo>=4.6.0
+pymilvus>=2.5.0
 
-# 工具
+# Utilities
 python-dotenv>=1.0.0
 pydantic>=2.0.0
 requests>=2.31.0

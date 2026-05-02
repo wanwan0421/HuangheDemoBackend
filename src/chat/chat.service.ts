@@ -39,6 +39,24 @@ export class ChatService {
                         observer.next({ data: { type: 'heartbeat', message: 'keep-alive' } });
                     }, 20000);
 
+                    const sanitizeEventData = (data: any) => {
+                        if (!data || typeof data !== 'object') {
+                            return data;
+                        }
+
+                        const visibleTypes = new Set(['token', 'error', 'final']);
+                        if (visibleTypes.has(data.type)) {
+                            return data;
+                        }
+
+                        const { message, ...rest } = data;
+                        if (message !== undefined) {
+                            return { ...rest, detail: message };
+                        }
+
+                        return rest;
+                    };
+
                     response.data.on('data', (chunk: Buffer) => {
                         buffer += chunk.toString();
                         while (true) {
@@ -67,7 +85,7 @@ export class ChatService {
                             if (dataLines.length) {
                                 const jsonStr = dataLines.join('\n');
                                 try {
-                                    const data = JSON.parse(jsonStr);
+                                    const data = sanitizeEventData(JSON.parse(jsonStr));
                                     observer.next(eventName ? { event: eventName, data } : { data });
                                 } catch (err) {
                                     console.warn('SSE JSON parse error:', err);
@@ -582,8 +600,12 @@ export class ChatService {
                 // LangGraph会根据thread_id自动加载和保存对话记忆
                 this.getSystemStream(query, sessionId).subscribe({
                     next: (event) => {
-                        observer.next(event);
                         const payload = event.data;
+                        if (payload?.type === 'heartbeat') {
+                            return;
+                        }
+
+                        observer.next(event);
                         if (payload?.type === 'token') {
                             aiResponse += payload.message || '';
                         }

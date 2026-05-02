@@ -1,4 +1,5 @@
 import os
+import logging
 from typing import List, Dict, Any, Optional, Annotated
 from langchain.tools import tool
 from langchain_openai import OpenAIEmbeddings,ChatOpenAI
@@ -7,11 +8,19 @@ from langchain.chat_models import init_chat_model
 from langchain_core.embeddings import Embeddings
 from langchain.messages import HumanMessage
 from pymongo import MongoClient
+from pymilvus import connections, Collection, AnnSearchRequest, WeightedRanker
 import math
 from dotenv import load_dotenv
 from google import genai
 from langgraph.prebuilt import InjectedState
 from openai import OpenAI
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 # 初始化模型
 load_dotenv()
@@ -35,9 +44,14 @@ recommendation_model = ChatOpenAI(
 # 连接配置
 MONGO_URI = "mongodb://localhost:27017/"
 DB_NAME = "huanghe-demo"
+MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
+MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
+MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION", "modelembeddings")
 
 # MongoDB连接池
 _db_client = None
+_milvus_collection = None
+logger = logging.getLogger(__name__)
 
 def _latest_user_query_from_state(state: Optional[Dict[str, Any]]) -> str:
     if not state:
@@ -96,6 +110,164 @@ def get_db():
         _db_client = MongoClient(MONGO_URI)
     return _db_client[DB_NAME]
 
+def get_milvus_collection():
+    """获取 Milvus collection 连接"""
+    global _milvus_collection
+    if _milvus_collection is None:
+        connections.connect(alias="default", host=MILVUS_HOST, port=MILVUS_PORT)
+        _milvus_collection = Collection(MILVUS_COLLECTION)
+        _milvus_collection.load()
+    return _milvus_collection
+
+def _collection_has_sparse_field(collection: Collection) -> bool:
+    try:
+        schema = getattr(collection, "schema", None)
+        fields = getattr(schema, "fields", None) or []
+        for field in fields:
+            if getattr(field, "name", "") == "sparse":
+                return True
+        return False
+    except Exception:
+        return False
+
+def _safe_hit_value(hit: Any, field_name: str) -> Any:
+    if isinstance(hit, dict):
+        return hit.get(field_name)
+
+    if hasattr(hit, "get"):
+        try:
+            return hit.get(field_name)
+        except Exception:
+            pass
+
+    entity = getattr(hit, "entity", None)
+    if entity is not None:
+        try:
+            return entity.get(field_name)
+        except Exception:
+            pass
+
+    return getattr(hit, field_name, None)
+
+def _make_weighted_ranker():
+    """创建一个 WeightedRanker，兼容不同版本的 pymilvus"""
+    try:
+        return WeightedRanker(0.65, 0.35)
+    except TypeError:
+        return WeightedRanker([0.65, 0.35])
+
+def _extract_hybrid_hits(search_result: Any) -> List[Any]:
+    candidates: List[Any] = []
+
+    if isinstance(search_result, dict):
+        candidates.extend([search_result.get("results"), search_result.get("data")])
+    else:
+        candidates.append(getattr(search_result, "results", None))
+        candidates.append(getattr(search_result, "data", None))
+        candidates.append(search_result)
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if isinstance(candidate, list):
+            if len(candidate) > 0 and isinstance(candidate[0], list):
+                return candidate[0]
+            return candidate
+
+        if hasattr(candidate, "__iter__") and not isinstance(candidate, (str, bytes, dict)):
+            try:
+                items = list(candidate)
+                if len(items) > 0 and isinstance(items[0], list):
+                    return items[0]
+                if items:
+                    return items
+            except Exception:
+                continue
+
+    return []
+
+def _milvus_vector_search(query_vector: List[float], top_k: int) -> List[Dict[str, Any]]:
+    try:
+        collection = get_milvus_collection()
+        search_result = collection.search(
+            data=[query_vector],
+            anns_field="embedding",
+            param={"metric_type": "COSINE", "params": {"ef": 128}},
+            limit=top_k,
+            output_fields=["modelId", "modelMd5", "modelName", "modelDescription", "embeddingSource"],
+        )
+
+        rows = _extract_hybrid_hits(search_result)
+        vector_results: List[Dict[str, Any]] = []
+        for rank, hit in enumerate(rows, start=1):
+            vector_results.append({
+                "modelId": _safe_hit_value(hit, "modelId"),
+                "modelMd5": _safe_hit_value(hit, "modelMd5"),
+                "modelName": _safe_hit_value(hit, "modelName"),
+                "modelDescription": _safe_hit_value(hit, "modelDescription"),
+                "embeddingSource": _safe_hit_value(hit, "embeddingSource"),
+                "score": float(getattr(hit, "score", 0.0) or 0.0),
+                "rank": rank,
+            })
+
+        return vector_results
+    except Exception:
+        logger.exception("Milvus vector fallback search failed")
+        return []
+
+def _milvus_hybrid_search(query_text: str, query_vector: List[float], top_k: int) -> List[Dict[str, Any]]:
+    """在 Milvus 中执行语义 + 关键词混合检索，并返回格式化结果"""
+    try:
+        print("ENTER HYBRID SEARCH")
+        collection = get_milvus_collection()
+        if not _collection_has_sparse_field(collection):
+            logger.info("Milvus collection does not have sparse field; using vector-only search")
+            return _milvus_vector_search(query_vector, top_k)
+
+        search_limit = max(top_k, 10)
+        semantic_request = AnnSearchRequest(
+            data=[query_vector],
+            anns_field="embedding",
+            param={"metric_type": "COSINE", "params": {"ef": 128}},
+            limit=search_limit,
+        )
+        keyword_request = AnnSearchRequest(
+            data=[query_text],
+            anns_field="sparse",
+            param={"metric_type": "BM25", "params": {}},
+            limit=search_limit,
+        )
+        results = collection.hybrid_search(
+            [semantic_request, keyword_request],
+            _make_weighted_ranker(),
+            limit=top_k,
+            output_fields=["modelId", "modelMd5", "modelName", "modelDescription", "embeddingSource"],
+        )
+        print(f"Milvus hybrid search raw results: {results}")
+        logger.info(results)
+
+        hits = _extract_hybrid_hits(results)
+        hybrid_results: List[Dict[str, Any]] = []
+        for rank, hit in enumerate(hits, start=1):
+            hybrid_results.append({
+                "modelId": _safe_hit_value(hit, "modelId"),
+                "modelMd5": _safe_hit_value(hit, "modelMd5"),
+                "modelName": _safe_hit_value(hit, "modelName"),
+                "modelDescription": _safe_hit_value(hit, "modelDescription"),
+                "embeddingSource": _safe_hit_value(hit, "embeddingSource"),
+                "score": float(getattr(hit, "score", 0.0) or 0.0),
+                "rank": rank,
+            })
+
+        if not hybrid_results:
+            logger.warning("Milvus hybrid search returned no hits; falling back to vector-only search")
+            return _milvus_vector_search(query_vector, top_k)
+
+        return hybrid_results
+    except Exception:
+        logger.exception("Milvus hybrid search failed; falling back to vector-only search")
+        return _milvus_vector_search(query_vector, top_k)
+
 def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     """计算两个向量的余弦相似度"""
     if not vec1 or not vec2 or len(vec1) != len(vec2):
@@ -117,8 +289,7 @@ def search_relevant_models(
     state: Annotated[Dict[str, Any], InjectedState] = None,
 ) -> Dict[str, Any]:
     """
-    根据用户查询文本，从所有模型中找出最相关的10个模型。
-    计算余弦相似度，返回最相关的模型MD5和相似度分数。
+    使用 Milvus 语义检索 + Milvus 关键词检索（BM25）混合检索。
     Args:
         user_query_text: 用户查询文本
         top_k: 返回的最相关模型数（默认 10）
@@ -140,31 +311,15 @@ def search_relevant_models(
             model="gemini-embedding-001",
             input=user_query_text
         ).data[0].embedding
-        # query_vector = client.models.embed_content(
-        #     model="gemini-embedding-001",
-        #     contents=user_query_text
-        # ).embeddings[0].values
 
-        db = get_db()
-        model_embeddings_collection = db["modelembeddings"]
-
-        # 查询所有模型embedding
-        all_models = list(model_embeddings_collection.find({}))
-
-        # 计算相似度并排序
-        scored_models = []
-        for model in all_models:
-            if model.get("embedding") and len(model.get("embedding", [])) > 0:
-                score = cosine_similarity(query_vector, model["embedding"])
-                scored_models.append({
-                    "modelMd5": model.get("modelMd5"),
-                    "modelName": model.get("modelName"),
-                    "score": score
-                })
-
-        # 按相似度排序并取前top_k
-        scored_models.sort(key=lambda x: x["score"], reverse=True)
-        result = scored_models[:top_k]
+        result = _milvus_hybrid_search(user_query_text, query_vector, top_k)
+        if not result:
+            return {
+                "status": "error",
+                "message": "Milvus 混合检索未返回结果，请检查 collection、索引、embeddingSource 或 query 向量。",
+                "models": [],
+                "count": 0,
+            }
         
         return {
             "status": "success",

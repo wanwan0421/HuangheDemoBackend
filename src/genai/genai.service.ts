@@ -38,10 +38,13 @@ export class GenAIService {
                 config: { taskType: 'RETRIEVAL_DOCUMENT' }
             });
 
+            console.log('[GenAI] embedContent response:', JSON.stringify(response, null, 2));
+
             const embeddings = response.embeddings
                 ? response.embeddings.map(e => e.values).filter((v): v is number[] => !!v)
                 : [];
 
+            console.log('[GenAI] Extracted embeddings count:', embeddings.length);
             return embeddings;
         } catch (e) {
             console.error('Embedding error', e);

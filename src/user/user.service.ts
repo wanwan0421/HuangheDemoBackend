@@ -116,19 +116,31 @@ export class UserService {
   }
 
   async addFavoriteModel(payload: any, userId?: string, req?: Request) {
-    const doc = await this.getUser(userId, req);
+    const resolvedUserId = await this.resolveUserId(userId, req);
     const next = this.normalizeObject(payload, 'model');
     const name = this.getName(next, 'model');
 
-    const current = ((doc as any).favoriteModels || []) as Record<string, any>[];
-    const exists = current.some((item) => this.getName(item) === name);
-    if (!exists) {
-      current.push({ ...next, name, createdAt: new Date().toISOString() });
-      (doc as any).favoriteModels = current;
-      await doc.save();
+    const item = { ...next, name, createdAt: new Date().toISOString() };
+    const updated = await this.userModel
+      .findOneAndUpdate(
+        {
+          _id: resolvedUserId,
+          favoriteModels: { $not: { $elemMatch: { name } } },
+        },
+        { $push: { favoriteModels: item } },
+        { new: true },
+      )
+      .exec();
+
+    if (updated) {
+      return ((updated as any).favoriteModels || []) as Record<string, any>[];
     }
 
-    return (doc as any).favoriteModels || [];
+    const doc = await this.userModel.findById(resolvedUserId).exec();
+    if (!doc) {
+      throw new NotFoundException('用户不存在');
+    }
+    return ((doc as any).favoriteModels || []) as Record<string, any>[];
   }
 
   async removeFavoriteModel(name: string, userId?: string, req?: Request) {
@@ -147,19 +159,31 @@ export class UserService {
   }
 
   async addFavoriteData(payload: any, userId?: string, req?: Request) {
-    const doc = await this.getUser(userId, req);
+    const resolvedUserId = await this.resolveUserId(userId, req);
     const next = this.normalizeObject(payload, 'data');
     const name = this.getName(next, 'data');
 
-    const current = ((doc as any).favoriteData || []) as Record<string, any>[];
-    const exists = current.some((item) => this.getName(item) === name);
-    if (!exists) {
-      current.push({ ...next, name, createdAt: new Date().toISOString() });
-      (doc as any).favoriteData = current;
-      await doc.save();
+    const item = { ...next, name, createdAt: new Date().toISOString() };
+    const updated = await this.userModel
+      .findOneAndUpdate(
+        {
+          _id: resolvedUserId,
+          favoriteData: { $not: { $elemMatch: { name } } },
+        },
+        { $push: { favoriteData: item } },
+        { new: true },
+      )
+      .exec();
+
+    if (updated) {
+      return ((updated as any).favoriteData || []) as Record<string, any>[];
     }
 
-    return (doc as any).favoriteData || [];
+    const doc = await this.userModel.findById(resolvedUserId).exec();
+    if (!doc) {
+      throw new NotFoundException('用户不存在');
+    }
+    return ((doc as any).favoriteData || []) as Record<string, any>[];
   }
 
   async removeFavoriteData(name: string, userId?: string, req?: Request) {
@@ -178,18 +202,26 @@ export class UserService {
   }
 
   async addSimulationResult(payload: any, userId?: string, req?: Request) {
-    const doc = await this.getUser(userId, req);
+    const resolvedUserId = await this.resolveUserId(userId, req);
     const next = this.normalizeObject(payload, 'simulation-result');
-
-    const current = ((doc as any).simulationResults || []) as Record<string, any>[];
-    current.push({
+    const item = {
       ...next,
       id: next.id || randomUUID(),
       createdAt: next.createdAt || new Date().toISOString(),
-    });
-    (doc as any).simulationResults = current;
+    };
 
-    await doc.save();
-    return (doc as any).simulationResults || [];
+    const updated = await this.userModel
+      .findByIdAndUpdate(
+        resolvedUserId,
+        { $push: { simulationResults: item } },
+        { new: true },
+      )
+      .exec();
+
+    if (!updated) {
+      throw new NotFoundException('用户不存在');
+    }
+
+    return ((updated as any).simulationResults || []) as Record<string, any>[];
   }
 }

@@ -39,8 +39,6 @@ export class ModelRunnerService {
     if (!fs.existsSync(this.driverScriptsPath)) {
       this.logger.warn(`警告: Python驱动脚本未找到，请确保文件存在于: ${this.driverScriptsPath}`);
     }
-
-    this.logger.log(`ModelRunner Python解释器: ${this.pythonExe}`);
   }
 
   /**

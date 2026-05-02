@@ -1,11 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model, Document } from 'mongoose';
+import { Model } from 'mongoose';
 import { ConfigService } from '@nestjs/config';
 import { plainToInstance } from 'class-transformer';
 import { ModelResource, ResourceType } from './schemas/modelResource.schema';
-import { ModelEmbedding } from '../index/schemas/modelEmbedding.schema';
 import { Md5Item, OnePageMd5Result, PortalMd5Data } from './interfaces/portalSync.interface';
 import { firstValueFrom } from 'rxjs';
 import { ModelItemDataDto } from './dto/modelItemData.dto';
@@ -16,6 +15,7 @@ import { ModelItemEventDataNodeDto } from './dto/modelItemEventDataNode.dto';
 import { ModelItemEventDto } from './dto/modelItemEvent.dto';
 import { ModelItemParamDto } from './dto/modelResourceIO.dto';
 import { GenAIService } from 'src/genai/genai.service';
+import { MilvusService } from 'src/genai/milvus.service';
 import { Cron, CronExpression } from '@nestjs/schedule';
 
 @Injectable()
@@ -32,25 +32,14 @@ export class ResourceService {
                 private readonly configService: ConfigService,
                 private readonly modelUtilsService: ModelUtilsService,
                 private readonly genAIService: GenAIService,
+                private readonly milvusService: MilvusService,
                 @InjectModel(ModelResource.name)
                 private modelResourceModel: Model<ModelResource>,
-                @InjectModel(ModelEmbedding.name)
-                private ModelEmbeddingModel: Model<ModelEmbedding & Document>,
     ) {
         this.portalLocation = this.configService.get<string>('portalLocation')!;
         this.portalToken = this.configService.get<string>('portalToken')!;
         this.dataServerLocation = this.configService.get<string>('dataServerLocation') ?? '';
         this.dataServerToken = this.configService.get<string>('dataServerToken') ?? '';
-    }
-
-    async onModuleInit() {
-        console.log('🚀 正在初始化模型向量数据...');
-        try {
-            await this.initResourceModelVectorData();
-            console.log('✅ 模型向量初始化完成');
-        } catch (error) {
-            console.error('❌ 模型向量初始化失败:', error);
-        }
     }
 
     // 获取单页健康模型的md5列表
@@ -565,6 +554,15 @@ export class ResourceService {
         }
 
         const dedupedTasks = Array.from(dedupedTaskMap.values());
+        const milvusDocuments: Array<{
+            modelId: string;
+            modelMd5: string;
+            modelName: string;
+            modelDescription: string;
+            modelText: string;
+            embeddingSource: string;
+            embedding: number[];
+        }> = [];
 
         if (dedupedTasks.length > 0) {
             const CHUNK_SIZE = 50;
@@ -583,29 +581,18 @@ export class ResourceService {
                         continue;
                     }
 
-                    const writeOperations = chunk.map((task, index) => ({
-                        updateOne: {
-                            filter: {
-                                $or: [
-                                    { modelId: task.modelId },
-                                    { modelMd5: task.modelMd5, embeddingSource: this.embeddingSource },
-                                ],
-                            },
-                            update: {
-                                $set: {
-                                    modelId: task.modelId,
-                                    modelMd5: task.modelMd5,
-                                    modelName: task.modelName,
-                                    modelDescription: task.modelDescription,
-                                    embeddingSource: this.embeddingSource,
-                                    embedding: vectors[index],
-                                },
-                            },
-                            upsert: true,
-                        },
-                    }));
+                    milvusDocuments.push(
+                        ...chunk.map((task, index) => ({
+                            modelId: task.modelId,
+                            modelMd5: task.modelMd5,
+                            modelName: task.modelName,
+                            modelDescription: task.modelDescription,
+                            modelText: texts[index],
+                            embeddingSource: this.embeddingSource,
+                            embedding: vectors[index],
+                        })),
+                    );
 
-                    await this.ModelEmbeddingModel.bulkWrite(writeOperations, { ordered: false });
                     await new Promise((resolve) => setTimeout(resolve, 30000));
                 } catch (error) {
                     this.logger.error(`处理模型向量批次（起始索引 ${i}）时出错: ${error}`);
@@ -615,18 +602,12 @@ export class ResourceService {
             this.logger.log('没有检测到需要更新的模型向量。');
         }
 
+        await this.milvusService.upsertDocuments(milvusDocuments, activeModelMd5s, this.embeddingSource);
+
         if (activeModelIds.length === 0 && activeModelMd5s.length === 0) {
             this.logger.warn('门户模型列表为空，跳过向量清理。');
-            return;
         }
 
-        await this.ModelEmbeddingModel.deleteMany({
-            embeddingSource: this.embeddingSource,
-            $or: [
-                { modelId: { $exists: true, $nin: activeModelIds } },
-                { modelId: { $exists: false }, modelMd5: { $nin: activeModelMd5s } },
-            ],
-        }).exec();
     }
 
     public async initResourceModelVectorData() {
@@ -635,32 +616,9 @@ export class ResourceService {
             .lean();
         console.log(`查找到 ${data.length} 条模型资源数据`);
 
-        await this.ModelEmbeddingModel.updateMany(
-            {
-                embeddingSource: { $exists: false },
-                indicatorEnName: { $exists: false },
-                categoryEnName: { $exists: false },
-                sphereEnName: { $exists: false },
-            },
-            {
-                $set: { embeddingSource: this.embeddingSource },
-            },
-        ).exec();
+        await this.milvusService.assertEmbeddingSourceConsistent(this.embeddingSource);
 
-        const existingEmbeddingDocs = await this.ModelEmbeddingModel
-            .find(
-                { embeddingSource: this.embeddingSource },
-                { modelId: 1, modelMd5: 1, modelName: 1, modelDescription: 1, embedding: 1 },
-            )
-            .lean();
-
-        const embeddingByModelId = new Map<string, any>();
-        for (const item of existingEmbeddingDocs) {
-            const modelId = this.normalizeText(item.modelId);
-            if (modelId) {
-                embeddingByModelId.set(modelId, item);
-            }
-        }
+        const existingEmbeddingDocs = await this.milvusService.getExistingDocumentMap(this.embeddingSource);
 
         const activeModelIds: string[] = [];
         const activeModelMd5s: string[] = [];
@@ -688,23 +646,14 @@ export class ResourceService {
                 continue;
             }
 
-            const modelName = this.normalizeText(model.name);
-            const modelDescription = this.normalizeText(model.description);
-            const existingEmbedding = embeddingByModelId.get(modelId);
-            const hasValidVector =
-                existingEmbedding &&
-                Array.isArray(existingEmbedding.embedding) &&
-                existingEmbedding.embedding.length > 0;
+            const existingEmbedding = existingEmbeddingDocs.get(modelId);
 
-            const needRefresh =
-                !hasValidVector ||
-                this.normalizeText(existingEmbedding.modelMd5) !== modelMd5 ||
-                this.normalizeText(existingEmbedding.modelName) !== modelName ||
-                this.normalizeText(existingEmbedding.modelDescription) !== modelDescription;
-
-            if (!needRefresh) {
+            if (existingEmbedding) {
                 continue;
             }
+
+            const modelName = this.normalizeText(model.name);
+            const modelDescription = this.normalizeText(model.description);
 
             modelTasks.push({
                 modelId,
@@ -715,6 +664,6 @@ export class ResourceService {
         }
 
         await this.upsertResourceEmbeddings(modelTasks, activeModelIds, activeModelMd5s);
-        console.log(`✅ 资源模型向量同步完成，本次更新 ${modelTasks.length} 条`);
+        console.log(`✅ 资源模型向量同步完成，本次新增 ${modelTasks.length} 条`);
     }
 }

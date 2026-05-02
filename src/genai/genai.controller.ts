@@ -182,6 +182,43 @@ export class GenaiController {
         }
     }
 
+    @Post('milvus/hybrid-search')
+    @HttpCode(HttpStatus.OK)
+    async hybridSearchInMilvus(@Body() body: { text: string; embedding: number[]; limit?: number }) {
+        try {
+            if (!body.text || typeof body.text !== 'string') {
+                return {
+                    success: false,
+                    error: 'Invalid input: text must be a string',
+                    results: [],
+                };
+            }
+
+            if (!body.embedding || !Array.isArray(body.embedding)) {
+                return {
+                    success: false,
+                    error: 'Invalid input: embedding must be an array',
+                    results: [],
+                };
+            }
+
+            const results = await this.milvusService.hybridSearch(body.text, body.embedding, body.limit || 10);
+
+            return {
+                success: true,
+                results,
+                count: results.length,
+            };
+        } catch (error: any) {
+            this.logger.error(`Milvus hybrid search failed: ${error?.message || String(error)}`);
+            return {
+                success: false,
+                error: error?.message || String(error),
+                results: [],
+            };
+        }
+    }
+
     @Post('milvus/flush')
     @HttpCode(HttpStatus.OK)
     async flushMilvus() {

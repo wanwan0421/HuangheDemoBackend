@@ -41,6 +41,24 @@ export class LlmAgentService {
                     observer.next({ data: { type: "heartbeat", message: "keep-alive"} });
                 }, 20000);
 
+                const sanitizeEventData = (data: any) => {
+                    if (!data || typeof data !== 'object') {
+                        return data;
+                    }
+
+                    const visibleTypes = new Set(['token', 'error', 'final']);
+                    if (visibleTypes.has(data.type)) {
+                        return data;
+                    }
+
+                    const { message, ...rest } = data;
+                    if (message !== undefined) {
+                        return { ...rest, detail: message };
+                    }
+
+                    return rest;
+                };
+
                 // 处理SSE chunk（保留 event 行，避免被丢弃 token 等命名事件）
                 response.data.on('data', (chunk: Buffer) => {
                     buffer += chunk.toString();
@@ -83,7 +101,10 @@ export class LlmAgentService {
                         if (dataLines.length) {
                             const jsonStr = dataLines.join('\n');
                             try {
-                                const data = JSON.parse(jsonStr);
+                                const data = sanitizeEventData(JSON.parse(jsonStr));
+                                if (data?.type === 'heartbeat') {
+                                    continue;
+                                }
                                 observer.next(eventName ? { event: eventName, data } : { data });
                             } catch (err) {
                                 console.warn('SSE JSON parse error:', err);
@@ -120,9 +141,72 @@ export class LlmAgentService {
             },
         });
 
-        // 管道传输数据到客户端
+        let buffer = '';
+
+        const writeEvent = (eventName: string | undefined, data: any) => {
+            if (data?.type === 'heartbeat') {
+                return;
+            }
+
+            const visibleTypes = new Set(['token', 'error', 'final']);
+            const payload = visibleTypes.has(data?.type)
+                ? data
+                : (() => {
+                    if (!data || typeof data !== 'object') {
+                        return data;
+                    }
+                    const { message, ...rest } = data;
+                    return message !== undefined ? { ...rest, detail: message } : rest;
+                })();
+
+            if (eventName) {
+                res.write(`event: ${eventName}\n`);
+            }
+            res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        };
+
         pythonRes.data.on('data', (chunk: Buffer) => {
-            res.write(chunk);
+            buffer += chunk.toString();
+
+            while (true) {
+                const nn = buffer.indexOf('\n\n');
+                const rrnn = buffer.indexOf('\r\n\r\n');
+                const sepIndex = nn === -1 ? rrnn : rrnn === -1 ? nn : Math.min(nn, rrnn);
+                if (sepIndex < 0) {
+                    break;
+                }
+
+                const block = buffer.slice(0, sepIndex);
+                const sepLen = buffer.startsWith('\r\n', sepIndex) ? 4 : 2;
+                buffer = buffer.slice(sepIndex + sepLen);
+
+                let eventName: string | undefined;
+                const dataLines: string[] = [];
+
+                block.split(/\r?\n/).forEach((rawLine) => {
+                    const line = rawLine.trim();
+                    if (!line) {
+                        return;
+                    }
+                    if (line.startsWith('event:')) {
+                        eventName = line.replace(/^event:\s*/, '');
+                    } else if (line.startsWith('data:')) {
+                        dataLines.push(line.replace(/^data:\s*/, ''));
+                    }
+                });
+
+                if (!dataLines.length) {
+                    continue;
+                }
+
+                const jsonStr = dataLines.join('\n');
+                try {
+                    const data = JSON.parse(jsonStr);
+                    writeEvent(eventName, data);
+                } catch (err) {
+                    console.warn('SSE JSON parse error:', err);
+                }
+            }
         });
 
         pythonRes.data.on('end', () => {

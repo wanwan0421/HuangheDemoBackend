@@ -38,6 +38,11 @@ EMBEDDING_CONFIG = {
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 DB_NAME = os.getenv("DB_NAME", "huanghe-demo")
 
+# ======================== Milvus 配置 ========================
+MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
+MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
+MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION", "modelembeddings")
+
 # ======================== 数据集配置 ========================
 # 数据集 CSV 路径（相对或绝对）
 QUERYSET_PATH = os.getenv("QUERYSET_PATH")
@@ -79,7 +84,7 @@ STRATEGIES = {
         "description": "关键词+语义混合",
         "dense_topk": 50,
         "keyword_topk": 50,
-        "fusion": "rrf",
-        "fusion_param": {"k": 60},
+        "semantic_weight": 0.65,
+        "keyword_weight": 0.35,
     }
 }

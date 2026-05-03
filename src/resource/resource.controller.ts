@@ -14,7 +14,7 @@ export class ResourceController {
         try {
             await this.resourceService.synchronizePortalModels();
         } catch (error) {
-            throw new Error(`Failed to synchronize portal resources: ${error.message}`);
+            throw new Error(`Failed to synchronize portal resources: ${error}`);
         }
     }
 
@@ -24,7 +24,7 @@ export class ResourceController {
         try {
             await this.resourceService.synchronizeDataMethods();
         } catch (error) {
-            throw new Error(`Failed to synchronize data methods: ${error.message}`);
+            throw new Error(`Failed to synchronize data methods: ${error}`);
         }
     }
 

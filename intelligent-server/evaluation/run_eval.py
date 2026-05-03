@@ -58,20 +58,19 @@ def save_results_to_csv(results: dict, output_prefix: str):
         writer.writeheader()
         
         for idx, (strategy_name, result) in enumerate(results.items()):
-            metrics = result.get("avg_metrics", {})
             
             row = {
                 "run_id": f"run_{idx+1:03d}",
                 "date": datetime.now().isoformat(),
                 "strategy": strategy_name,
                 "total_queries": result.get("total_queries", 0),
-                "recall_at_5": metrics.get("recall_at_5", 0),
-                "recall_at_10": metrics.get("recall_at_10", 0),
-                "recall_at_20": metrics.get("recall_at_20", 0),
-                "mrr_at_10": metrics.get("mrr_at_10", 0),
-                "success_at_1": metrics.get("success_at_1", 0),
-                "precision_at_5": metrics.get("precision_at_5", 0),
-                "precision_at_10": metrics.get("precision_at_10", 0),
+                "recall_at_5": result.get("recall_at_5", 0),
+                "recall_at_10": result.get("recall_at_10", 0),
+                "recall_at_20": result.get("recall_at_20", 0),
+                "mrr_at_10": result.get("mrr_at_10", 0),
+                "success_at_1": result.get("success_at_1", 0),
+                "precision_at_5": result.get("precision_at_5", 0),
+                "precision_at_10": result.get("precision_at_10", 0),
                 "avg_time_seconds": result.get("avg_time_seconds", 0),
                 "avg_retrieval_time_seconds": result.get("avg_retrieval_time_seconds", 0),
                 "avg_generation_time_seconds": result.get("avg_generation_time_seconds", 0),

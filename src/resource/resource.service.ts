@@ -525,8 +525,61 @@ export class ResourceService {
     /**
      * 遍历modelResourceModel数据库将"模型名称+模型描述"拼接为一段话为每个模型生成embedding并存入到ModelEmbeddingModel
      */
-    private normalizeText(value: unknown): string {
-        return typeof value === 'string' ? value : '';
+    private normalizeText(value: unknown, maxLength = 0): string {
+        if (typeof value !== 'string') {
+            return '';
+        }
+
+        const normalized = value.replace(/\s+/g, ' ').trim();
+        if (!normalized) {
+            return '';
+        }
+
+        return maxLength > 0 ? normalized.slice(0, maxLength) : normalized;
+    }
+
+    private normalizeTextList(value: unknown): string[] {
+        return Array.from(
+            new Set(
+                this.extractStringValues(value)
+                    .flatMap((item) => item.replace(/[;，]/g, ',').split(','))
+                    .map((item) => item.trim())
+                    .filter((item) => item.length > 0),
+            ),
+        );
+    }
+
+    private extractMdlSummary(value: unknown): string {
+        if (typeof value !== 'string') {
+            return '';
+        }
+
+        return value
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/&[a-zA-Z]+;/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 1200);
+    }
+
+    private buildResourceEmbeddingText(resource: Partial<ModelResource>): string {
+        const mdlJson = resource.mdlJson ?? {};
+        const mdl = (mdlJson as any).mdl ?? {};
+        const enAttr = mdl?.enAttr ?? {};
+
+        const parts: string[] = [];
+        const push = (label: string, value: unknown, maxLength = 0): void => {
+            const text = this.normalizeText(value, maxLength);
+            if (text) {
+                parts.push(`${label}: ${text}`);
+            }
+        };
+
+        push('model_name', resource.name);
+        push('model_description', resource.description, 1200);
+        push('mdl_summary', this.extractMdlSummary(resource.mdl), 1200);
+
+        return parts.join('. ');
     }
 
     private async upsertResourceEmbeddings(
@@ -535,6 +588,10 @@ export class ResourceService {
             modelMd5: string;
             modelName: string;
             modelDescription: string;
+            problemTags?: string;
+            normalTags?: string[];
+            mdl?: string;
+            mdlJson?: Record<string, any>;
         }>,
         activeModelIds: string[],
         activeModelMd5s: string[],
@@ -544,6 +601,8 @@ export class ResourceService {
             modelMd5: string;
             modelName: string;
             modelDescription: string;
+            mdl?: string;
+            mdlJson?: Record<string, any>;
         }>();
 
         for (const task of tasks) {
@@ -559,6 +618,8 @@ export class ResourceService {
             modelMd5: string;
             modelName: string;
             modelDescription: string;
+            modelMdl?: string;
+            modelMdlJson?: Record<string, any>;
             modelText: string;
             embeddingSource: string;
             embedding: number[];
@@ -569,9 +630,12 @@ export class ResourceService {
             for (let i = 0; i < dedupedTasks.length; i += CHUNK_SIZE) {
                 try {
                     const chunk = dedupedTasks.slice(i, i + CHUNK_SIZE);
-                    const texts = chunk.map((task) =>
-                        `model_name: ${task.modelName}. model_description: ${task.modelDescription}.`,
-                    );
+                    const texts = chunk.map((task) => this.buildResourceEmbeddingText({
+                        name: task.modelName,
+                        description: task.modelDescription,
+                        mdl: task.mdl,
+                        mdlJson: task.mdlJson,
+                    }));
 
                     const vectors = await this.genAIService.generateEmbeddings(texts);
 
@@ -587,6 +651,8 @@ export class ResourceService {
                             modelMd5: task.modelMd5,
                             modelName: task.modelName,
                             modelDescription: task.modelDescription,
+                            modelMdl: task.mdl,
+                            modelMdlJson: task.mdlJson,
                             modelText: texts[index],
                             embeddingSource: this.embeddingSource,
                             embedding: vectors[index],
@@ -612,7 +678,7 @@ export class ResourceService {
 
     public async initResourceModelVectorData() {
         const data = await this.modelResourceModel
-            .find({ type: ResourceType.MODEL }, { id: 1, md5: 1, name: 1, description: 1 })
+            .find({ type: ResourceType.MODEL }, { id: 1, md5: 1, name: 1, description: 1, problemTags: 1, normalTags: 1, mdl: 1, mdlJson: 1 })
             .lean();
         console.log(`查找到 ${data.length} 条模型资源数据`);
 
@@ -627,6 +693,10 @@ export class ResourceService {
             modelMd5: string;
             modelName: string;
             modelDescription: string;
+            problemTags?: string;
+            normalTags?: string[];
+            mdl?: string;
+            mdlJson?: Record<string, any>;
         }> = [];
 
         for (const model of data) {
@@ -660,6 +730,8 @@ export class ResourceService {
                 modelMd5,
                 modelName,
                 modelDescription,
+                mdl: this.normalizeText(model.mdl),
+                mdlJson: model.mdlJson ?? undefined,
             });
         }
 

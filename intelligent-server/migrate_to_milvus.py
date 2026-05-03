@@ -20,6 +20,7 @@ import json
 import time
 import argparse
 import asyncio
+import re
 from typing import List, Dict, Any, Optional
 from tqdm import tqdm
 import logging
@@ -46,6 +47,35 @@ except:
 
 # GenAI - 通过HTTP调用NestJS服务
 import httpx
+
+
+def extract_mdl_summary(doc: Dict[str, Any], max_length: int = 1200) -> str:
+    """从 modelResource.mdl 中提取一个适合 embedding 的摘要文本。"""
+    resource = doc.get("_resource") or {}
+    raw_mdl = resource.get("mdl") or ""
+
+    if not isinstance(raw_mdl, str) or not raw_mdl.strip():
+        return ""
+
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", raw_mdl)).strip()[:max_length]
+
+
+def build_model_text(doc: Dict[str, Any]) -> str:
+    """构建用于 embedding 和 BM25 的文本：名称 + 描述 + mdl 摘要。"""
+    model_name = doc.get("modelName", "") or ""
+    resource = doc.get("_resource") or {}
+    description = doc.get("modelDescription", "") or resource.get("description", "") or ""
+    mdl_summary = extract_mdl_summary(doc)
+
+    parts = [
+        part for part in [
+            f"model_name: {model_name}" if model_name else "",
+            f"model_description: {description[:1200]}" if description else "",
+            f"mdl_summary: {mdl_summary[:1200]}" if mdl_summary else "",
+        ] if part
+    ]
+
+    return ". ".join(parts)
 
 
 class MongoDBConnector:
@@ -75,16 +105,48 @@ class MongoDBConnector:
             return None
         return self.db['modelembeddings']
     
+    def get_resource_collection(self):
+        """获取modelResource集合（包含keywords）"""
+        if self.db is None:
+            return None
+        return self.db['modelResource']
+    
     def read_all_embeddings(self) -> List[Dict[str, Any]]:
-        """读取所有embedding文档"""
-        collection = self.get_embeddings_collection()
-        if collection is None:
+        """读取所有embedding文档，并通过join获取 mdl 文本"""
+        embeddings_col = self.get_embeddings_collection()
+        resources_col = self.get_resource_collection()
+        
+        if embeddings_col is None:
             return []
         
         try:
-            docs = list(collection.find({}))
-            logger.info(f"✅ 从MongoDB读取 {len(docs)} 条embedding数据")
-            return docs
+            embed_docs = list(embeddings_col.find({}))
+            logger.info(f"✅ 从MongoDB读取 {len(embed_docs)} 条embedding数据")
+            
+            # 构建 md5 -> resource 的缓存（包含 description / mdl）
+            resource_cache = {}
+            if resources_col is not None:
+                try:
+                    resource_docs = list(resources_col.find({}, {'md5': 1, 'description': 1, 'mdl': 1, 'mdlJson': 1}))
+                    for res_doc in resource_docs:
+                        md5 = res_doc.get('md5')
+                        if md5:
+                            resource_cache[md5] = {
+                                'description': res_doc.get('description', ''),
+                                'mdl': res_doc.get('mdl', ''),
+                                'mdlJson': res_doc.get('mdlJson', {}),
+                            }
+                    logger.info(f"✅ 从modelResource读取 {len(resource_cache)} 条资源数据")
+                except Exception as e:
+                    logger.warning(f"⚠️  读取资源字段失败: {e}")
+            
+            # 补充 resource 到 embed_docs
+            for doc in embed_docs:
+                model_md5 = doc.get('modelMd5')
+                if model_md5 and model_md5 in resource_cache:
+                    doc['_resource'] = resource_cache[model_md5]
+            
+            return embed_docs
         except Exception as e:
             logger.error(f"❌ 读取MongoDB数据失败: {e}")
             return []
@@ -130,21 +192,18 @@ class EmbeddingGenerator:
         except Exception as e:
             logger.error(f"❌ 生成embedding失败: {e}")
             return []
-    
+
     async def regenerate_all_embeddings(self, docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """重新生成所有embedding"""
         
         logger.info("🔄 开始重新生成embedding（使用 RETRIEVAL_DOCUMENT 任务类型）...")
         
-        # 准备文本：组合模型名称和描述
+        # 准备文本：组合模型名称和关键词
         texts_to_embed = []
         doc_indices = []
         
         for idx, doc in enumerate(docs):
-            model_name = doc.get('modelName', '')
-            model_desc = doc.get('modelDescription', '')
-            # 组合文本
-            combined_text = f"{model_name}。{model_desc}" if model_desc else model_name
+            combined_text = build_model_text(doc)
             if combined_text:
                 texts_to_embed.append(combined_text)
                 doc_indices.append(idx)
@@ -398,9 +457,7 @@ class MilvusConnector:
 
                 model_name = doc.get("modelName", "") or ""
                 model_description = doc.get("modelDescription", "") or ""
-                model_text = doc.get("modelText")
-                if not model_text:
-                    model_text = f"model_name: {model_name}. model_description: {model_description}"
+                model_text = build_model_text(doc)
 
                 rows.append({
                     "modelId": str(doc.get("modelId", "")),

@@ -94,10 +94,15 @@ class RAGEvaluator:
             "aihubmix_base_url": cfg.AIHUBMIX_BASE_URL,
             "mongo_uri": cfg.MONGO_URI,
             "db_name": cfg.DB_NAME,
+            "milvus_host": cfg.MILVUS_HOST,
+            "milvus_port": cfg.MILVUS_PORT,
+            "milvus_collection": cfg.MILVUS_COLLECTION,
             "llm_model": cfg.LLM_CONFIG["model"],
             "llm_temperature": cfg.LLM_CONFIG["temperature"],
             "llm_max_tokens": cfg.LLM_CONFIG["max_tokens"],
             "embedding_model": cfg.EMBEDDING_CONFIG["model"],
+            "hybrid_semantic_weight": cfg.STRATEGIES["hybrid"].get("semantic_weight", 0.65),
+            "hybrid_keyword_weight": cfg.STRATEGIES["hybrid"].get("keyword_weight", 0.35),
         }
         
         strategy = create_strategy(strategy_name, strategy_config)
@@ -223,6 +228,7 @@ class RAGEvaluator:
             "strategy": strategy_name,
             "runs": len(run_results),
             "total_queries": run_results[0]["total_queries"],
+            "successful_queries": int(sum(r.get("successful_queries", 0) for r in run_results) / len(run_results)),
         }
         
         # 聚合指标

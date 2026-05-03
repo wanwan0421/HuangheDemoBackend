@@ -1,0 +1,2 @@
+run_id,date,strategy,total_queries,recall_at_5,recall_at_10,recall_at_20,mrr_at_10,success_at_1,precision_at_5,precision_at_10,avg_time_seconds,avg_retrieval_time_seconds,avg_generation_time_seconds,avg_prompt_tokens,avg_completion_tokens,avg_total_tokens,total_prompt_tokens,total_completion_tokens,total_tokens,retrieval_success_rate,generation_success_rate
+run_001,2026-05-03T15:30:50.302697,vector_only,100,0.87,0.9,0.9,0.8258333333333333,0.78,0.228,0.11800000000000001,2137.2371768951416,6.826466722488403,13.161981840133667,677.55,1000.22,1677.77,67755,100022,167777,1.0,0.12

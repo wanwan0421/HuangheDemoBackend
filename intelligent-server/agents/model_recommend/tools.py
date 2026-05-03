@@ -8,7 +8,7 @@ from langchain.chat_models import init_chat_model
 from langchain_core.embeddings import Embeddings
 from langchain.messages import HumanMessage
 from pymongo import MongoClient
-from pymilvus import connections, Collection, AnnSearchRequest, WeightedRanker
+from pymilvus import RRFRanker, connections, Collection, AnnSearchRequest, WeightedRanker
 import math
 from dotenv import load_dotenv
 from google import genai
@@ -224,7 +224,7 @@ def _milvus_hybrid_search(query_text: str, query_vector: List[float], top_k: int
             logger.info("Milvus collection does not have sparse field; using vector-only search")
             return _milvus_vector_search(query_vector, top_k)
 
-        search_limit = max(top_k, 10)
+        search_limit = max(top_k * 5, 10)
         semantic_request = AnnSearchRequest(
             data=[query_vector],
             anns_field="embedding",
@@ -239,7 +239,7 @@ def _milvus_hybrid_search(query_text: str, query_vector: List[float], top_k: int
         )
         results = collection.hybrid_search(
             [semantic_request, keyword_request],
-            _make_weighted_ranker(),
+            rerank=RRFRanker(k=60),
             limit=top_k,
             output_fields=["modelId", "modelMd5", "modelName", "modelDescription", "embeddingSource"],
         )

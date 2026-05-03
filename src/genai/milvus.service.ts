@@ -13,6 +13,8 @@ export interface MilvusEmbeddingDocument {
     modelMd5: string;
     modelName: string;
     modelDescription: string;
+    modelMdl?: string;
+    modelMdlJson?: Record<string, any>;
     modelText?: string;
     embeddingSource: string;
     embedding: number[];
@@ -58,11 +60,63 @@ export class MilvusService {
         });
     }
 
+    private normalizeText(value: unknown, maxLength = 0): string {
+        if (typeof value !== 'string') {
+            return '';
+        }
+
+        const normalized = value.replace(/\s+/g, ' ').trim();
+        if (!normalized) {
+            return '';
+        }
+
+        return maxLength > 0 ? normalized.slice(0, maxLength) : normalized;
+    }
+
+    private normalizeTextList(value: unknown): string[] {
+        const candidates = Array.isArray(value)
+            ? value.flatMap((item) => this.normalizeTextList(item))
+            : this.normalizeText(value)
+                .replace(/[;，]/g, ',')
+                .split(',')
+                .map((item) => item.trim())
+                .filter((item) => item.length > 0);
+
+        return Array.from(new Set(candidates));
+    }
+
+    private extractMdlSummary(document: Partial<MilvusEmbeddingDocument>): string {
+        const rawMdl = document.modelMdl || (document.modelMdlJson as any)?.mdl?.raw || '';
+        const normalized = this.normalizeText(rawMdl, 2400);
+        if (!normalized) {
+            return '';
+        }
+
+        return normalized
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/&[a-zA-Z]+;/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 1200);
+    }
+
     private buildModelText(document: Partial<MilvusEmbeddingDocument>): string {
-        return [
-            `model_name: ${document.modelName || ''}`,
-            `model_description: ${document.modelDescription || ''}`,
-        ].join('. ');
+        const mdlJson = document.modelMdlJson ?? {};
+        const mdl = (mdlJson as any).mdl ?? {};
+
+        const parts: string[] = [];
+        const push = (label: string, value: unknown, maxLength = 0): void => {
+            const text = this.normalizeText(value, maxLength);
+            if (text) {
+                parts.push(`${label}: ${text}`);
+            }
+        };
+
+        push('model_name', document.modelName);
+        push('model_description', document.modelDescription, 1200);
+        push('mdl_summary', this.extractMdlSummary(document), 1200);
+
+        return parts.join('. ');
     }
 
     private escapeMilvusString(value: string): string {

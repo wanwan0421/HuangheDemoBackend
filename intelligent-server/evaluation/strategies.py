@@ -2,7 +2,7 @@
 RAG 检索策略实现
 - No-RAG: 直接问大模型，不检索
 - Vector-only: 仅向量检索
-- Hybrid: 关键词+语义混合（后续补）
+- Hybrid: 关键词+语义混合（Milvus）
 """
 
 import time
@@ -12,6 +12,7 @@ import os
 from typing import List, Dict, Any, Tuple, Optional
 from abc import ABC, abstractmethod
 from pymongo import MongoClient
+from pymilvus import RRFRanker, connections, Collection, AnnSearchRequest, WeightedRanker
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ class RAGStrategy(ABC):
         self.config = config
         self.db_client = None
         self.llm_client = None
+        self.milvus_collection = None
     
     def get_db(self):
         """获取 MongoDB 连接"""
@@ -77,11 +79,46 @@ class RAGStrategy(ABC):
             (answer, metadata)
         """
         pass
+
+    def build_context(self, retrieved_docs: List[Dict[str, Any]]) -> str:
+        """默认上下文构建，供无检索或空检索策略复用。"""
+        if not retrieved_docs:
+            return ""
+
+        context_parts = []
+        for idx, doc in enumerate(retrieved_docs, 1):
+            description = doc.get("description") or doc.get("modelDescription") or ""
+            text = f"""
+                模型 {idx}:
+                模型名称: {doc.get('modelName', '')}
+                模型描述: {description}
+                相似度: {doc.get('score', 0):.4f}
+                """
+            context_parts.append(text)
+
+        return "\n".join(context_parts)
+
+    def get_milvus_collection(self) -> Collection:
+        """获取 Milvus collection 连接。"""
+        if self.milvus_collection is None:
+            connections.connect(
+                alias="default",
+                host=self.config.get("milvus_host", "localhost"),
+                port=int(self.config.get("milvus_port", 19530)),
+            )
+            self.milvus_collection = Collection(self.config.get("milvus_collection", "modelembeddings"))
+            self.milvus_collection.load()
+        return self.milvus_collection
     
     def cleanup(self):
         """清理资源"""
         if self.db_client:
             self.db_client.close()
+        if self.milvus_collection:
+            try:
+                self.milvus_collection.release()
+            except Exception:
+                logger.debug("release Milvus collection failed", exc_info=True)
 
 
 class NoRAGStrategy(RAGStrategy):
@@ -147,11 +184,8 @@ class VectorOnlyStrategy(RAGStrategy):
         return dot_product / (magnitude1 * magnitude2)
     
     def retrieve(self, query: str, top_k: int = 10) -> Tuple[List[str], Dict[str, Any]]:
-        """
-        使用向量检索
-        """
+        """使用 Milvus Dense-only 检索，不再扫描 MongoDB。"""
         llm_client = self.get_llm_client()
-        db = self.get_db()
         
         start_time = time.time()
         
@@ -164,28 +198,33 @@ class VectorOnlyStrategy(RAGStrategy):
             
             embedding_time = time.time() - start_time
             
-            # 2. 检索模型
             retrieval_start = time.time()
             
-            model_collection = db["modelembeddings"]
-            all_models = list(model_collection.find({}))
-            
-            scored_models = []
-            for model in all_models:
-                if model.get("embedding") and len(model.get("embedding", [])) > 0:
-                    score = self.cosine_similarity(query_embedding, model["embedding"])
-                    scored_models.append({
-                        "modelMd5": model.get("modelMd5"),
-                        "modelName": model.get("modelName"),
-                        "description": model.get("modelDescription"),
-                        "score": score
-                    })
-            
-            # 排序并取 top-k
-            scored_models.sort(key=lambda x: x["score"], reverse=True)
-            result = scored_models[:top_k]
-            
-            retrieved_ids = [m["modelMd5"] for m in result]
+            collection = self.get_milvus_collection()
+            search_result = collection.search(
+                data=[query_embedding],
+                anns_field="embedding",
+                param={"metric_type": "COSINE", "params": {"ef": 128}},
+                limit=top_k,
+                output_fields=["modelId", "modelMd5", "modelName", "modelDescription", "embeddingSource"],
+            )
+
+            hits = HybridStrategy._extract_hits(search_result)
+            result = []
+            for rank, hit in enumerate(hits, start=1):
+                description = HybridStrategy._safe_hit_value(hit, "modelDescription")
+                result.append({
+                    "modelId": HybridStrategy._safe_hit_value(hit, "modelId"),
+                    "modelMd5": HybridStrategy._safe_hit_value(hit, "modelMd5"),
+                    "modelName": HybridStrategy._safe_hit_value(hit, "modelName"),
+                    "description": description,
+                    "modelDescription": description,
+                    "embeddingSource": HybridStrategy._safe_hit_value(hit, "embeddingSource"),
+                    "score": float(getattr(hit, "score", 0.0) or 0.0),
+                    "rank": rank,
+                })
+
+            retrieved_ids = [m.get("modelMd5") for m in result if m.get("modelMd5")]
             retrieval_time = time.time() - retrieval_start
             
             return result, {
@@ -256,11 +295,193 @@ class VectorOnlyStrategy(RAGStrategy):
             return "", {"strategy": "vector_only", "error": str(e)}
 
 
+class HybridStrategy(VectorOnlyStrategy):
+    """使用 Milvus 语义 + 关键词（BM25）混合检索。"""
+
+    @staticmethod
+    def _collection_has_sparse_field(collection: Collection) -> bool:
+        try:
+            schema = getattr(collection, "schema", None)
+            fields = getattr(schema, "fields", None) or []
+            for field in fields:
+                if getattr(field, "name", "") == "sparse":
+                    return True
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _safe_hit_value(hit: Any, field_name: str) -> Any:
+        if isinstance(hit, dict):
+            return hit.get(field_name)
+
+        if hasattr(hit, "get"):
+            try:
+                return hit.get(field_name)
+            except Exception:
+                pass
+
+        entity = getattr(hit, "entity", None)
+        if entity is not None:
+            try:
+                return entity.get(field_name)
+            except Exception:
+                pass
+
+        return getattr(hit, field_name, None)
+
+    @staticmethod
+    def _extract_hits(search_result: Any) -> List[Any]:
+        candidates: List[Any] = []
+
+        if isinstance(search_result, dict):
+            candidates.extend([search_result.get("results"), search_result.get("data")])
+        else:
+            candidates.append(getattr(search_result, "results", None))
+            candidates.append(getattr(search_result, "data", None))
+            candidates.append(search_result)
+
+        for candidate in candidates:
+            if candidate is None:
+                continue
+
+            if isinstance(candidate, list):
+                if len(candidate) > 0 and isinstance(candidate[0], list):
+                    return candidate[0]
+                return candidate
+
+            if hasattr(candidate, "__iter__") and not isinstance(candidate, (str, bytes, dict)):
+                try:
+                    items = list(candidate)
+                    if len(items) > 0 and isinstance(items[0], list):
+                        return items[0]
+                    if items:
+                        return items
+                except Exception:
+                    continue
+
+        return []
+
+    def _make_weighted_ranker(self):
+        semantic_weight = float(self.config.get("hybrid_semantic_weight", 0.8))
+        keyword_weight = float(self.config.get("hybrid_keyword_weight", 0.2))
+        try:
+            return WeightedRanker(semantic_weight, keyword_weight)
+        except TypeError:
+            return WeightedRanker([semantic_weight, keyword_weight])
+
+    def _format_hits(self, hits: List[Any]) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        for rank, hit in enumerate(hits, start=1):
+            description = self._safe_hit_value(hit, "modelDescription")
+            results.append({
+                "modelId": self._safe_hit_value(hit, "modelId"),
+                "modelMd5": self._safe_hit_value(hit, "modelMd5"),
+                "modelName": self._safe_hit_value(hit, "modelName"),
+                "description": description,
+                "modelDescription": description,
+                "embeddingSource": self._safe_hit_value(hit, "embeddingSource"),
+                "score": float(getattr(hit, "score", 0.0) or 0.0),
+                "rank": rank,
+            })
+        return results
+
+    def _milvus_vector_search(self, query_vector: List[float], top_k: int) -> List[Dict[str, Any]]:
+        try:
+            collection = self.get_milvus_collection()
+            search_result = collection.search(
+                data=[query_vector],
+                anns_field="embedding",
+                param={"metric_type": "COSINE", "params": {"ef": 128}},
+                limit=top_k,
+                output_fields=["modelId", "modelMd5", "modelName", "modelDescription", "embeddingSource"],
+            )
+            hits = self._extract_hits(search_result)
+            return self._format_hits(hits)
+        except Exception:
+            logger.exception("Milvus vector fallback search failed")
+            return []
+
+    def _milvus_hybrid_search(self, query_text: str, query_vector: List[float], top_k: int) -> Tuple[List[Dict[str, Any]], str]:
+        collection = self.get_milvus_collection()
+        if not self._collection_has_sparse_field(collection):
+            logger.info("Milvus collection does not have sparse field; using vector-only search")
+            return self._milvus_vector_search(query_vector, top_k), "vector_fallback_no_sparse"
+
+        search_limit = max(top_k * 5, 50)
+        semantic_request = AnnSearchRequest(
+            data=[query_vector],
+            anns_field="embedding",
+            param={"metric_type": "COSINE", "params": {"ef": 128}},
+            limit=search_limit,
+        )
+        keyword_request = AnnSearchRequest(
+            data=[query_text],
+            anns_field="sparse",
+            param={"metric_type": "BM25", "params": {}},
+            limit=search_limit,
+        )
+
+        results = collection.hybrid_search(
+            [semantic_request, keyword_request],
+            rerank=RRFRanker(k=60),
+            limit=top_k,
+            output_fields=["modelId", "modelMd5", "modelName", "modelDescription", "embeddingSource"],
+        )
+
+        hits = self._extract_hits(results)
+        formatted = self._format_hits(hits)
+        if not formatted:
+            logger.warning("Milvus hybrid search returned no hits; falling back to vector-only search")
+            return self._milvus_vector_search(query_vector, top_k), "vector_fallback_empty_hybrid"
+        return formatted, "hybrid"
+
+    def retrieve(self, query: str, top_k: int = 10) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        llm_client = self.get_llm_client()
+        start_time = time.time()
+
+        try:
+            query_vector = llm_client.embeddings.create(
+                model=self.config["embedding_model"],
+                input=query,
+            ).data[0].embedding
+            embedding_time = time.time() - start_time
+
+            retrieval_start = time.time()
+            try:
+                result, retrieval_mode = self._milvus_hybrid_search(query, query_vector, top_k)
+            except Exception:
+                logger.exception("Milvus hybrid search failed; falling back to vector-only search")
+                result = self._milvus_vector_search(query_vector, top_k)
+                retrieval_mode = "vector_fallback_error"
+
+            retrieval_time = time.time() - retrieval_start
+
+            return result, {
+                "strategy": "hybrid",
+                "retrieval_mode": retrieval_mode,
+                "embedding_time": embedding_time,
+                "retrieval_time": retrieval_time,
+                "retrieved_count": len(result),
+                "scores": [doc.get("score", 0.0) for doc in result],
+            }
+        except Exception as e:
+            logger.exception("Hybrid 检索失败")
+            return [], {"strategy": "hybrid", "error": str(e)}
+
+    def generate(self, query: str, context: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
+        answer, meta = super().generate(query, context)
+        if meta.get("strategy") == "vector_only":
+            meta["strategy"] = "hybrid"
+        return answer, meta
+
+
 def create_strategy(strategy_name: str, config: Dict[str, Any]) -> RAGStrategy:
     """工厂函数：创建策略实例"""
     strategy_map = {
         "no_rag": NoRAGStrategy,
         "vector_only": VectorOnlyStrategy,
+        "hybrid": HybridStrategy,
     }
     
     if strategy_name not in strategy_map:

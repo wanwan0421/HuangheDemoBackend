@@ -113,7 +113,7 @@ def main():
         "--strategies",
         nargs="+",
         default=["no_rag", "vector_only"],
-        choices=["no_rag", "vector_only", "hybrid"],
+        choices=["no_rag", "vector_only", "sparse_only", "hybrid", "hybrid_weighted", "hybrid_rrf"],
         help="要评测的策略列表"
     )
     

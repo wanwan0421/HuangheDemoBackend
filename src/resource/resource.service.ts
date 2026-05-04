@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
@@ -19,14 +19,15 @@ import { MilvusService } from 'src/genai/milvus.service';
 import { Cron, CronExpression } from '@nestjs/schedule';
 
 @Injectable()
-export class ResourceService {
+export class ResourceService implements OnApplicationBootstrap {
     private readonly logger = new Logger(ResourceService.name); // 日志记录器
     private readonly portalLocation: string;
     private readonly portalToken: string;
     private readonly dataServerLocation: string;
     private readonly dataServerToken: string;
     private readonly pageSize = 20;
-    private readonly embeddingSource = 'resource-sync';
+    private readonly embeddingSource = 'RETRIEVAL_DOCUMENT';
+    private initVectorRunning = false;
 
     constructor(private readonly httpService: HttpService,
                 private readonly configService: ConfigService,
@@ -40,6 +41,29 @@ export class ResourceService {
         this.portalToken = this.configService.get<string>('portalToken')!;
         this.dataServerLocation = this.configService.get<string>('dataServerLocation') ?? '';
         this.dataServerToken = this.configService.get<string>('dataServerToken') ?? '';
+    }
+
+    public onApplicationBootstrap(): void {
+        setImmediate(() => {
+            void this.runInitResourceModelVectorData('startup');
+        });
+    }
+
+    private async runInitResourceModelVectorData(reason: string): Promise<void> {
+        if (this.initVectorRunning) {
+            this.logger.warn(`initResourceModelVectorData 已在运行，跳过: ${reason}`);
+            return;
+        }
+
+        this.initVectorRunning = true;
+        this.logger.log(`initResourceModelVectorData 开始: ${reason}`);
+        try {
+            await this.initResourceModelVectorData();
+        } catch (error) {
+            this.logger.error(`initResourceModelVectorData 失败: ${error}`);
+        } finally {
+            this.initVectorRunning = false;
+        }
     }
 
     // 获取单页健康模型的md5列表
@@ -558,28 +582,119 @@ export class ResourceService {
             .replace(/<[^>]+>/g, ' ')
             .replace(/&[a-zA-Z]+;/g, ' ')
             .replace(/\s+/g, ' ')
-            .trim()
-            .slice(0, 1200);
+            .trim();
+    }
+
+    private pushTextPart(parts: string[], label: string, value: unknown, maxLength = 0): void {
+        const text = this.normalizeText(value, maxLength);
+        if (text) {
+            parts.push(`${label}: ${text}`);
+        }
+    }
+
+    private buildMdlJsonStructuredText(mdlJson: Record<string, any> | undefined): string {
+        const mdl = mdlJson?.mdl ?? {};
+        const parts: string[] = [];
+
+        this.pushTextPart(parts, 'mdlName', mdl.name);
+        this.pushTextPart(parts, 'mdlLocalName', mdl.enAttr?.localName);
+        this.pushTextPart(parts, 'mdlKeywords', mdl.enAttr?.keywords);
+        this.pushTextPart(parts, 'mdlAbstract', mdl.enAttr?.abstract, 1600);
+        this.pushTextPart(parts, 'mdlPrinciple', mdl.principle, 1200);
+
+        const states = Array.isArray(mdl.states) ? mdl.states : [];
+        const stateParts: string[] = [];
+        const inputParts: string[] = [];
+        const outputParts: string[] = [];
+        const formatEventData = (data: unknown): string => {
+            const dataItems = Array.isArray(data) ? data : [];
+            const dataParts: string[] = [];
+
+            for (const item of dataItems.slice(0, 6)) {
+                const nodeParts = Array.isArray(item?.nodes)
+                    ? item.nodes.slice(0, 8)
+                        .map((node: any) => [
+                            this.normalizeText(node?.name),
+                            this.normalizeText(node?.description, 160),
+                            this.normalizeText(node?.dataType),
+                        ].filter(Boolean).join(' '))
+                        .filter(Boolean)
+                    : [];
+
+                const itemText = [
+                    this.normalizeText(item?.name),
+                    this.normalizeText(item?.type),
+                    this.normalizeText(item?.description, 180),
+                    nodeParts.join(' '),
+                ].filter(Boolean).join(' ');
+
+                if (itemText) {
+                    dataParts.push(itemText);
+                }
+            }
+
+            return dataParts.join(' ');
+        };
+
+        for (const state of states.slice(0, 24)) {
+            const stateName = this.normalizeText(state?.stateName);
+            const stateDesc = this.normalizeText(state?.stateDesc, 300);
+            if (stateName || stateDesc) {
+                stateParts.push([stateName, stateDesc].filter(Boolean).join(' - '));
+            }
+
+            const events = Array.isArray(state?.event) ? state.event : [];
+            for (const event of events.slice(0, 24)) {
+                const eventText = [
+                    this.normalizeText(event?.eventName),
+                    this.normalizeText(event?.eventDesc, 240),
+                    formatEventData(event?.data),
+                ].filter(Boolean).join(' - ');
+
+                if (!eventText) {
+                    continue;
+                }
+
+                if (event?.eventType === 'response') {
+                    inputParts.push(eventText);
+                } else {
+                    outputParts.push(eventText);
+                }
+            }
+        }
+
+        this.pushTextPart(parts, 'mdlStates', stateParts.slice(0, 40).join('; '), 2400);
+        this.pushTextPart(parts, 'inputEvents', inputParts.slice(0, 80).join('; '), 3600);
+        this.pushTextPart(parts, 'outputEvents', outputParts.slice(0, 80).join('; '), 3600);
+
+        return parts.join('. ');
     }
 
     private buildResourceEmbeddingText(resource: Partial<ModelResource>): string {
-        const mdlJson = resource.mdlJson ?? {};
-        const mdl = (mdlJson as any).mdl ?? {};
-        const enAttr = mdl?.enAttr ?? {};
-
         const parts: string[] = [];
-        const push = (label: string, value: unknown, maxLength = 0): void => {
+        const pushDistinct = (label: string, value: unknown, maxLength = 0): void => {
             const text = this.normalizeText(value, maxLength);
-            if (text) {
-                parts.push(`${label}: ${text}`);
+            if (!text) {
+                return;
             }
+
+            const existing = parts.join(' ');
+            if (existing.includes(text)) {
+                return;
+            }
+
+            parts.push(`${label}: ${text}`);
         };
+        const mdlStructuredText = this.buildMdlJsonStructuredText(resource.mdlJson);
 
-        push('model_name', resource.name);
-        push('model_description', resource.description, 1200);
-        push('mdl_summary', this.extractMdlSummary(resource.mdl), 1200);
+        pushDistinct('modelName', resource.name);
+        pushDistinct('modelDescription', resource.description, 1600);
+        pushDistinct('mdlStructured', mdlStructuredText, 11000);
+        if (!mdlStructuredText) {
+            pushDistinct('mdlSummary', this.extractMdlSummary(resource.mdl), 3000);
+        }
 
-        return parts.join('. ');
+        return parts.join('. ').slice(0, 15000);
     }
 
     private async upsertResourceEmbeddings(
@@ -588,12 +703,10 @@ export class ResourceService {
             modelMd5: string;
             modelName: string;
             modelDescription: string;
-            problemTags?: string;
-            normalTags?: string[];
             mdl?: string;
             mdlJson?: Record<string, any>;
+            modelText?: string;
         }>,
-        activeModelIds: string[],
         activeModelMd5s: string[],
     ): Promise<void> {
         const dedupedTaskMap = new Map<string, {
@@ -603,34 +716,27 @@ export class ResourceService {
             modelDescription: string;
             mdl?: string;
             mdlJson?: Record<string, any>;
+            modelText?: string;
         }>();
 
         for (const task of tasks) {
             if (!task.modelId || !task.modelMd5) {
                 continue;
             }
-            dedupedTaskMap.set(task.modelId, task);
+            dedupedTaskMap.set(task.modelMd5, task);
         }
 
         const dedupedTasks = Array.from(dedupedTaskMap.values());
-        const milvusDocuments: Array<{
-            modelId: string;
-            modelMd5: string;
-            modelName: string;
-            modelDescription: string;
-            modelMdl?: string;
-            modelMdlJson?: Record<string, any>;
-            modelText: string;
-            embeddingSource: string;
-            embedding: number[];
-        }> = [];
+        let generatedCount = 0;
+        let insertedCount = 0;
+        let failedBatchCount = 0;
 
         if (dedupedTasks.length > 0) {
             const CHUNK_SIZE = 50;
             for (let i = 0; i < dedupedTasks.length; i += CHUNK_SIZE) {
                 try {
                     const chunk = dedupedTasks.slice(i, i + CHUNK_SIZE);
-                    const texts = chunk.map((task) => this.buildResourceEmbeddingText({
+                    const texts = chunk.map((task) => task.modelText || this.buildResourceEmbeddingText({
                         name: task.modelName,
                         description: task.modelDescription,
                         mdl: task.mdl,
@@ -641,36 +747,57 @@ export class ResourceService {
 
                     if (!vectors || !Array.isArray(vectors) || vectors.length !== chunk.length) {
                         this.logger.error(`⚠️ 批次索引 ${i} 失败：API 返回数据无效或受限。跳过此批次。`);
+                        failedBatchCount += 1;
                         await new Promise((resolve) => setTimeout(resolve, 60000));
                         continue;
                     }
 
-                    milvusDocuments.push(
-                        ...chunk.map((task, index) => ({
-                            modelId: task.modelId,
-                            modelMd5: task.modelMd5,
-                            modelName: task.modelName,
-                            modelDescription: task.modelDescription,
-                            modelMdl: task.mdl,
-                            modelMdlJson: task.mdlJson,
-                            modelText: texts[index],
-                            embeddingSource: this.embeddingSource,
-                            embedding: vectors[index],
-                        })),
+                    const batchDocuments = chunk.map((task, index) => ({
+                        modelId: task.modelId,
+                        modelMd5: task.modelMd5,
+                        modelName: task.modelName,
+                        modelDescription: task.modelDescription,
+                        modelMdl: task.mdl,
+                        modelMdlJson: task.mdlJson,
+                        modelText: texts[index],
+                        embeddingSource: this.embeddingSource,
+                        embedding: vectors[index],
+                    }));
+
+                    generatedCount += batchDocuments.length;
+
+                    const upserted = await this.milvusService.upsertDocuments(
+                        batchDocuments,
+                        activeModelMd5s
                     );
+
+                    if (!upserted) {
+                        failedBatchCount += 1;
+                        this.logger.error(`批次索引 ${i} 写入 Milvus 失败，已保留此前成功批次。`);
+                    } else {
+                        insertedCount += batchDocuments.length;
+                        this.logger.log(
+                            `Milvus写入进度: ${Math.min(i + CHUNK_SIZE, dedupedTasks.length)}/${dedupedTasks.length}, ` +
+                            `本批 ${batchDocuments.length} 条，累计 ${insertedCount} 条`,
+                        );
+                    }
 
                     await new Promise((resolve) => setTimeout(resolve, 30000));
                 } catch (error) {
+                    failedBatchCount += 1;
                     this.logger.error(`处理模型向量批次（起始索引 ${i}）时出错: ${error}`);
                 }
             }
+
+            this.logger.log(
+                `模型向量流式同步完成: 生成 ${generatedCount} 条, 写入 ${insertedCount} 条, 失败批次 ${failedBatchCount}`,
+            );
         } else {
             this.logger.log('没有检测到需要更新的模型向量。');
+            await this.milvusService.upsertDocuments([], activeModelMd5s);
         }
 
-        await this.milvusService.upsertDocuments(milvusDocuments, activeModelMd5s, this.embeddingSource);
-
-        if (activeModelIds.length === 0 && activeModelMd5s.length === 0) {
+        if (activeModelMd5s.length === 0) {
             this.logger.warn('门户模型列表为空，跳过向量清理。');
         }
 
@@ -678,25 +805,22 @@ export class ResourceService {
 
     public async initResourceModelVectorData() {
         const data = await this.modelResourceModel
-            .find({ type: ResourceType.MODEL }, { id: 1, md5: 1, name: 1, description: 1, problemTags: 1, normalTags: 1, mdl: 1, mdlJson: 1 })
+            .find({ type: ResourceType.MODEL }, { id: 1, md5: 1, name: 1, description: 1, mdl: 1, mdlJson: 1 })
             .lean();
         console.log(`查找到 ${data.length} 条模型资源数据`);
 
-        await this.milvusService.assertEmbeddingSourceConsistent(this.embeddingSource);
+        const existingEmbeddingDocs = await this.milvusService.getExistingDocumentMap();
+        this.logger.log(`Milvus 现有模型向量: ${existingEmbeddingDocs.size} 条`);
 
-        const existingEmbeddingDocs = await this.milvusService.getExistingDocumentMap(this.embeddingSource);
-
-        const activeModelIds: string[] = [];
         const activeModelMd5s: string[] = [];
         const modelTasks: Array<{
             modelId: string;
             modelMd5: string;
             modelName: string;
             modelDescription: string;
-            problemTags?: string;
-            normalTags?: string[];
             mdl?: string;
             mdlJson?: Record<string, any>;
+            modelText?: string;
         }> = [];
 
         for (const model of data) {
@@ -704,8 +828,6 @@ export class ResourceService {
             if (!modelId) {
                 continue;
             }
-
-            activeModelIds.push(modelId);
 
             const modelMd5 = this.normalizeText(model.md5);
             if (modelMd5) {
@@ -716,14 +838,19 @@ export class ResourceService {
                 continue;
             }
 
-            const existingEmbedding = existingEmbeddingDocs.get(modelId);
-
-            if (existingEmbedding) {
-                continue;
-            }
-
             const modelName = this.normalizeText(model.name);
             const modelDescription = this.normalizeText(model.description);
+            const modelText = this.buildResourceEmbeddingText({
+                name: modelName,
+                description: modelDescription,
+                mdl: this.normalizeText(model.mdl),
+                mdlJson: model.mdlJson ?? undefined,
+            });
+            const existingEmbedding = existingEmbeddingDocs.get(modelMd5);
+
+            if (existingEmbedding?.modelText === modelText) {
+                continue;
+            }
 
             modelTasks.push({
                 modelId,
@@ -732,10 +859,16 @@ export class ResourceService {
                 modelDescription,
                 mdl: this.normalizeText(model.mdl),
                 mdlJson: model.mdlJson ?? undefined,
+                modelText,
             });
         }
 
-        await this.upsertResourceEmbeddings(modelTasks, activeModelIds, activeModelMd5s);
+        const skippedCount = activeModelMd5s.length - modelTasks.length;
+        this.logger.log(
+            `向量同步统计: 总模型 ${activeModelMd5s.length} 条, 跳过已有 ${skippedCount} 条, 待生成 ${modelTasks.length} 条`,
+        );
+
+        await this.upsertResourceEmbeddings(modelTasks, activeModelMd5s);
         console.log(`✅ 资源模型向量同步完成，本次新增 ${modelTasks.length} 条`);
     }
 }

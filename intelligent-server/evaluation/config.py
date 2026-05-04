@@ -1,5 +1,5 @@
 """
-评测框架配置
+Configuration for the RAG evaluation scripts.
 """
 
 import os
@@ -18,7 +18,8 @@ def _resolve_path(path_value: str, default_relative: str) -> str:
         return str(path)
     return str((REPO_ROOT / path).resolve())
 
-# ======================== LLM 配置 ========================
+
+# LLM
 AIHUBMIX_API_KEY = os.getenv("AIHUBMIX_API_KEY", "")
 AIHUBMIX_BASE_URL = os.getenv("AIHUBMIX_BASE_URL", "")
 
@@ -29,62 +30,67 @@ LLM_CONFIG = {
     "top_p": 0.95,
 }
 
-# ======================== 嵌入模型配置 ========================
+# Embedding
 EMBEDDING_CONFIG = {
     "model": "gemini-embedding-001",
 }
 
-# ======================== MongoDB 配置 ========================
+# MongoDB
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 DB_NAME = os.getenv("DB_NAME", "huanghe-demo")
 
-# ======================== Milvus 配置 ========================
+# Milvus
 MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
 MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
 MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION", "modelembeddings")
 
-# ======================== 数据集配置 ========================
-# 数据集 CSV 路径（相对或绝对）
-QUERYSET_PATH = os.getenv("QUERYSET_PATH")
+# Dataset and result paths
 QUERYSET_PATH = _resolve_path(
-    QUERYSET_PATH,
+    os.getenv("QUERYSET_PATH"),
     "docs/rag-experiments/queryset_template.csv",
 )
-
-# 结果输出路径
-RESULT_PREFIX = os.getenv("RESULT_PREFIX")
 RESULT_PREFIX = _resolve_path(
-    RESULT_PREFIX,
+    os.getenv("RESULT_PREFIX"),
     "docs/rag-experiments/run_result",
 )
 
-# ======================== 检索配置 ========================
-VECTOR_TOPK = 10  # 向量检索返回 top-k
-FINAL_TOPK = 10   # 最终输出 top-k
+# Retrieval
+VECTOR_TOPK = 10
+FINAL_TOPK = 10
 
-# ======================== 评测配置 ========================
-BATCH_SIZE = 10  # 批量处理的查询数
-
-# 日志级别
+# Evaluation
+BATCH_SIZE = 10
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-# ======================== 策略标志 ========================
-# 用于运行时选择策略
+# Strategy metadata and default hybrid params.
 STRATEGIES = {
     "no_rag": {
         "name": "A-NoRAG",
-        "description": "不使用RAG，直接大模型生成",
+        "description": "No retrieval, direct generation",
     },
     "vector_only": {
         "name": "B-VectorOnly",
-        "description": "仅向量检索",
+        "description": "Dense vector retrieval only",
+    },
+    "sparse_only": {
+        "name": "C-SparseOnly",
+        "description": "BM25 sparse retrieval only",
     },
     "hybrid": {
-        "name": "C-Hybrid",
-        "description": "关键词+语义混合",
+        "name": "D-HybridAdaptive",
+        "description": "Adaptive dense + BM25 hybrid retrieval",
         "dense_topk": 50,
         "keyword_topk": 50,
         "semantic_weight": 0.65,
         "keyword_weight": 0.35,
-    }
+        "rrf_k": 60,
+    },
+    "hybrid_weighted": {
+        "name": "E-HybridWeighted",
+        "description": "Fixed weighted dense + BM25 hybrid retrieval",
+    },
+    "hybrid_rrf": {
+        "name": "F-HybridRRF",
+        "description": "Fixed RRF dense + BM25 hybrid retrieval",
+    },
 }

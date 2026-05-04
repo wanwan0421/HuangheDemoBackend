@@ -101,8 +101,11 @@ class RAGEvaluator:
             "llm_temperature": cfg.LLM_CONFIG["temperature"],
             "llm_max_tokens": cfg.LLM_CONFIG["max_tokens"],
             "embedding_model": cfg.EMBEDDING_CONFIG["model"],
+            "hybrid_dense_topk": cfg.STRATEGIES["hybrid"].get("dense_topk", 50),
+            "hybrid_keyword_topk": cfg.STRATEGIES["hybrid"].get("keyword_topk", 50),
             "hybrid_semantic_weight": cfg.STRATEGIES["hybrid"].get("semantic_weight", 0.65),
             "hybrid_keyword_weight": cfg.STRATEGIES["hybrid"].get("keyword_weight", 0.35),
+            "hybrid_rrf_k": cfg.STRATEGIES["hybrid"].get("rrf_k", 60),
         }
         
         strategy = create_strategy(strategy_name, strategy_config)

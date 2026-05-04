@@ -38,8 +38,6 @@ export class GenAIService {
                 config: { taskType: 'RETRIEVAL_DOCUMENT' }
             });
 
-            console.log('[GenAI] embedContent response:', JSON.stringify(response, null, 2));
-
             const embeddings = response.embeddings
                 ? response.embeddings.map(e => e.values).filter((v): v is number[] => !!v)
                 : [];

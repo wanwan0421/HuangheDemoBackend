@@ -1,0 +1,26 @@
+{
+  "hybrid": {
+    "strategy": "hybrid",
+    "runs": 1,
+    "total_queries": 100,
+    "successful_queries": 100,
+    "success_at_1": 0.65,
+    "precision_at_5": 0.20800000000000002,
+    "recall_at_5": 0.795,
+    "recall_at_20": 0.85,
+    "recall_at_10": 0.85,
+    "precision_at_10": 0.11200000000000002,
+    "mrr_at_10": 0.7395,
+    "avg_time_seconds": 1610.2927358150482,
+    "avg_retrieval_time_seconds": 0.01486257791519165,
+    "avg_generation_time_seconds": 15.178891837596893,
+    "avg_prompt_tokens": 660.88,
+    "avg_completion_tokens": 995.75,
+    "avg_total_tokens": 1656.63,
+    "total_prompt_tokens": 66088,
+    "total_completion_tokens": 99575,
+    "total_tokens": 165663,
+    "retrieval_success_rate": 1.0,
+    "generation_success_rate": 0.12
+  }
+}

@@ -26,7 +26,6 @@
 - **Milvus 2.6.0**: 向量数据库 (gRPC: 19530, HTTP: 9091)
 - **Etcd 3.5.5**: 分布式配置存储 (2379)
 - **MinIO latest**: 对象存储后端 (9000/9001)
-- **MongoDB 6.0**: Docker 空库容器（当前仅用于对照）
 - **本机 MongoDB 服务**: 真实数据源（`G:\mongoDB\bin\mongod.exe`，27017）
 
 ### 索引配置
@@ -126,7 +125,7 @@ docker compose -f docker-compose.milvus.yml down
 ```
 
 ## 相关文件修改
-- ✅ `docker-compose.milvus.yml` - 完整的多容器配置 (etcd + minio + milvus + mongodb)
+- ✅ `docker-compose.milvus.yml` - 完整的多容器配置 (etcd + minio + milvus)
 - ✅ `intelligent-server/mongo_to_milvus.py` - 迁移脚本（已修复数据格式）
 - ✅ `src/genai/milvus.service.ts` - Milvus 服务（ready）
 - ✅ `src/genai/genai.controller.ts` - API 控制器（ready）

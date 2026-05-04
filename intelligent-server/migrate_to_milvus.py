@@ -14,14 +14,12 @@ MongoDB embedding 迁移到 Milvus 的脚本
     python migrate_to_milvus.py --mode verify
 """
 
-import os
-import sys
 import json
 import time
 import argparse
 import asyncio
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from tqdm import tqdm
 import logging
 
@@ -33,7 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # MongoDB
-from pymongo import MongoClient
+from pymongo import MongoClient, UpdateOne
 from pymongo.errors import ConnectionFailure
 
 # Milvus
@@ -50,9 +48,8 @@ import httpx
 
 
 def extract_mdl_summary(doc: Dict[str, Any], max_length: int = 1200) -> str:
-    """从 modelResource.mdl 中提取一个适合 embedding 的摘要文本。"""
-    resource = doc.get("_resource") or {}
-    raw_mdl = resource.get("mdl") or ""
+    """从 mdl 字段中提取纯文本摘要，去除HTML标签和多余空白，并限制长度。"""
+    raw_mdl = doc.get("mdl") or ""
 
     if not isinstance(raw_mdl, str) or not raw_mdl.strip():
         return ""
@@ -62,16 +59,15 @@ def extract_mdl_summary(doc: Dict[str, Any], max_length: int = 1200) -> str:
 
 def build_model_text(doc: Dict[str, Any]) -> str:
     """构建用于 embedding 和 BM25 的文本：名称 + 描述 + mdl 摘要。"""
-    model_name = doc.get("modelName", "") or ""
-    resource = doc.get("_resource") or {}
-    description = doc.get("modelDescription", "") or resource.get("description", "") or ""
-    mdl_summary = extract_mdl_summary(doc)
+    modelName = doc.get("name", "") or doc.get("modelName", "") or ""
+    modelDescription = doc.get("description", "") or doc.get("modelDescription", "") or ""
+    modelMdl = extract_mdl_summary(doc)
 
     parts = [
         part for part in [
-            f"model_name: {model_name}" if model_name else "",
-            f"model_description: {description[:1200]}" if description else "",
-            f"mdl_summary: {mdl_summary[:1200]}" if mdl_summary else "",
+            f"modelName: {modelName}" if modelName else "",
+            f"modelDescription: {modelDescription}" if modelDescription else "",
+            f"modelMdl: {modelMdl}" if modelMdl else "",
         ] if part
     ]
 
@@ -99,57 +95,129 @@ class MongoDBConnector:
             logger.error(f"❌ MongoDB 连接失败: {e}")
             return False
     
-    def get_embeddings_collection(self):
-        """获取embeddings集合"""
-        if self.db is None:
-            return None
-        return self.db['modelembeddings']
-    
     def get_resource_collection(self):
         """获取modelResource集合（包含keywords）"""
         if self.db is None:
             return None
         return self.db['modelResource']
+
+    def get_embeddings_collection(self):
+        """获取modelembeddings集合"""
+        if self.db is None:
+            return None
+        return self.db['modelembeddings']
     
     def read_all_embeddings(self) -> List[Dict[str, Any]]:
-        """读取所有embedding文档，并通过join获取 mdl 文本"""
-        embeddings_col = self.get_embeddings_collection()
+        """读取 modelResource 作为唯一来源，生成待重建的文档列表"""
         resources_col = self.get_resource_collection()
-        
+
+        if resources_col is None:
+            return []
+
+        try:
+            resource_docs = list(resources_col.find({}, {
+                'id': 1,
+                'md5': 1,
+                'name': 1,
+                'description': 1,
+                'mdl': 1,
+                'mdlJson': 1,
+            }))
+            logger.info(f"✅ 读取资源数据: {len(resource_docs)} 条")
+
+            docs: List[Dict[str, Any]] = []
+            for res_doc in resource_docs:
+                model_md5 = res_doc.get('md5') or ''
+                model_id = res_doc.get('id') or ''
+                model_name = res_doc.get('name') or ''
+                model_description = res_doc.get('description') or ''
+
+                if not model_md5:
+                    continue
+
+                docs.append({
+                    'modelId': str(model_id),
+                    'modelMd5': str(model_md5),
+                    'modelName': str(model_name),
+                    'modelDescription': str(model_description),
+                    'mdl': res_doc.get('mdl') or '',
+                    'mdlJson': res_doc.get('mdlJson') or {},
+                })
+
+            return docs
+        except Exception as e:
+            logger.error(f"❌ 读取资源数据失败: {e}")
+            return []
+
+    def read_embeddings_from_mongo(self) -> List[Dict[str, Any]]:
+        """读取 MongoDB embedding 集合，用于迁移到 Milvus"""
+        embeddings_col = self.get_embeddings_collection()
+
         if embeddings_col is None:
             return []
-        
+
         try:
-            embed_docs = list(embeddings_col.find({}))
-            logger.info(f"✅ 从MongoDB读取 {len(embed_docs)} 条embedding数据")
-            
-            # 构建 md5 -> resource 的缓存（包含 description / mdl）
-            resource_cache = {}
-            if resources_col is not None:
-                try:
-                    resource_docs = list(resources_col.find({}, {'md5': 1, 'description': 1, 'mdl': 1, 'mdlJson': 1}))
-                    for res_doc in resource_docs:
-                        md5 = res_doc.get('md5')
-                        if md5:
-                            resource_cache[md5] = {
-                                'description': res_doc.get('description', ''),
-                                'mdl': res_doc.get('mdl', ''),
-                                'mdlJson': res_doc.get('mdlJson', {}),
-                            }
-                    logger.info(f"✅ 从modelResource读取 {len(resource_cache)} 条资源数据")
-                except Exception as e:
-                    logger.warning(f"⚠️  读取资源字段失败: {e}")
-            
-            # 补充 resource 到 embed_docs
-            for doc in embed_docs:
-                model_md5 = doc.get('modelMd5')
-                if model_md5 and model_md5 in resource_cache:
-                    doc['_resource'] = resource_cache[model_md5]
-            
-            return embed_docs
+            docs = list(embeddings_col.find({}, {
+                'modelId': 1,
+                'modelMd5': 1,
+                'modelName': 1,
+                'modelDescription': 1,
+                'embeddingSource': 1,
+                'embedding': 1,
+                'modelText': 1,
+                'mdl': 1,
+                'mdlJson': 1,
+            }))
+            logger.info(f"✅ 读取 MongoDB embeddings: {len(docs)} 条")
+            return docs
         except Exception as e:
-            logger.error(f"❌ 读取MongoDB数据失败: {e}")
+            logger.error(f"❌ 读取 MongoDB embeddings 失败: {e}")
             return []
+
+    def upsert_embeddings(self, docs: List[Dict[str, Any]], batch_size: int = 1000) -> int:
+        """写入 embedding 到 MongoDB（upsert by modelMd5）"""
+        embeddings_col = self.get_embeddings_collection()
+
+        if embeddings_col is None:
+            return 0
+
+        ops: List[UpdateOne] = []
+        written = 0
+
+        for doc in docs:
+            model_md5 = str(doc.get("modelMd5", "") or "")
+            embedding = doc.get("embedding", [])
+            if not model_md5:
+                continue
+            if not (isinstance(embedding, list) and len(embedding) == 3072):
+                continue
+
+            payload = {
+                "modelId": str(doc.get("modelId", "") or ""),
+                "modelMd5": model_md5,
+                "modelName": str(doc.get("modelName", "") or ""),
+                "modelDescription": str(doc.get("modelDescription", "") or ""),
+                "embeddingSource": str(doc.get("embeddingSource", "") or ""),
+                "embedding": embedding,
+                "modelText": str(doc.get("modelText", "") or build_model_text(doc)),
+                "mdl": str(doc.get("mdl", "") or ""),
+                "mdlJson": doc.get("mdlJson") or {},
+                "updatedAt": time.time(),
+            }
+
+            ops.append(UpdateOne({"modelMd5": model_md5}, {"$set": payload}, upsert=True))
+
+            if len(ops) >= batch_size:
+                result = embeddings_col.bulk_write(ops, ordered=False)
+                written += result.upserted_count + result.modified_count
+                ops = []
+
+        if ops:
+            result = embeddings_col.bulk_write(ops, ordered=False)
+            written += result.upserted_count + result.modified_count
+
+        logger.info(f"✅ 写入 MongoDB embeddings: {written} 条")
+        return written
     
     def close(self):
         """关闭连接"""
@@ -196,7 +264,7 @@ class EmbeddingGenerator:
     async def regenerate_all_embeddings(self, docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """重新生成所有embedding"""
         
-        logger.info("🔄 开始重新生成embedding（使用 RETRIEVAL_DOCUMENT 任务类型）...")
+        logger.info("🔄 开始重新生成 embedding")
         
         # 准备文本：组合模型名称和关键词
         texts_to_embed = []
@@ -208,7 +276,7 @@ class EmbeddingGenerator:
                 texts_to_embed.append(combined_text)
                 doc_indices.append(idx)
         
-        logger.info(f"📝 准备生成 {len(texts_to_embed)} 条向量")
+        logger.info(f"📝 待生成向量: {len(texts_to_embed)}")
         
         # 批量生成embedding
         new_docs = [doc.copy() for doc in docs]  # 复制一份，保留原有元数据
@@ -233,6 +301,7 @@ class EmbeddingGenerator:
                     vec = embeddings[i]
                     if isinstance(vec, list) and len(vec) == 3072:
                         new_docs[doc_idx]['embedding'] = vec
+                        new_docs[doc_idx]['modelText'] = batch_texts[i]
                         new_docs[doc_idx]['embeddingSource'] = 'RETRIEVAL_DOCUMENT'
                         new_docs[doc_idx]['regeneratedAt'] = time.time()
                         regenerated_count += 1
@@ -247,7 +316,7 @@ class EmbeddingGenerator:
                 await asyncio.sleep(self.delay_per_batch)
 
         logger.info(
-            f"✅ embedding处理完成: 新生成 {regenerated_count} 条, 保留原向量 {kept_original_count} 条"
+            f"✅ 向量生成完成: 新生成 {regenerated_count} 条, 保留 {kept_original_count} 条"
         )
         
         return new_docs
@@ -300,9 +369,7 @@ class MilvusConnector:
             fields = [
                 FieldSchema(
                     name="id",
-                    dtype=DataType.INT64,
-                    is_primary=True,
-                    auto_id=True
+                    dtype=DataType.INT64
                 ),
                 FieldSchema(
                     name="modelId",
@@ -312,7 +379,9 @@ class MilvusConnector:
                 FieldSchema(
                     name="modelMd5",
                     dtype=DataType.VARCHAR,
-                    max_length=255
+                    max_length=255,
+                    is_primary=True,
+                    auto_id=False,
                 ),
                 FieldSchema(
                     name="modelName",
@@ -373,7 +442,7 @@ class MilvusConnector:
                 schema=schema
             )
             
-            logger.info(f"✅ 成功创建Milvus集合: {self.collection_name}")
+            logger.info(f"✅ 创建集合: {self.collection_name}")
             return True
             
         except Exception as e:
@@ -457,7 +526,7 @@ class MilvusConnector:
 
                 model_name = doc.get("modelName", "") or ""
                 model_description = doc.get("modelDescription", "") or ""
-                model_text = build_model_text(doc)
+                model_text = str(doc.get("modelText", "") or build_model_text(doc))
 
                 rows.append({
                     "modelId": str(doc.get("modelId", "")),
@@ -470,14 +539,14 @@ class MilvusConnector:
                 })
 
             if not rows:
-                logger.info("✅ 无新增数据需要写入Milvus")
+                logger.info("✅ 无新增数据写入")
                 return True
             
             # 批量插入
             mr = self.collection.insert(rows)
             self.collection.flush()
             
-            logger.info(f"✅ 成功插入 {mr.insert_count} 条数据到Milvus")
+            logger.info(f"✅ 写入 Milvus: {mr.insert_count} 条")
             return True
             
         except Exception as e:
@@ -509,7 +578,7 @@ class MilvusConnector:
                     field_name="embedding",
                     index_params=embedding_index_params
                 )
-                logger.info("✅ 成功创建embedding索引")
+                logger.info("✅ 创建 embedding 索引")
 
             if "sparse" not in existing_fields:
                 sparse_index_params = {
@@ -521,7 +590,7 @@ class MilvusConnector:
                     field_name="sparse",
                     index_params=sparse_index_params
                 )
-                logger.info("✅ 成功创建sparse索引")
+                logger.info("✅ 创建 sparse 索引")
 
             try:
                 self.collection.load()
@@ -550,24 +619,26 @@ class MilvusConnector:
     def verify_data(self) -> Dict[str, Any]:
         """验证数据"""
         if self.collection is None:
-            logger.error("❌ 集合未初始化")
-            return {}
+            try:
+                if not utility.has_collection(self.collection_name):
+                    logger.warning(f"⚠️  集合不存在: {self.collection_name}")
+                    return {
+                        "total_count": 0,
+                        "sample_data": []
+                    }
+
+                self.collection = Collection(name=self.collection_name)
+            except Exception as e:
+                logger.error(f"❌ 初始化集合失败: {e}")
+                return {}
         
         try:
             self.collection.load()
             count = self.collection.num_entities
-            logger.info(f"✅ Milvus中的数据量: {count}")
-            
-            # 获取样本数据
-            result = self.collection.query(
-                expr="",
-                output_fields=["modelId", "modelMd5", "modelName", "modelDescription", "modelText", "embeddingSource", "embedding"],
-                limit=3
-            )
+            logger.info(f"✅ Milvus 数据量: {count}")
             
             return {
                 "total_count": count,
-                "sample_data": result
             }
             
         except Exception as e:
@@ -585,9 +656,7 @@ class MilvusConnector:
 
 def reset_milvus(milvus_host: str, milvus_port: int, collection_name: str = "modelembeddings"):
     """重置Milvus集合（删除后重建）"""
-    logger.info("=" * 60)
-    logger.info("🔄 开始重置Milvus集合")
-    logger.info("=" * 60)
+    logger.info("🔄 重置 Milvus 集合")
     
     milvus = MilvusConnector(host=milvus_host, port=milvus_port)
     if not milvus.connect():
@@ -608,20 +677,18 @@ def reset_milvus(milvus_host: str, milvus_port: int, collection_name: str = "mod
             utility.drop_collection(collection_name)
             logger.info(f"✅ 已删除集合: {collection_name}")
         
-        logger.info("✅ Milvus集合重置完成")
+        logger.info("✅ Milvus 集合重置完成")
     except Exception as e:
         logger.error(f"❌ 重置集合失败: {e}")
     finally:
         milvus.close()
 
-async def migrate_full(mongodb_uri: str, genai_url: str, milvus_host: str, milvus_port: int):
-    """完整迁移：重新生成向量并迁移到Milvus"""
-    logger.info("=" * 60)
-    logger.info("🚀 开始完整迁移流程（重新生成向量）")
-    logger.info("=" * 60)
+async def migrate_full(mongodb_uri: str, mongodb_db: str, genai_url: str, milvus_host: str, milvus_port: int):
+    """完整迁移：生成向量写入MongoDB，再迁移到Milvus"""
+    logger.info("🚀 开始全量重建")
     
     # 1. 从MongoDB读取数据
-    mongo = MongoDBConnector(uri=mongodb_uri)
+    mongo = MongoDBConnector(uri=mongodb_uri, db_name=mongodb_db)
     if not mongo.connect():
         return
     
@@ -640,7 +707,7 @@ async def migrate_full(mongodb_uri: str, genai_url: str, milvus_host: str, milvu
     finally:
         await generator.close()
     
-    # 3. 迁移到Milvus
+    # 3. 写入 Milvus，不再经过 MongoDB embeddings 中转
     milvus = MilvusConnector(host=milvus_host, port=milvus_port)
     if not milvus.connect():
         return
@@ -665,62 +732,53 @@ async def migrate_full(mongodb_uri: str, genai_url: str, milvus_host: str, milvu
     milvus.close()
 
 
-def migrate_only(mongodb_uri: str, milvus_host: str, milvus_port: int):
+def migrate_only(mongodb_uri: str, mongodb_db: str, milvus_host: str, milvus_port: int):
     """只迁移数据，不重新生成向量"""
-    logger.info("=" * 60)
-    logger.info("🚀 开始数据迁移流程（保留原有向量）")
-    logger.info("=" * 60)
-    
-    # 1. 从MongoDB读取数据
-    mongo = MongoDBConnector(uri=mongodb_uri)
+    logger.info("🚀 开始迁移 MongoDB embeddings")
+
+    mongo = MongoDBConnector(uri=mongodb_uri, db_name=mongodb_db)
     if not mongo.connect():
         return
-    
-    docs = mongo.read_all_embeddings()
-    if not docs:
-        logger.error("❌ 未读取到任何数据，中止迁移")
-        mongo.close()
-        return
-    
-    logger.info(f"✅ 从MongoDB读取 {len(docs)} 条数据")
+
+    docs = mongo.read_embeddings_from_mongo()
     mongo.close()
-    
-    # 2. 迁移到Milvus
+
+    if not docs:
+        logger.error("❌ 未读取到 MongoDB embeddings，中止迁移")
+        return
+
     milvus = MilvusConnector(host=milvus_host, port=milvus_port)
     if not milvus.connect():
         return
-    
+
     if not milvus.create_collection():
         milvus.close()
         return
-    
+
+    if not milvus.create_index():
+        logger.warning("⚠️  索引创建失败，但数据已插入")
+
     if not milvus.insert_documents(docs):
         milvus.close()
         return
-    
-    if not milvus.create_index():
-        logger.warning("⚠️  索引创建失败，但数据已插入")
-    
-    # 验证
+
+    milvus.load_collection()
+
     verification = milvus.verify_data()
     logger.info(f"✅ 迁移完成！共 {verification.get('total_count', 0)} 条数据")
-    
+
     milvus.close()
 
 
 def verify_milvus(milvus_host: str, milvus_port: int):
     """验证Milvus中的数据"""
-    logger.info("=" * 60)
-    logger.info("🔍 开始验证Milvus数据")
-    logger.info("=" * 60)
+    logger.info("🔍 验证 Milvus 数据")
     
     milvus = MilvusConnector(host=milvus_host, port=milvus_port)
     if not milvus.connect():
         return
     
-    verification = milvus.verify_data()
-    if verification:
-        logger.info(json.dumps(verification, indent=2, ensure_ascii=False))
+    milvus.verify_data()
     
     milvus.close()
 
@@ -767,10 +825,9 @@ def main():
     
     args = parser.parse_args()
     
-    logger.info(f"📋 配置信息:")
-    logger.info(f"  - 模式: {args.mode}")
-    logger.info(f"  - MongoDB: {args.mongodb_uri}")
-    logger.info(f"  - Milvus: {args.milvus_host}:{args.milvus_port}")
+    logger.info("📋 配置信息")
+    logger.info(f"- 模式: {args.mode}")
+    logger.info(f"- Milvus: {args.milvus_host}:{args.milvus_port}")
     if args.mode == "full":
         logger.info(f"  - GenAI服务: {args.genai_url}")
     if args.reset_collection:
@@ -785,6 +842,7 @@ def main():
     if args.mode == "full":
         asyncio.run(migrate_full(
             mongodb_uri=args.mongodb_uri,
+            mongodb_db=args.mongodb_db,
             genai_url=args.genai_url,
             milvus_host=args.milvus_host,
             milvus_port=args.milvus_port
@@ -792,6 +850,7 @@ def main():
     elif args.mode == "migrate-only":
         migrate_only(
             mongodb_uri=args.mongodb_uri,
+            mongodb_db=args.mongodb_db,
             milvus_host=args.milvus_host,
             milvus_port=args.milvus_port
         )

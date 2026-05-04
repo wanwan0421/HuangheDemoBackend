@@ -123,6 +123,84 @@ export class MilvusService {
         return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
     }
 
+    private inferHybridWeights(queryText: string): { profile: string; weights: [number, number] } {
+        const text = this.normalizeText(queryText);
+        const lower = text.toLowerCase();
+        const asciiTokens = text.match(/[A-Za-z][A-Za-z0-9_./-]*/g) || [];
+        const hasIdentifier = asciiTokens.some((token) =>
+            token.includes('_') ||
+            token.includes('/') ||
+            token.includes('.') ||
+            /\d/.test(token),
+        );
+        const hasAcronym = asciiTokens.some((token) =>
+            token.length >= 2 && (token.match(/[A-Z]/g) || []).length >= 2,
+        );
+        const parameterTerms = [
+            '参数', '输入', '输出', '文件', '格式', '支持', '导入', '设置',
+            'input', 'output', 'parameter', 'param', 'data', 'file',
+        ];
+        const intentTerms = ['我想', '有没有', '推荐', '哪个', '哪一个', '比较好', '适合', '怎么选', '用什么'];
+
+        let keywordSignal = 0;
+        keywordSignal += hasIdentifier ? 2 : 0;
+        keywordSignal += hasAcronym ? 2 : 0;
+        keywordSignal += parameterTerms.filter((term) => lower.includes(term) || text.includes(term)).length;
+
+        const isColloquial = intentTerms.some((term) => text.includes(term));
+        if (isColloquial && keywordSignal <= 1) {
+            return { profile: 'dense_heavy', weights: [0.9, 0.1] };
+        }
+
+        if (keywordSignal >= 3) {
+            return { profile: 'keyword_aware', weights: [0.65, 0.35] };
+        }
+
+        return { profile: 'balanced', weights: [0.8, 0.2] };
+    }
+
+    private extractQueryRows(queryResult: any): any[] {
+        if (Array.isArray(queryResult)) {
+            return queryResult;
+        }
+
+        const rows = queryResult?.data ?? queryResult?.results ?? [];
+        return Array.isArray(rows) ? rows : [];
+    }
+
+    private async queryAllRowsByExpr(expr: string, outputFields: string[]): Promise<any[]> {
+        const batchSize = 1000;
+        const maxPages = 50;
+        let offset = 0;
+        const allRows: any[] = [];
+
+        for (let page = 0; page < maxPages; page += 1) {
+            const queryResult = await this.client.query({
+                collection_name: this.config.collectionName,
+                filter: expr,
+                expr,
+                output_fields: outputFields,
+                limit: batchSize,
+                offset,
+            } as any);
+
+            const rows = this.extractQueryRows(queryResult);
+            if (rows.length === 0) {
+                break;
+            }
+
+            allRows.push(...rows);
+
+            if (rows.length < batchSize) {
+                break;
+            }
+
+            offset += rows.length;
+        }
+
+        return allRows;
+    }
+
     private async collectionHasHybridSchema(): Promise<boolean> {
         const description = await this.client.describeCollection({
             collection_name: this.config.collectionName,
@@ -337,31 +415,26 @@ export class MilvusService {
         }
     }
 
-    private async deleteStaleBySource(activeModelMd5s: string[], embeddingSource: string): Promise<void> {
+    private async deleteStaleByMd5(activeModelMd5s: string[]): Promise<void> {
         const activeSet = new Set(activeModelMd5s.filter((item) => !!item));
         if (activeSet.size === 0) {
             return;
         }
 
-        const queryResult = await this.client.query({
-            collection_name: this.config.collectionName,
-            filter: `embeddingSource == "${this.escapeMilvusString(embeddingSource)}"`,
-            output_fields: ['modelMd5'],
-            limit: 100000,
-        });
-
-        const rows = (queryResult as any)?.data ?? (queryResult as any)?.results ?? [];
+        const rows = await this.queryAllRowsByExpr('', ['modelMd5']);
         const staleModelMd5s = (Array.isArray(rows) ? rows : [])
             .map((item: any) => item?.modelMd5)
             .filter((item: any) => typeof item === 'string' && !activeSet.has(item));
 
-        await this.deleteByModelMd5s(staleModelMd5s);
+        if (staleModelMd5s.length > 0) {
+            this.logger.log(`Deleting ${staleModelMd5s.length} stale model embeddings`);
+            await this.deleteByModelMd5s(staleModelMd5s);
+        }
     }
 
     async upsertDocuments(
         documents: MilvusEmbeddingDocument[],
-        activeModelMd5s: string[],
-        embeddingSource: string,
+        activeModelMd5s: string[]
     ): Promise<boolean> {
         try {
             await this.createCollection();
@@ -385,7 +458,7 @@ export class MilvusService {
                 }));
 
             if (rows.length === 0) {
-                await this.deleteStaleBySource(activeModelMd5s, embeddingSource);
+                await this.deleteStaleByMd5(activeModelMd5s);
                 this.logger.warn('No valid documents to insert; stale Milvus rows cleaned only');
                 return true;
             }
@@ -404,7 +477,7 @@ export class MilvusService {
                 collection_names: [this.config.collectionName],
             });
 
-            await this.deleteStaleBySource(activeModelMd5s, embeddingSource);
+            await this.deleteStaleByMd5(activeModelMd5s);
             await this.client.loadCollectionSync({
                 collection_name: this.config.collectionName,
             });
@@ -419,7 +492,7 @@ export class MilvusService {
     }
 
     async insertDocuments(documents: MilvusEmbeddingDocument[]): Promise<boolean> {
-        return this.upsertDocuments(documents, [], 'manual');
+        return this.upsertDocuments(documents, []);
     }
 
     async createIndex(): Promise<boolean> {
@@ -434,29 +507,27 @@ export class MilvusService {
         }
     }
 
-    async getExistingDocumentMap(embeddingSource: string): Promise<Map<string, MilvusEmbeddingDocument>> {
+    async getExistingDocumentMap(): Promise<Map<string, MilvusEmbeddingDocument>> {
         const existing = new Map<string, MilvusEmbeddingDocument>();
 
         try {
             await this.createCollection();
 
-            const queryResult = await this.client.query({
-                collection_name: this.config.collectionName,
-                filter: `embeddingSource == "${this.escapeMilvusString(embeddingSource)}"`,
-                output_fields: ['modelId', 'modelMd5', 'modelName', 'modelDescription', 'modelText', 'embeddingSource'],
-                limit: 100000,
-            });
+            const rows = await this.queryAllRowsByExpr(
+                '',
+                ['modelMd5', 'modelId', 'modelName', 'modelDescription', 'modelText', 'embeddingSource'],
+            );
 
-            const rows = (queryResult as any)?.data ?? (queryResult as any)?.results ?? [];
+            this.logger.log(`Milvus existing model embeddings fetched (by modelMd5): ${rows.length}`);
             for (const row of Array.isArray(rows) ? rows : []) {
-                const modelId = String(row?.modelId || '');
-                if (!modelId) {
+                const modelMd5 = String(row?.modelMd5 || '');
+                if (!modelMd5) {
                     continue;
                 }
 
-                existing.set(modelId, {
-                    modelId,
-                    modelMd5: String(row?.modelMd5 || ''),
+                existing.set(modelMd5, {
+                    modelId: String(row?.modelId || ''),
+                    modelMd5: modelMd5,
                     modelName: String(row?.modelName || ''),
                     modelDescription: String(row?.modelDescription || ''),
                     modelText: String(row?.modelText || ''),
@@ -470,34 +541,6 @@ export class MilvusService {
         }
 
         return existing;
-    }
-
-    async assertEmbeddingSourceConsistent(expectedSource: string): Promise<void> {
-        await this.createCollection();
-
-        const queryResult = await this.client.query({
-            collection_name: this.config.collectionName,
-            filter: `embeddingSource != "${this.escapeMilvusString(expectedSource)}"`,
-            output_fields: ['embeddingSource'],
-            limit: 10,
-        });
-
-        const rows = (queryResult as any)?.data ?? (queryResult as any)?.results ?? [];
-        const conflicts = Array.isArray(rows)
-            ? Array.from(
-                new Set(
-                    rows
-                        .map((row: any) => String(row?.embeddingSource || '').trim())
-                        .filter((value: string) => value.length > 0),
-                ),
-            )
-            : [];
-
-        if (conflicts.length > 0) {
-            throw new Error(
-                `Milvus embeddingSource 与当前配置不一致。期望: "${expectedSource}"，检测到历史来源: ${conflicts.join(', ')}`,
-            );
-        }
     }
 
     async search(embedding: number[], limit: number = 10, filter?: string): Promise<any[]> {
@@ -537,7 +580,8 @@ export class MilvusService {
         try {
             await this.createCollection();
 
-            const searchLimit = Math.max(limit, 10);
+            const searchLimit = Math.max(limit * 5, 50);
+            const hybridProfile = this.inferHybridWeights(queryText);
             const hybridRequests: any[] = [
                 {
                     data: [embedding],
@@ -561,7 +605,7 @@ export class MilvusService {
                 data: hybridRequests,
                 rerank: {
                     strategy: 'weighted',
-                    params: { weights: [0.65, 0.35] },
+                    params: { weights: hybridProfile.weights },
                 },
                 limit,
                 output_fields: ['modelId', 'modelMd5', 'modelName', 'modelDescription', 'embeddingSource'],

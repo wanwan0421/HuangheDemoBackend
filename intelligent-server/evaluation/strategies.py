@@ -9,6 +9,7 @@ import time
 import logging
 import math
 import os
+import re
 from typing import List, Dict, Any, Tuple, Optional
 from abc import ABC, abstractmethod
 from pymongo import MongoClient
@@ -298,6 +299,9 @@ class VectorOnlyStrategy(RAGStrategy):
 class HybridStrategy(VectorOnlyStrategy):
     """使用 Milvus 语义 + 关键词（BM25）混合检索。"""
 
+    strategy_name = "hybrid"
+    fusion_type = "adaptive"
+
     @staticmethod
     def _collection_has_sparse_field(collection: Collection) -> bool:
         try:
@@ -362,14 +366,6 @@ class HybridStrategy(VectorOnlyStrategy):
 
         return []
 
-    def _make_weighted_ranker(self):
-        semantic_weight = float(self.config.get("hybrid_semantic_weight", 0.8))
-        keyword_weight = float(self.config.get("hybrid_keyword_weight", 0.2))
-        try:
-            return WeightedRanker(semantic_weight, keyword_weight)
-        except TypeError:
-            return WeightedRanker([semantic_weight, keyword_weight])
-
     def _format_hits(self, hits: List[Any]) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
         for rank, hit in enumerate(hits, start=1):
@@ -385,6 +381,70 @@ class HybridStrategy(VectorOnlyStrategy):
                 "rank": rank,
             })
         return results
+
+    def _candidate_limit(self, top_k: int) -> int:
+        dense_topk = int(self.config.get("hybrid_dense_topk", max(top_k * 5, 50)) or 0)
+        keyword_topk = int(self.config.get("hybrid_keyword_topk", max(top_k * 5, 50)) or 0)
+        return max(top_k, dense_topk, keyword_topk, 50)
+
+    def _make_weighted_ranker(self, semantic_weight: float, keyword_weight: float):
+        try:
+            return WeightedRanker(semantic_weight, keyword_weight)
+        except TypeError:
+            return WeightedRanker([semantic_weight, keyword_weight])
+
+    def _make_rrf_ranker(self):
+        return RRFRanker(k=int(self.config.get("hybrid_rrf_k", 60)))
+
+    def _infer_query_profile(self, query_text: str) -> Dict[str, Any]:
+        text = (query_text or "").strip()
+        lower = text.lower()
+        ascii_tokens = re.findall(r"[A-Za-z][A-Za-z0-9_./-]*", text)
+        has_identifier = any(
+            "_" in token or "/" in token or "." in token or any(ch.isdigit() for ch in token)
+            for token in ascii_tokens
+        )
+        has_acronym = any(
+            len(token) >= 2 and sum(1 for ch in token if ch.isupper()) >= 2
+            for token in ascii_tokens
+        )
+        parameter_terms = [
+            "参数", "输入", "输出", "文件", "格式", "支持", "导入", "设置",
+            "input", "output", "parameter", "param", "data", "file",
+        ]
+        intent_terms = [
+            "我想", "有没有", "推荐", "哪个", "哪一个", "比较好", "适合",
+            "怎么选", "用什么",
+        ]
+
+        keyword_signal = 0
+        keyword_signal += 2 if has_identifier else 0
+        keyword_signal += 2 if has_acronym else 0
+        keyword_signal += sum(1 for term in parameter_terms if term in lower or term in text)
+
+        is_colloquial = any(term in text for term in intent_terms)
+        if is_colloquial and keyword_signal <= 1:
+            return {
+                "profile": "dense_heavy",
+                "semantic_weight": 0.9,
+                "keyword_weight": 0.1,
+                "keyword_signal": keyword_signal,
+            }
+
+        if keyword_signal >= 3:
+            return {
+                "profile": "keyword_aware",
+                "semantic_weight": 0.65,
+                "keyword_weight": 0.35,
+                "keyword_signal": keyword_signal,
+            }
+
+        return {
+            "profile": "balanced",
+            "semantic_weight": 0.8,
+            "keyword_weight": 0.2,
+            "keyword_signal": keyword_signal,
+        }
 
     def _milvus_vector_search(self, query_vector: List[float], top_k: int) -> List[Dict[str, Any]]:
         try:
@@ -402,13 +462,33 @@ class HybridStrategy(VectorOnlyStrategy):
             logger.exception("Milvus vector fallback search failed")
             return []
 
+    def _milvus_sparse_search(self, query_text: str, top_k: int) -> List[Dict[str, Any]]:
+        try:
+            collection = self.get_milvus_collection()
+            if not self._collection_has_sparse_field(collection):
+                logger.info("Milvus collection does not have sparse field; sparse-only search skipped")
+                return []
+
+            search_result = collection.search(
+                data=[query_text],
+                anns_field="sparse",
+                param={"metric_type": "BM25", "params": {}},
+                limit=top_k,
+                output_fields=["modelId", "modelMd5", "modelName", "modelDescription", "embeddingSource"],
+            )
+            hits = self._extract_hits(search_result)
+            return self._format_hits(hits)
+        except Exception:
+            logger.exception("Milvus sparse search failed")
+            return []
+
     def _milvus_hybrid_search(self, query_text: str, query_vector: List[float], top_k: int) -> Tuple[List[Dict[str, Any]], str]:
         collection = self.get_milvus_collection()
         if not self._collection_has_sparse_field(collection):
             logger.info("Milvus collection does not have sparse field; using vector-only search")
             return self._milvus_vector_search(query_vector, top_k), "vector_fallback_no_sparse"
 
-        search_limit = max(top_k * 5, 50)
+        search_limit = self._candidate_limit(top_k)
         semantic_request = AnnSearchRequest(
             data=[query_vector],
             anns_field="embedding",
@@ -422,9 +502,24 @@ class HybridStrategy(VectorOnlyStrategy):
             limit=search_limit,
         )
 
+        retrieval_mode = self.fusion_type
+        if self.fusion_type == "rrf":
+            reranker = self._make_rrf_ranker()
+        elif self.fusion_type == "weighted":
+            semantic_weight = float(self.config.get("hybrid_semantic_weight", 0.65))
+            keyword_weight = float(self.config.get("hybrid_keyword_weight", 0.35))
+            reranker = self._make_weighted_ranker(semantic_weight, keyword_weight)
+        else:
+            profile = self._infer_query_profile(query_text)
+            reranker = self._make_weighted_ranker(
+                float(profile["semantic_weight"]),
+                float(profile["keyword_weight"]),
+            )
+            retrieval_mode = f"adaptive_{profile['profile']}"
+
         results = collection.hybrid_search(
             [semantic_request, keyword_request],
-            rerank=RRFRanker(k=60),
+            rerank=reranker,
             limit=top_k,
             output_fields=["modelId", "modelMd5", "modelName", "modelDescription", "embeddingSource"],
         )
@@ -434,7 +529,7 @@ class HybridStrategy(VectorOnlyStrategy):
         if not formatted:
             logger.warning("Milvus hybrid search returned no hits; falling back to vector-only search")
             return self._milvus_vector_search(query_vector, top_k), "vector_fallback_empty_hybrid"
-        return formatted, "hybrid"
+        return formatted, retrieval_mode
 
     def retrieve(self, query: str, top_k: int = 10) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         llm_client = self.get_llm_client()
@@ -458,7 +553,7 @@ class HybridStrategy(VectorOnlyStrategy):
             retrieval_time = time.time() - retrieval_start
 
             return result, {
-                "strategy": "hybrid",
+                "strategy": self.strategy_name,
                 "retrieval_mode": retrieval_mode,
                 "embedding_time": embedding_time,
                 "retrieval_time": retrieval_time,
@@ -467,13 +562,47 @@ class HybridStrategy(VectorOnlyStrategy):
             }
         except Exception as e:
             logger.exception("Hybrid 检索失败")
-            return [], {"strategy": "hybrid", "error": str(e)}
+            return [], {"strategy": self.strategy_name, "error": str(e)}
 
     def generate(self, query: str, context: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
         answer, meta = super().generate(query, context)
         if meta.get("strategy") == "vector_only":
-            meta["strategy"] = "hybrid"
+            meta["strategy"] = self.strategy_name
         return answer, meta
+
+
+class SparseOnlyStrategy(HybridStrategy):
+    """Only use Milvus BM25 sparse retrieval."""
+
+    strategy_name = "sparse_only"
+
+    def retrieve(self, query: str, top_k: int = 10) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        retrieval_start = time.time()
+        result = self._milvus_sparse_search(query, top_k)
+        retrieval_time = time.time() - retrieval_start
+
+        return result, {
+            "strategy": self.strategy_name,
+            "retrieval_mode": "sparse_only",
+            "embedding_time": 0.0,
+            "retrieval_time": retrieval_time,
+            "retrieved_count": len(result),
+            "scores": [doc.get("score", 0.0) for doc in result],
+        }
+
+
+class HybridWeightedStrategy(HybridStrategy):
+    """Milvus dense + BM25 using fixed weighted fusion."""
+
+    strategy_name = "hybrid_weighted"
+    fusion_type = "weighted"
+
+
+class HybridRRFStrategy(HybridStrategy):
+    """Milvus dense + BM25 using fixed RRF fusion."""
+
+    strategy_name = "hybrid_rrf"
+    fusion_type = "rrf"
 
 
 def create_strategy(strategy_name: str, config: Dict[str, Any]) -> RAGStrategy:
@@ -481,7 +610,10 @@ def create_strategy(strategy_name: str, config: Dict[str, Any]) -> RAGStrategy:
     strategy_map = {
         "no_rag": NoRAGStrategy,
         "vector_only": VectorOnlyStrategy,
+        "sparse_only": SparseOnlyStrategy,
         "hybrid": HybridStrategy,
+        "hybrid_weighted": HybridWeightedStrategy,
+        "hybrid_rrf": HybridRRFStrategy,
     }
     
     if strategy_name not in strategy_map:

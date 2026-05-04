@@ -32,8 +32,8 @@ services:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "19000:9000"
+      - "19001:9001"
     volumes:
       - minio-data:/minio_data
     command: minio server /minio_data --console-address ":9001"
@@ -62,7 +62,7 @@ services:
       COMMON_LOG_LEVEL: info
     ports:
       - "19530:19530"
-      - "9091:9091"
+      - "19091:9091"
     volumes:
       - milvus-data:/var/lib/milvus
     networks:
@@ -74,33 +74,12 @@ services:
       retries: 5
     command: milvus run standalone
 
-  # MongoDB（如果使用）
-  mongodb:
-    image: mongo:6.0
-    container_name: mongodb-embedding
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: root
-      MONGO_INITDB_ROOT_PASSWORD: password
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongodb-data:/data/db
-    networks:
-      - embedding-network
-    healthcheck:
-      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
 volumes:
   etcd-data:
     driver: local
   minio-data:
     driver: local
   milvus-data:
-    driver: local
-  mongodb-data:
     driver: local
 
 networks:

@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 from typing import List, Dict, Any, Optional, Annotated
 from langchain.tools import tool
 from langchain_openai import OpenAIEmbeddings,ChatOpenAI
@@ -149,12 +150,45 @@ def _safe_hit_value(hit: Any, field_name: str) -> Any:
 
     return getattr(hit, field_name, None)
 
-def _make_weighted_ranker():
+def _make_weighted_ranker(semantic_weight: float = 0.65, keyword_weight: float = 0.35):
     """创建一个 WeightedRanker，兼容不同版本的 pymilvus"""
     try:
-        return WeightedRanker(0.65, 0.35)
+        return WeightedRanker(semantic_weight, keyword_weight)
     except TypeError:
-        return WeightedRanker([0.65, 0.35])
+        return WeightedRanker([semantic_weight, keyword_weight])
+
+def _infer_query_profile(query_text: str) -> Dict[str, Any]:
+    text = (query_text or "").strip()
+    lower = text.lower()
+    ascii_tokens = re.findall(r"[A-Za-z][A-Za-z0-9_./-]*", text)
+    has_identifier = any(
+        "_" in token or "/" in token or "." in token or any(ch.isdigit() for ch in token)
+        for token in ascii_tokens
+    )
+    has_acronym = any(
+        len(token) >= 2 and sum(1 for ch in token if ch.isupper()) >= 2
+        for token in ascii_tokens
+    )
+    parameter_terms = [
+        "参数", "输入", "输出", "文件", "格式", "支持", "导入", "设置",
+        "input", "output", "parameter", "param", "data", "file",
+    ]
+    intent_terms = [
+        "我想", "有没有", "推荐", "哪个", "哪一个", "比较好", "适合",
+        "怎么选", "用什么",
+    ]
+
+    keyword_signal = 0
+    keyword_signal += 2 if has_identifier else 0
+    keyword_signal += 2 if has_acronym else 0
+    keyword_signal += sum(1 for term in parameter_terms if term in lower or term in text)
+
+    is_colloquial = any(term in text for term in intent_terms)
+    if is_colloquial and keyword_signal <= 1:
+        return {"profile": "dense_heavy", "semantic_weight": 0.9, "keyword_weight": 0.1}
+    if keyword_signal >= 3:
+        return {"profile": "keyword_aware", "semantic_weight": 0.65, "keyword_weight": 0.35}
+    return {"profile": "balanced", "semantic_weight": 0.8, "keyword_weight": 0.2}
 
 def _extract_hybrid_hits(search_result: Any) -> List[Any]:
     candidates: List[Any] = []
@@ -218,13 +252,12 @@ def _milvus_vector_search(query_vector: List[float], top_k: int) -> List[Dict[st
 def _milvus_hybrid_search(query_text: str, query_vector: List[float], top_k: int) -> List[Dict[str, Any]]:
     """在 Milvus 中执行语义 + 关键词混合检索，并返回格式化结果"""
     try:
-        print("ENTER HYBRID SEARCH")
         collection = get_milvus_collection()
         if not _collection_has_sparse_field(collection):
             logger.info("Milvus collection does not have sparse field; using vector-only search")
             return _milvus_vector_search(query_vector, top_k)
 
-        search_limit = max(top_k * 5, 10)
+        search_limit = max(top_k * 5, 50)
         semantic_request = AnnSearchRequest(
             data=[query_vector],
             anns_field="embedding",
@@ -237,14 +270,17 @@ def _milvus_hybrid_search(query_text: str, query_vector: List[float], top_k: int
             param={"metric_type": "BM25", "params": {}},
             limit=search_limit,
         )
+        profile = _infer_query_profile(query_text)
         results = collection.hybrid_search(
             [semantic_request, keyword_request],
-            rerank=RRFRanker(k=60),
+            rerank=_make_weighted_ranker(
+                float(profile["semantic_weight"]),
+                float(profile["keyword_weight"]),
+            ),
             limit=top_k,
             output_fields=["modelId", "modelMd5", "modelName", "modelDescription", "embeddingSource"],
         )
-        print(f"Milvus hybrid search raw results: {results}")
-        logger.info(results)
+        logger.info("Milvus adaptive hybrid search profile=%s", profile.get("profile"))
 
         hits = _extract_hybrid_hits(results)
         hybrid_results: List[Dict[str, Any]] = []

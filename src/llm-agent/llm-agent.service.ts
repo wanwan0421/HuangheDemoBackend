@@ -27,12 +27,16 @@ export class LlmAgentService {
      */
     getSystemErrorName(query: string): Observable<{ event?: string; data: any}> {
         // 每一次observer.next()就推送一个SSE事件
+        const agentToken = process.env.AGENT_INTERNAL_TOKEN;
         return new Observable((observer) => {
             // 调用Python FastAPI后端接口
             this.httpsService.axiosRef({
                 url: `${process.env.agentUrl}/stream?query=${encodeURIComponent(query)}`,
                 method: 'GET',
                 responseType: 'stream',
+                headers: {
+                    ...(agentToken ? { 'X-Agent-Token': agentToken } : {}),
+                },
             }).then((response) => {
                 let buffer = '';
 
@@ -131,6 +135,7 @@ export class LlmAgentService {
 
     async pipePythonSSE(query: string, res: any) {
         const pythonUrl = `${process.env.agentUrl}/stream?query=${encodeURIComponent(query)}`;
+        const agentToken = process.env.AGENT_INTERNAL_TOKEN;
 
         const pythonRes = await axios({
             method: 'GET',
@@ -138,6 +143,7 @@ export class LlmAgentService {
             responseType: 'stream',
             headers: {
                 Accept: 'text/event-stream',
+                ...(agentToken ? { 'X-Agent-Token': agentToken } : {}),
             },
         });
 

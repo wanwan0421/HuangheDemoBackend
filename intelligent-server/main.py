@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException
+import os
+from fastapi import Depends, FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from agents.model_recommend.graph import agent, ModelState
@@ -13,6 +14,8 @@ import asyncio
 from pydantic import BaseModel, Field
 from pathlib import Path
 import logging
+from pymongo import MongoClient
+from bson import ObjectId
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -21,6 +24,38 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 # 允许任何来源的跨域请求
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME")
+mongo_client = MongoClient(MONGO_URI)
+mongo_db = mongo_client[MONGO_DB_NAME]
+
+
+def require_internal_agent_token(
+    x_agent_token: Optional[str] = Header(default=None, alias="X-Agent-Token"),
+):
+    expected_token = os.getenv("AGENT_INTERNAL_TOKEN")
+    if not expected_token:
+        raise HTTPException(status_code=500, detail="AGENT_INTERNAL_TOKEN is not configured")
+    if x_agent_token != expected_token:
+        raise HTTPException(status_code=401, detail="Unauthorized agent request")
+
+
+def verify_session_ownership(sessionId: Optional[str], userId: Optional[str]) -> tuple[str, str]:
+    """验证 sessionId 是否属于当前 userId。"""
+    if not sessionId or not userId:
+        raise HTTPException(status_code=401, detail="Missing sessionId or userId")
+
+    try:
+        session_object_id = ObjectId(sessionId)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid sessionId")
+
+    session_doc = mongo_db.sessions.find_one({"_id": session_object_id, "userId": userId})
+    if not session_doc:
+        raise HTTPException(status_code=403, detail="Unauthorized session access")
+
+    return sessionId, userId
 
 # ============= 模型推荐智能体路由 =============
 
@@ -35,7 +70,15 @@ def extract_text(content):
         return ""
 
 @app.get("/api/agent/stream")
-async def stream_agent(query: str, sessionId: Optional[str] = None):
+async def stream_agent(
+    query: str,
+    sessionId: Optional[str] = None,
+    userId: Optional[str] = Header(default=None, alias="X-User-ID"),
+    _: None = Depends(require_internal_agent_token),
+):
+    if sessionId:
+        verify_session_ownership(sessionId, userId)
+
     print("Received stream query:", query, "sessionId:", sessionId)
     if not query:
         raise HTTPException(status_code=400, detail="query is required")
@@ -46,7 +89,17 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
 
     async def event_generator():
         init_input = {
-            "messages": [HumanMessage(content=query)]
+            "messages": [HumanMessage(content=query)],
+            "llm_calls": 0,
+            "Task_spec": {},
+            "Model_contract": {},
+            "recommended_model": {},
+            "tool_results": {},
+            "selected_model_md5": "",
+            "user_id": userId,
+            "user_profile": {},
+            "user_preferences": {},
+            "latest_user_query": query,
         }
 
         try:
@@ -54,7 +107,16 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
                 "messages": [],
                 "session_id": thread_id,
                 "status": "processing",
-                "Task_spec": {}
+                "Task_spec": {},
+                "Model_contract": {},
+                "recommended_model": {},
+                "tool_results": {},
+                "selected_model_md5": "",
+                "llm_calls": 0,
+                "user_id": userId,
+                "user_profile": {},
+                "user_preferences": {},
+                "latest_user_query": query,
             }
 
             async for mode, chunk in agent.astream(
@@ -200,7 +262,12 @@ async def stream_agent(query: str, sessionId: Optional[str] = None):
 # ============= 数据分析辅助路由 =============
 
 @app.get("/api/agent/data-scan/stream")
-async def data_scan_stream_endpoint(file_path: str, session_id: Optional[str] = None, sessionId: Optional[str] = None):
+async def data_scan_stream_endpoint(
+    file_path: str,
+    session_id: Optional[str] = None,
+    sessionId: Optional[str] = None,
+    _: None = Depends(require_internal_agent_token),
+):
     """
     流式数据扫描端点：实时返回分析过程
     用于React前端实时展示分析进度
@@ -422,7 +489,11 @@ class AlignSessionRequest(BaseModel):
     auto_transform: bool = True
 
 @app.post("/api/agent/align-session/stream")
-async def align_session_stream(request: AlignSessionRequest):
+async def align_session_stream(
+    request: AlignSessionRequest,
+    userId: Optional[str] = Header(default=None, alias="X-User-ID"),
+    _: None = Depends(require_internal_agent_token),
+):
     """
     流式对齐与转换执行：作为第三智能体对外提供SSE。
 
@@ -434,6 +505,8 @@ async def align_session_stream(request: AlignSessionRequest):
     """
     if not request.task_spec or not request.model_contract:
         raise HTTPException(status_code=400, detail="缺少必要数据：task_spec 或 model_contract 为空")
+
+    verify_session_ownership(request.session_id, userId)
 
     async def event_generator():
         coordinator = get_coordinator()

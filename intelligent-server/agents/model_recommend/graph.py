@@ -1,6 +1,8 @@
 from . import tools
 from typing import TypedDict, Dict, Any, Annotated, Optional, get_type_hints, get_origin, get_args
 from langchain.messages import ToolMessage, HumanMessage, SystemMessage, AnyMessage
+from ..context_manager import ContextManager
+from ..store import Store
 from langgraph.graph import StateGraph, START, END
 import operator
 import json
@@ -18,6 +20,8 @@ DB_NAME = "huanghe-demo"
 class ModelState(TypedDict):
     messages: Annotated[list[AnyMessage], operator.add]
     llm_calls: int
+    user_id: str
+    latest_user_query: str
     # 任务规范，由Task Agent生成
     Task_spec: Annotated[Dict[str, Any], operator.or_]
     # 模型契约：由Model Agent生成
@@ -135,6 +139,72 @@ def get_latest_user_query(messages):
             return msg.content
     return ""
 
+
+def maybe_compress_messages(
+    messages: list[AnyMessage],
+    ctx_mgr: ContextManager,
+    max_tokens: int = 3000,
+    keep_last: int = 6,
+    summary_max_tokens: int = 500,
+) -> list[AnyMessage]:
+    if not messages:
+        return []
+
+    total_tokens = sum(ctx_mgr._count_tokens(extract_text_content(getattr(m, "content", ""))) for m in messages)
+    if total_tokens <= max_tokens:
+        return messages
+
+    if len(messages) <= keep_last:
+        return messages
+
+    to_compress = messages[:-keep_last]
+    to_keep = messages[-keep_last:]
+
+    compress_content = "\n".join(
+        f"[{type(m).__name__}] {extract_text_content(getattr(m, 'content', ''))[:200]}"
+        for m in to_compress
+    )
+
+    summary_prompt = (
+        "请将以下对话历史压缩成 3-5 条要点，保留用户目标、关键约束、已做决定、模型/数据细节。\n\n"
+        f"{compress_content}\n\n"
+        "压缩摘要："
+    )
+
+    summary_text = None
+    try:
+        summary_response = tools.recommendation_model.invoke([HumanMessage(content=summary_prompt)])
+        summary_text = extract_text_content(getattr(summary_response, "content", ""))
+    except Exception:
+        summary_text = None
+
+    if not summary_text:
+        return to_keep
+
+    summary_text = ctx_mgr._truncate_text(summary_text, summary_max_tokens)
+    summary_msg = HumanMessage(content=f"[Conversation Summary]\n{summary_text}")
+    return [summary_msg] + to_keep
+
+
+def _persist_task_memory(user_id: Optional[str], task_spec: Dict[str, Any], latest_query: str) -> None:
+    if not user_id or not task_spec:
+        return
+    try:
+        store = Store()
+        summary_parts = []
+        if latest_query:
+            summary_parts.append(f"query={latest_query}")
+        domain = task_spec.get("Domain")
+        target = task_spec.get("Target_object")
+        if domain:
+            summary_parts.append(f"domain={domain}")
+        if target:
+            summary_parts.append(f"target={target}")
+        summary = " | ".join(summary_parts) if summary_parts else "task_memory"
+        store.add_task_memory(user_id, summary, task_spec)
+    except Exception:
+        pass
+
 def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
     """
     负责从用户最新输入中提取或更新地理建模任务规范
@@ -165,7 +235,16 @@ def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
         "请基于对话更新 Task_spec。"
     ))
 
-    messages = [system, context] + state["messages"]
+    ctx_mgr = ContextManager(max_tokens=4000)
+    compressed_history = maybe_compress_messages(state.get("messages", []), ctx_mgr, max_tokens=3000)
+    fitted_history = ctx_mgr.fit_context_window(
+        messages=compressed_history,
+        system_prompt=system.content,
+        context_messages=[context],
+        task_spec=current_task_spec,
+        tool_results=state.get("tool_results"),
+    )
+    messages = [system, context] + fitted_history
     latest_user_query = state.get("latest_user_query") or get_latest_user_query(state.get("messages", []))
 
     try:
@@ -175,6 +254,12 @@ def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
             
     except Exception as e:
         contract = {}
+
+    _persist_task_memory(
+        state.get("user_id"),
+        contract,
+        latest_user_query,
+    )
 
     return {
         "messages": [], 
@@ -198,6 +283,17 @@ def recommend_model_node(state: ModelState) -> Dict[str, Any]:
         return {
             "messages": [AIMessage(content="未检索到可用的候选模型，请检查 Milvus 里的模型向量数据、collection schema 或输入查询。")],
         }
+
+    # 如果存在 user_id（由调用端注入），则检索用户长期记忆并构建 Context Bundle
+    user_id = state.get("user_id")
+    context_msgs = []
+    ctx_mgr = ContextManager(max_tokens=4000)
+    compressed_history = maybe_compress_messages(state.get("messages", []), ctx_mgr, max_tokens=3000)
+    try:
+        if user_id:
+            context_msgs = ctx_mgr.build_context_bundle(user_id, state, get_latest_user_query(state.get("messages", [])))
+    except Exception:
+        context_msgs = []
 
     system = SystemMessage(content=f"""
         # Role
@@ -230,9 +326,31 @@ def recommend_model_node(state: ModelState) -> Dict[str, Any]:
         - 只有在工具返回了真实候选模型后，才允许输出最终推荐。
         - 如果候选池为空，必须直接结束，不得自行猜测或编造模型。
         """)
-    messages = [system] + state["messages"]
+    # 动态裁剪历史消息，避免超过 token 预算
+    fitted_history = ctx_mgr.fit_context_window(
+        messages=compressed_history,
+        system_prompt=system.content,
+        context_messages=context_msgs,
+        task_spec=state.get("Task_spec"),
+        tool_results=state.get("tool_results"),
+    )
+
+    # 在 prompt 前注入 context bundle（如果有）以提供用户长期记忆和偏好
+    messages = ([] if not context_msgs else context_msgs) + [system] + fitted_history
 
     response = tools.model_with_tools.invoke(messages)
+
+    # 推荐后，若命中了具体模型则把推荐记入 user model memory
+    try:
+        store = Store()
+        user_id = state.get("user_id")
+        if user_id and isinstance(response, dict):
+            # 如果响应包含推荐模型信息，尝试写入
+            rec = response.get("recommended_model") or {}
+            if rec and rec.get("md5"):
+                store.add_model_memory(user_id, rec.get("md5"), rec.get("name", ""), reason="auto-recommend")
+    except Exception:
+        pass
 
     return {"messages": [response]}
 
@@ -300,11 +418,21 @@ def model_contract_node(state: ModelState) -> Dict[str, Any]:
     输出必须严格符合 `ModelContractEnvelope` 定义的 JSON 结构，确保字段不缺失。
     """
 
-    # 仅发送当前任务相关的 Prompt，不带state["messages"]里的历史聊天
+    ctx_mgr = ContextManager(max_tokens=4000)
+    compressed_history = maybe_compress_messages(state.get("messages", []), ctx_mgr, max_tokens=3000)
+    fitted_history = ctx_mgr.fit_context_window(
+        messages=compressed_history,
+        system_prompt=prompt_content,
+        context_messages=[],
+        task_spec=task_spec,
+        tool_results=state.get("tool_results"),
+    )
+
+    # 发送任务相关 Prompt，并附带裁剪后的历史消息（如有）
     response = None
     try:
         structured_llm = tools.recommendation_model.with_structured_output(ModelContractEnvelope)
-        response = structured_llm.invoke([HumanMessage(content=prompt_content)])
+        response = structured_llm.invoke([HumanMessage(content=prompt_content)] + fitted_history)
         contract = to_dict(response)
             
     except Exception as e:
@@ -350,6 +478,22 @@ def tool_node(state: ModelState) -> Dict[str, Any]:
 
             if tool_call["name"] == "get_model_details" and observation.get("status") == "success":
                 recommended_model = observation
+                try:
+                    user_id = state.get("user_id")
+                    if user_id:
+                        model_md5 = observation.get("md5", "")
+                        model_name = observation.get("name", "")
+                        reason = f"selected for task: {(state.get('Task_spec') or {}).get('Target_object', '')}"
+                        if model_md5:
+                            Store().add_model_memory(
+                                user_id=user_id,
+                                model_md5=model_md5,
+                                model_name=model_name,
+                                reason=reason,
+                                success=True,
+                            )
+                except Exception:
+                    pass
 
         # Graph 内部只保留 ToolMessage
         tool_messages.append(ToolMessage(

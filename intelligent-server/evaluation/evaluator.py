@@ -57,23 +57,27 @@ class RAGEvaluator:
             logger.error(f"加载查询集失败: {str(e)}")
             raise
     
-    def evaluate_strategy(self, strategy_name: str, runs: int = 1) -> Dict[str, Any]:
+    def evaluate_strategy(self, strategy_name: str, runs: int = 1, retrieval_only: bool = False) -> Dict[str, Any]:
         """
         评测单个策略
         Args:
             strategy_name: 策略名称 ("no_rag" 或 "vector_only")
             runs: 重复运行次数
+            retrieval_only: 是否只评测检索部分，跳过生成
         Returns:
             评测结果字典
         """
-        logger.info(f"开始评测策略: {strategy_name} (运行 {runs} 次)")
+        if retrieval_only:
+            logger.info(f"开始评测策略: {strategy_name} (检索模式，跳过生成) (运行 {runs} 次)")
+        else:
+            logger.info(f"开始评测策略: {strategy_name} (运行 {runs} 次)")
         
         all_run_results = []
         
         for run_idx in range(runs):
             logger.info(f"  --- 第 {run_idx + 1} 次运行 ---")
             
-            run_result = self._evaluate_single_run(strategy_name)
+            run_result = self._evaluate_single_run(strategy_name, retrieval_only=retrieval_only)
             all_run_results.append(run_result)
         
         # 合并多次运行的结果
@@ -85,7 +89,7 @@ class RAGEvaluator:
         
         return merged_result
     
-    def _evaluate_single_run(self, strategy_name: str) -> Dict[str, Any]:
+    def _evaluate_single_run(self, strategy_name: str, retrieval_only: bool = False) -> Dict[str, Any]:
         """执行单次评测"""
         
         # 创建策略
@@ -134,12 +138,6 @@ class RAGEvaluator:
                     # 执行检索
                     retrieved_docs, retrieval_meta = strategy.retrieve(query_text, cfg.VECTOR_TOPK)
                     
-                    # 生成context
-                    context = strategy.build_context(retrieved_docs)
-
-                    # 执行生成
-                    answer, generation_meta = strategy.generate(query_text, context)
-
                     # 提取检索到的 ID 列表
                     retrieved_ids = [doc.get("modelMd5") for doc in retrieved_docs]
                     
@@ -148,9 +146,24 @@ class RAGEvaluator:
                     all_metrics.append(metrics)
 
                     retrieval_time = float(retrieval_meta.get("retrieval_time", 0.0) or 0.0)
-                    generation_time = float(generation_meta.get("generation_time", 0.0) or 0.0)
-                    prompt_tokens = int(generation_meta.get("input_tokens", 0) or 0)
-                    completion_tokens = int(generation_meta.get("output_tokens", 0) or 0)
+                    
+                    # 根据 retrieval_only 决定是否生成
+                    if retrieval_only:
+                        generation_time = 0.0
+                        prompt_tokens = 0
+                        completion_tokens = 0
+                        answer = ""
+                        generation_meta = {"strategy": strategy_name, "skipped": True}
+                    else:
+                        # 生成context
+                        context = strategy.build_context(retrieved_docs)
+
+                        # 执行生成
+                        answer, generation_meta = strategy.generate(query_text, context)
+                        generation_time = float(generation_meta.get("generation_time", 0.0) or 0.0)
+                        prompt_tokens = int(generation_meta.get("input_tokens", 0) or 0)
+                        completion_tokens = int(generation_meta.get("output_tokens", 0) or 0)
+                    
                     query_total_tokens = prompt_tokens + completion_tokens
 
                     total_retrieval_time += retrieval_time
@@ -290,12 +303,13 @@ class RAGEvaluator:
         return merged
 
 
-def evaluate_all_strategies(strategies_list: List[str], runs: int = 1) -> Dict[str, Any]:
+def evaluate_all_strategies(strategies_list: List[str], runs: int = 1, retrieval_only: bool = False) -> Dict[str, Any]:
     """
     评测所有指定的策略
     Args:
         strategies_list: 策略名称列表，如 ["no_rag", "vector_only"]
         runs: 每个策略的重复运行次数
+        retrieval_only: 是否只评测检索部分，跳过生成
     Returns:
         所有策略的评测结果
     """
@@ -304,7 +318,7 @@ def evaluate_all_strategies(strategies_list: List[str], runs: int = 1) -> Dict[s
     all_results = {}
     
     for strategy_name in strategies_list:
-        result = evaluator.evaluate_strategy(strategy_name, runs)
+        result = evaluator.evaluate_strategy(strategy_name, runs, retrieval_only=retrieval_only)
         all_results[strategy_name] = result
     
     return all_results

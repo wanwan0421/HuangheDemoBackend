@@ -16,10 +16,13 @@ from pathlib import Path
 import logging
 from pymongo import MongoClient
 from bson import ObjectId
+from dotenv import load_dotenv
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 app = FastAPI()
 # 允许任何来源的跨域请求
@@ -27,6 +30,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME")
+if not MONGO_URI or not MONGO_DB_NAME:
+    raise RuntimeError("MONGO_URI and MONGO_DB_NAME must be configured in intelligent-server/.env")
 mongo_client = MongoClient(MONGO_URI)
 mongo_db = mongo_client[MONGO_DB_NAME]
 
@@ -88,14 +93,21 @@ async def stream_agent(
     coordinator = get_coordinator()
 
     async def event_generator():
+        request_id = str(uuid.uuid4())
         init_input = {
             "messages": [HumanMessage(content=query)],
             "llm_calls": 0,
+            "tool_call_count": 0,
             "Task_spec": {},
             "Model_contract": {},
             "recommended_model": {},
             "tool_results": {},
             "selected_model_md5": "",
+            "request_id": request_id,
+            "task_hash": "",
+            "tool_scope_id": request_id,
+            "conversation_summary": "",
+            "summary_revision": 0,
             "user_id": userId,
             "user_profile": {},
             "user_preferences": {},
@@ -113,6 +125,12 @@ async def stream_agent(
                 "tool_results": {},
                 "selected_model_md5": "",
                 "llm_calls": 0,
+                "tool_call_count": 0,
+                "request_id": request_id,
+                "task_hash": "",
+                "tool_scope_id": request_id,
+                "conversation_summary": "",
+                "summary_revision": 0,
                 "user_id": userId,
                 "user_profile": {},
                 "user_preferences": {},
@@ -141,7 +159,7 @@ async def stream_agent(
 
                     # 屏蔽 parse_task_spec_node 的文本输出
                     # 如果当前是解析节点，不仅不显示 JSON，什么都不发给前端文本流
-                    if node_name == "parse_task_spec_node" or node_name == "model_contract_node":
+                    if node_name in {"parse_task_spec_node", "model_contract_node", "memory_maintenance_node"}:
                         continue 
 
                     # 正常的LLM节点才发送 Token

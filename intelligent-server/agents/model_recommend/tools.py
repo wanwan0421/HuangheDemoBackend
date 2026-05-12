@@ -2,6 +2,7 @@ import os
 import logging
 import re
 from typing import List, Dict, Any, Optional, Annotated
+from pathlib import Path
 from langchain.tools import tool
 from langchain_openai import OpenAIEmbeddings,ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -24,7 +25,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # 初始化模型
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 AIHUBMIX_API_KEY = os.getenv("AIHUBMIX_API_KEY")
 AIHUBMIX_BASE_URL = os.getenv("AIHUBMIX_BASE_URL")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -43,11 +44,11 @@ recommendation_model = ChatOpenAI(
 )
 
 # 连接配置
-MONGO_URI = "mongodb://localhost:27017/"
-DB_NAME = "huanghe-demo"
-MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
-MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
-MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION", "modelembeddings")
+MONGO_URI = os.getenv("MONGO_URI")
+DB_NAME = os.getenv("MONGO_DB_NAME")
+MILVUS_HOST = os.getenv("MILVUS_HOST")
+MILVUS_PORT = int(os.getenv("MILVUS_PORT"))
+MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION")
 
 # MongoDB连接池
 _db_client = None
@@ -107,6 +108,8 @@ def _selected_model_md5_from_state(state: Optional[Dict[str, Any]]) -> str:
 def get_db():
     """获取 MongoDB 数据库连接"""
     global _db_client
+    if not MONGO_URI or not DB_NAME:
+        raise RuntimeError("MONGO_URI and MONGO_DB_NAME must be configured in intelligent-server/.env")
     if _db_client is None:
         _db_client = MongoClient(MONGO_URI)
     return _db_client[DB_NAME]

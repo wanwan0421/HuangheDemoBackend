@@ -7,31 +7,57 @@ from langgraph.graph import StateGraph, START, END
 import operator
 import json
 import inspect
+import hashlib
+import os
+from pathlib import Path
 from pymongo import MongoClient
 from langgraph.checkpoint.mongodb import MongoDBSaver
 from pydantic import BaseModel, Field
 from langgraph.prebuilt import InjectedState
 from langchain_core.messages import AIMessage
+from dotenv import load_dotenv
 
 # 连接配置
-MONGO_URI = "mongodb://localhost:27017/"
-DB_NAME = "huanghe-demo"
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME")
+MAX_TOOL_CALL_ITERATIONS = int(os.getenv("MAX_TOOL_CALL_ITERATIONS"))
+MESSAGE_SUMMARY_TRIGGER = int(os.getenv("MESSAGE_SUMMARY_TRIGGER"))
+MESSAGE_KEEP_RECENT = int(os.getenv("MESSAGE_KEEP_RECENT"))
+
+
+def replace_state_value(current: Any, incoming: Any) -> Any:
+    return current if incoming is None else incoming
+
+
+def messages_reducer(current: list[AnyMessage], incoming: Any) -> list[AnyMessage]:
+    current = current or []
+    if incoming is None:
+        return current
+    if isinstance(incoming, dict) and incoming.get("__replace_messages__"):
+        return incoming.get("items", [])
+    return current + (incoming or [])
 
 class ModelState(TypedDict):
-    messages: Annotated[list[AnyMessage], operator.add]
-    llm_calls: int
-    user_id: str
-    latest_user_query: str
+    messages: Annotated[list[AnyMessage], messages_reducer]
+    llm_calls: Annotated[int, replace_state_value]
+    tool_call_count: Annotated[int, replace_state_value]
+    request_id: Annotated[str, replace_state_value]
+    task_hash: Annotated[str, replace_state_value]
+    tool_scope_id: Annotated[str, replace_state_value]
+    conversation_summary: Annotated[str, replace_state_value]
+    user_id: Annotated[str, replace_state_value]
+    latest_user_query: Annotated[str, replace_state_value]
     # 任务规范，由Task Agent生成
     Task_spec: Annotated[Dict[str, Any], operator.or_]
     # 模型契约：由Model Agent生成
-    Model_contract: Annotated[Dict[str, Any], operator.or_]
+    Model_contract: Annotated[Dict[str, Any], replace_state_value]
     # 模型推荐详情
-    recommended_model: Annotated[Dict[str, Any], operator.or_]
+    recommended_model: Annotated[Dict[str, Any], replace_state_value]
     # 各工具最近一次结果
-    tool_results: Annotated[Dict[str, Any], operator.or_]
+    tool_results: Annotated[Dict[str, Any], replace_state_value]
     # 候选最优模型md5
-    selected_model_md5: str
+    selected_model_md5: Annotated[str, replace_state_value]
 
 # 任务规范结构
 class TaskSpec(BaseModel):
@@ -136,58 +162,153 @@ def render_recent_context(messages: list[AnyMessage], limit: int = 6) -> str:
 def get_latest_user_query(messages):
     for msg in reversed(messages or []):
         if isinstance(msg, HumanMessage):
-            return msg.content
+            return extract_text_content(getattr(msg, "content", ""))
     return ""
 
+# 构建任务哈希值
+def build_task_hash(task_spec: Dict[str, Any], latest_query: str) -> str:
+    payload = {
+        "task_spec": task_spec or {},
+        "latest_query": latest_query or "",
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
-def maybe_compress_messages(
-    messages: list[AnyMessage],
-    ctx_mgr: ContextManager,
-    max_tokens: int = 3000,
-    keep_last: int = 6,
-    summary_max_tokens: int = 500,
-) -> list[AnyMessage]:
-    if not messages:
-        return []
+# 构建工具调用范围ID，优先级：request_id > task_hash > 任务规范+最新用户查询的哈希值
+def get_tool_scope_id(state: ModelState) -> str:
+    request_id = str(state.get("request_id") or "").strip()
+    if request_id:
+        return request_id
+    task_hash = str(state.get("task_hash") or "").strip()
+    if task_hash:
+        return task_hash
+    return build_task_hash(state.get("Task_spec", {}) or {}, state.get("latest_user_query", "") or "")
 
-    total_tokens = sum(ctx_mgr._count_tokens(extract_text_content(getattr(m, "content", ""))) for m in messages)
-    if total_tokens <= max_tokens:
-        return messages
 
-    if len(messages) <= keep_last:
-        return messages
+def get_scoped_tool_results(state: ModelState) -> Dict[str, Any]:
+    tool_results = dict(state.get("tool_results", {}) or {})
+    scope_id = get_tool_scope_id(state)
+    if tool_results.get("_scope_id") and tool_results.get("_scope_id") != scope_id:
+        return {}
+    return {k: v for k, v in tool_results.items() if not str(k).startswith("_")}
 
-    to_compress = messages[:-keep_last]
-    to_keep = messages[-keep_last:]
 
-    compress_content = "\n".join(
-        f"[{type(m).__name__}] {extract_text_content(getattr(m, 'content', ''))[:200]}"
-        for m in to_compress
-    )
+def get_scoped_recommended_model(state: ModelState) -> Dict[str, Any]:
+    recommended_model = dict(state.get("recommended_model", {}) or {})
+    if not recommended_model:
+        return {}
+    scope_id = get_tool_scope_id(state)
+    model_scope = recommended_model.get("_scope_id")
+    if model_scope and model_scope != scope_id:
+        return {}
+    if model_scope is None and state.get("request_id"):
+        return {}
+    return {k: v for k, v in recommended_model.items() if not str(k).startswith("_")}
+
+
+def scoped_tool_results_envelope(state: ModelState, base_results: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    scope_id = get_tool_scope_id(state)
+    return {
+        "_scope_id": scope_id,
+        "_request_id": state.get("request_id", ""),
+        "_task_hash": state.get("task_hash", ""),
+        **(base_results or {}),
+    }
+
+
+def compact_tool_results(tool_results: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    compact: Dict[str, Any] = {}
+    for name, result in (tool_results or {}).items():
+        if str(name).startswith("_"):
+            continue
+        if not isinstance(result, dict):
+            compact[name] = result
+            continue
+        entry = {
+            "status": result.get("status"),
+            "count": result.get("count"),
+            "message": result.get("message"),
+        }
+        models = result.get("models")
+        if isinstance(models, list):
+            entry["models"] = [
+                {
+                    "modelMd5": model.get("modelMd5"),
+                    "modelName": model.get("modelName"),
+                    "score": model.get("score"),
+                    "rank": model.get("rank"),
+                }
+                for model in models[:5]
+                if isinstance(model, dict)
+            ]
+        if result.get("md5"):
+            entry["md5"] = result.get("md5")
+            entry["name"] = result.get("name")
+            entry["description"] = result.get("description")
+        compact[name] = {k: v for k, v in entry.items() if v is not None}
+    return compact
+
+
+def build_structured_history_digest(messages: list[AnyMessage], ctx_mgr: ContextManager, max_tokens: int = 1400) -> str:
+    rows = []
+    used = 0
+    for msg in messages:
+        compressed = ctx_mgr._compress_message_for_context(msg, max_tokens=140)
+        text = extract_text_content(getattr(compressed, "content", ""))
+        tokens = ctx_mgr._count_tokens(text)
+        if used + tokens > max_tokens:
+            break
+        rows.append(text)
+        used += tokens
+    return "\n\n".join(rows)
+
+
+def memory_maintenance_node(state: ModelState) -> Dict[str, Any]:
+    """负责对消息历史进行总结和压缩，生成对话摘要，并更新状态中的 messages 和 conversation_summary 字段"""
+    messages = state.get("messages", []) or []
+    if len(messages) <= MESSAGE_SUMMARY_TRIGGER:
+        return {}
+
+    keep_recent = max(MESSAGE_KEEP_RECENT, 4)
+    old_messages = messages[:-keep_recent]
+    recent_messages = messages[-keep_recent:]
+    if not old_messages:
+        return {}
+
+    ctx_mgr = ContextManager(max_tokens=4000)
+    previous_summary = state.get("conversation_summary") or ""
+    digest = build_structured_history_digest(old_messages, ctx_mgr)
+    latest_query = state.get("latest_user_query") or get_latest_user_query(messages)
 
     summary_prompt = (
-        "请将以下对话历史压缩成 3-5 条要点，保留用户目标、关键约束、已做决定、模型/数据细节。\n\n"
-        f"{compress_content}\n\n"
-        "压缩摘要："
+        "请更新对话滚动摘要，用于后续地理建模智能体恢复上下文。"
+        "摘要必须保留：用户目标、任务规范、关键约束、已调用工具、候选/已选模型、待确认问题。"
+        "不要保留无关寒暄，不要编造。\n\n"
+        f"已有摘要:\n{previous_summary or '无'}\n\n"
+        f"本次需要吸收的旧消息结构化摘要:\n{digest}\n\n"
+        f"最新用户问题:\n{latest_query}\n\n"
+        "输出 6 条以内要点："
     )
 
-    summary_text = None
     try:
-        summary_response = tools.recommendation_model.invoke([HumanMessage(content=summary_prompt)])
-        summary_text = extract_text_content(getattr(summary_response, "content", ""))
+        response = tools.recommendation_model.invoke([HumanMessage(content=summary_prompt)])
+        summary_text = extract_text_content(getattr(response, "content", "")).strip()
     except Exception:
-        summary_text = None
+        summary_text = ""
 
-    if not summary_text:
-        return to_keep
-
-    summary_text = ctx_mgr._truncate_text(summary_text, summary_max_tokens)
+    summary_text = ctx_mgr._truncate_text(summary_text, 700)
     summary_msg = HumanMessage(content=f"[Conversation Summary]\n{summary_text}")
-    return [summary_msg] + to_keep
+    return {
+        "messages": {
+            "__replace_messages__": True,
+            "items": [summary_msg] + recent_messages,
+        },
+        "conversation_summary": summary_text,
+    }
 
 
 def _persist_task_memory(user_id: Optional[str], task_spec: Dict[str, Any], latest_query: str) -> None:
-    if not user_id or not task_spec:
+    if not user_id or not task_spec or not any(str(v or "").strip() for v in task_spec.values()):
         return
     try:
         store = Store()
@@ -236,16 +357,16 @@ def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
     ))
 
     ctx_mgr = ContextManager(max_tokens=4000)
-    compressed_history = maybe_compress_messages(state.get("messages", []), ctx_mgr, max_tokens=3000)
+    latest_user_query = state.get("latest_user_query") or get_latest_user_query(state.get("messages", []))
     fitted_history = ctx_mgr.fit_context_window(
-        messages=compressed_history,
+        messages=state.get("messages", []),
         system_prompt=system.content,
-        context_messages=[context],
         task_spec=current_task_spec,
-        tool_results=state.get("tool_results"),
+        tool_results=compact_tool_results(get_scoped_tool_results(state)),
+        latest_query=latest_user_query,
+        conversation_summary=state.get("conversation_summary", ""),
     )
     messages = [system, context] + fitted_history
-    latest_user_query = state.get("latest_user_query") or get_latest_user_query(state.get("messages", []))
 
     try:
         structured_llm = tools.recommendation_model.with_structured_output(TaskSpecEnvelope)
@@ -261,10 +382,14 @@ def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
         latest_user_query,
     )
 
+    task_hash = build_task_hash(contract, latest_user_query)
+
     return {
         "messages": [], 
         "Task_spec": contract,
-        "latest_user_query": latest_user_query
+        "latest_user_query": latest_user_query,
+        "task_hash": task_hash,
+        "tool_scope_id": get_tool_scope_id({**state, "task_hash": task_hash}),
     }
 
 def recommend_model_node(state: ModelState) -> Dict[str, Any]:
@@ -275,7 +400,7 @@ def recommend_model_node(state: ModelState) -> Dict[str, Any]:
     """
     # 加入SystemMessage以约束模型行为（同时生成 Task Spec 与模型推荐）
 
-    tool_results = state.get("tool_results", {}) or {}
+    tool_results = get_scoped_tool_results(state)
     relevant_models = (tool_results.get("search_relevant_models", {}) or {}).get("models", []) or []
     search_status = (tool_results.get("search_relevant_models", {}) or {}).get("status")
 
@@ -284,14 +409,21 @@ def recommend_model_node(state: ModelState) -> Dict[str, Any]:
             "messages": [AIMessage(content="未检索到可用的候选模型，请检查 Milvus 里的模型向量数据、collection schema 或输入查询。")],
         }
 
+    if int(state.get("tool_call_count") or 0) >= MAX_TOOL_CALL_ITERATIONS and not get_scoped_recommended_model(state):
+        return {
+            "messages": [AIMessage(content=f"工具调用已达到上限（{MAX_TOOL_CALL_ITERATIONS} 次），暂时无法稳定完成模型推荐。请补充更明确的领域、目标对象或空间范围后重试。")],
+        }
+
     # 如果存在 user_id（由调用端注入），则检索用户长期记忆并构建 Context Bundle
     user_id = state.get("user_id")
     context_msgs = []
     ctx_mgr = ContextManager(max_tokens=4000)
-    compressed_history = maybe_compress_messages(state.get("messages", []), ctx_mgr, max_tokens=3000)
     try:
         if user_id:
-            context_msgs = ctx_mgr.build_context_bundle(user_id, state, get_latest_user_query(state.get("messages", [])))
+            context_msgs = ctx_mgr.build_context_bundle(
+                user_id,
+                state.get("latest_user_query") or get_latest_user_query(state.get("messages", [])),
+            )
     except Exception:
         context_msgs = []
 
@@ -328,15 +460,16 @@ def recommend_model_node(state: ModelState) -> Dict[str, Any]:
         """)
     # 动态裁剪历史消息，避免超过 token 预算
     fitted_history = ctx_mgr.fit_context_window(
-        messages=compressed_history,
+        messages=state.get("messages", []),
         system_prompt=system.content,
-        context_messages=context_msgs,
         task_spec=state.get("Task_spec"),
-        tool_results=state.get("tool_results"),
+        tool_results=compact_tool_results(tool_results),
+        latest_query=state.get("latest_user_query") or get_latest_user_query(state.get("messages", [])),
+        conversation_summary=state.get("conversation_summary", ""),
     )
 
-    # 在 prompt 前注入 context bundle（如果有）以提供用户长期记忆和偏好
-    messages = ([] if not context_msgs else context_msgs) + [system] + fitted_history
+    # SystemMessage 必须放在第一位；历史记忆作为参考上下文放在其后。
+    messages = [system] + context_msgs + fitted_history
 
     response = tools.model_with_tools.invoke(messages)
 
@@ -360,24 +493,21 @@ def model_contract_node(state: ModelState) -> Dict[str, Any]:
     """
     
     # 优先使用state里已缓存的推荐模型
-    target_model_data = state.get("recommended_model") or None
+    target_model_data = get_scoped_recommended_model(state) or None
     messages = state.get("messages", [])
     
-    # 显示所有消息类型，便于诊断
-    for i, msg in enumerate(reversed(messages)):
-        tool_id = getattr(msg, "tool_name", None) or getattr(msg, "name", None)
-        
-        if target_model_data:
-            break
-
-        if isinstance(msg, ToolMessage) and tool_id == "get_model_details":
-            try:
-                data = json.loads(msg.content)
-                if data.get("status") == "success":
-                    target_model_data = data
-                    break
-            except Exception as e:
-                continue
+    if not target_model_data and not state.get("request_id"):
+        # 兼容旧 checkpoint：旧状态没有 request_id 时，才允许从历史 ToolMessage 回捞。
+        for msg in reversed(messages):
+            tool_id = getattr(msg, "tool_name", None) or getattr(msg, "name", None)
+            if isinstance(msg, ToolMessage) and tool_id == "get_model_details":
+                try:
+                    data = json.loads(msg.content)
+                    if data.get("status") == "success":
+                        target_model_data = data
+                        break
+                except Exception:
+                    continue
 
     if not target_model_data:
         return {
@@ -419,20 +549,20 @@ def model_contract_node(state: ModelState) -> Dict[str, Any]:
     """
 
     ctx_mgr = ContextManager(max_tokens=4000)
-    compressed_history = maybe_compress_messages(state.get("messages", []), ctx_mgr, max_tokens=3000)
     fitted_history = ctx_mgr.fit_context_window(
-        messages=compressed_history,
+        messages=state.get("messages", []),
         system_prompt=prompt_content,
-        context_messages=[],
         task_spec=task_spec,
-        tool_results=state.get("tool_results"),
+        tool_results=compact_tool_results(get_scoped_tool_results(state)),
+        latest_query=state.get("latest_user_query") or get_latest_user_query(state.get("messages", [])),
+        conversation_summary=state.get("conversation_summary", ""),
     )
 
     # 发送任务相关 Prompt，并附带裁剪后的历史消息（如有）
     response = None
     try:
         structured_llm = tools.recommendation_model.with_structured_output(ModelContractEnvelope)
-        response = structured_llm.invoke([HumanMessage(content=prompt_content)] + fitted_history)
+        response = structured_llm.invoke([SystemMessage(content=prompt_content)] + fitted_history)
         contract = to_dict(response)
             
     except Exception as e:
@@ -458,15 +588,29 @@ def tool_node(state: ModelState) -> Dict[str, Any]:
     tool_calls = getattr(last_message, "tool_calls", []) or []
 
     tool_messages = []
-    tool_results = state.get("tool_results", {}) or {}
+    tool_results = get_scoped_tool_results(state)
     selected_model_md5 = state.get("selected_model_md5", "")
-    recommended_model = state.get("recommended_model", {}) or {}
+    recommended_model = get_scoped_recommended_model(state)
+    scope_id = get_tool_scope_id(state)
 
     for tool_call in tool_calls:
-        tool = tools.TOOLS_BY_NAME[tool_call["name"]]
+        tool_name = tool_call.get("name")
+        tool = tools.TOOLS_BY_NAME.get(tool_name)
+        if tool is None:
+            observation = {
+                "status": "error",
+                "message": f"未知工具: {tool_name}",
+            }
+            tool_messages.append(ToolMessage(
+                content=json.dumps(observation, ensure_ascii=False),
+                tool_call_id=tool_call.get("id", f"unknown_tool_{len(tool_messages)}"),
+                tool_name=tool_name or "unknown"
+            ))
+            continue
+
         args_with_injected_state = inject_state_for_tool(tool, tool_call.get("args", {}), state)
         observation = tool.invoke(args_with_injected_state)
-        tool_results[tool_call["name"]] = observation
+        tool_results[tool_name] = observation
 
         if isinstance(observation, dict):
             if observation.get("md5"):
@@ -476,8 +620,13 @@ def tool_node(state: ModelState) -> Dict[str, Any]:
                 if models and isinstance(models[0], dict) and models[0].get("modelMd5"):
                     selected_model_md5 = models[0]["modelMd5"]
 
-            if tool_call["name"] == "get_model_details" and observation.get("status") == "success":
-                recommended_model = observation
+            if tool_name == "get_model_details" and observation.get("status") == "success":
+                recommended_model = {
+                    **observation,
+                    "_scope_id": scope_id,
+                    "_request_id": state.get("request_id", ""),
+                    "_task_hash": state.get("task_hash", ""),
+                }
                 try:
                     user_id = state.get("user_id")
                     if user_id:
@@ -499,15 +648,16 @@ def tool_node(state: ModelState) -> Dict[str, Any]:
         tool_messages.append(ToolMessage(
             content=json.dumps(observation, ensure_ascii=False),
             tool_call_id=tool_call["id"],
-            tool_name=tool_call["name"]
+            tool_name=tool_name
         ))
 
     return {
         "messages": tool_messages,
         "Task_spec": state.get("Task_spec", {}),
-        "tool_results": tool_results,
+        "tool_results": scoped_tool_results_envelope(state, tool_results),
         "selected_model_md5": selected_model_md5,
         "recommended_model": recommended_model,
+        "tool_call_count": int(state.get("tool_call_count") or 0) + len(tool_calls),
     }
 
 def should_continue(state: ModelState) -> Any:
@@ -524,15 +674,8 @@ def should_continue(state: ModelState) -> Any:
     task_spec = state.get("Task_spec", {})
     has_task_spec = bool(task_spec and any(task_spec.values()))
     
-    # 反向查找是否已有get_model_details的结果
-    has_model_details = bool(state.get("recommended_model"))
-    for msg in reversed(messages):
-        if isinstance(msg, ToolMessage) and msg.tool_name == "get_model_details":
-            has_model_details = True
-            break
-
-    if has_task_spec and not has_model_details:
-        return "tool_node"
+    # 只认可本轮作用域内的 get_model_details 结果，避免旧 checkpoint 污染新请求。
+    has_model_details = bool(get_scoped_recommended_model(state))
     
     # 如果工作流已完整，进入合约生成阶段
     if has_task_spec and has_model_details:
@@ -541,10 +684,12 @@ def should_continue(state: ModelState) -> Any:
     # 检查是否还需要调用工具（但防止重复调用）
     # 只有当最后一条消息是 AIMessage 且有 tool_calls 时，才调用工具
     if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        if int(state.get("tool_call_count") or 0) >= MAX_TOOL_CALL_ITERATIONS:
+            return "memory_maintenance_node"
         return "tool_node"
     
     # 否则结束
-    return END
+    return "memory_maintenance_node"
 
 agent_builder = StateGraph(ModelState)
 
@@ -552,6 +697,7 @@ agent_builder.add_node("parse_task_spec_node", parse_task_spec_node)
 agent_builder.add_node("recommend_model_node", recommend_model_node)
 agent_builder.add_node("model_contract_node", model_contract_node)
 agent_builder.add_node("tool_node", tool_node)
+agent_builder.add_node("memory_maintenance_node", memory_maintenance_node)
 
 agent_builder.add_edge(START, "parse_task_spec_node")
 agent_builder.add_edge("parse_task_spec_node", "recommend_model_node")
@@ -563,12 +709,17 @@ agent_builder.add_conditional_edges(
         "recommend_model_node": "recommend_model_node",
         "tool_node": "tool_node",
         "model_contract_node": "model_contract_node",
+        "memory_maintenance_node": "memory_maintenance_node",
         END: END
     }
 )
 
 agent_builder.add_edge("tool_node", "recommend_model_node")
-agent_builder.add_edge("model_contract_node", END)
+agent_builder.add_edge("model_contract_node", "memory_maintenance_node")
+agent_builder.add_edge("memory_maintenance_node", END)
+
+if not MONGO_URI or not MONGO_DB_NAME:
+    raise RuntimeError("MONGO_URI and MONGO_DB_NAME must be configured in intelligent-server/.env")
 
 mongo_client = MongoClient(MONGO_URI)
 checkpointer = MongoDBSaver(mongo_client)

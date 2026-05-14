@@ -9,7 +9,6 @@ import time
 import logging
 import math
 import os
-import re
 from typing import List, Dict, Any, Tuple, Optional
 from abc import ABC, abstractmethod
 from pymongo import MongoClient
@@ -300,7 +299,7 @@ class HybridStrategy(VectorOnlyStrategy):
     """使用 Milvus 语义 + 关键词（BM25）混合检索。"""
 
     strategy_name = "hybrid"
-    fusion_type = "adaptive"
+    fusion_type = "rrf"
 
     @staticmethod
     def _collection_has_sparse_field(collection: Collection) -> bool:
@@ -396,56 +395,6 @@ class HybridStrategy(VectorOnlyStrategy):
     def _make_rrf_ranker(self):
         return RRFRanker(k=int(self.config.get("hybrid_rrf_k", 60)))
 
-    def _infer_query_profile(self, query_text: str) -> Dict[str, Any]:
-        text = (query_text or "").strip()
-        lower = text.lower()
-        ascii_tokens = re.findall(r"[A-Za-z][A-Za-z0-9_./-]*", text)
-        has_identifier = any(
-            "_" in token or "/" in token or "." in token or any(ch.isdigit() for ch in token)
-            for token in ascii_tokens
-        )
-        has_acronym = any(
-            len(token) >= 2 and sum(1 for ch in token if ch.isupper()) >= 2
-            for token in ascii_tokens
-        )
-        parameter_terms = [
-            "参数", "输入", "输出", "文件", "格式", "支持", "导入", "设置",
-            "input", "output", "parameter", "param", "data", "file",
-        ]
-        intent_terms = [
-            "我想", "有没有", "推荐", "哪个", "哪一个", "比较好", "适合",
-            "怎么选", "用什么",
-        ]
-
-        keyword_signal = 0
-        keyword_signal += 2 if has_identifier else 0
-        keyword_signal += 2 if has_acronym else 0
-        keyword_signal += sum(1 for term in parameter_terms if term in lower or term in text)
-
-        is_colloquial = any(term in text for term in intent_terms)
-        if is_colloquial and keyword_signal <= 1:
-            return {
-                "profile": "dense_heavy",
-                "semantic_weight": 0.9,
-                "keyword_weight": 0.1,
-                "keyword_signal": keyword_signal,
-            }
-
-        if keyword_signal >= 3:
-            return {
-                "profile": "keyword_aware",
-                "semantic_weight": 0.65,
-                "keyword_weight": 0.35,
-                "keyword_signal": keyword_signal,
-            }
-
-        return {
-            "profile": "balanced",
-            "semantic_weight": 0.8,
-            "keyword_weight": 0.2,
-            "keyword_signal": keyword_signal,
-        }
-
     def _milvus_vector_search(self, query_vector: List[float], top_k: int) -> List[Dict[str, Any]]:
         try:
             collection = self.get_milvus_collection()
@@ -503,19 +452,13 @@ class HybridStrategy(VectorOnlyStrategy):
         )
 
         retrieval_mode = self.fusion_type
-        if self.fusion_type == "rrf":
-            reranker = self._make_rrf_ranker()
-        elif self.fusion_type == "weighted":
+        if self.fusion_type == "weighted":
             semantic_weight = float(self.config.get("hybrid_semantic_weight", 0.65))
             keyword_weight = float(self.config.get("hybrid_keyword_weight", 0.35))
             reranker = self._make_weighted_ranker(semantic_weight, keyword_weight)
         else:
-            profile = self._infer_query_profile(query_text)
-            reranker = self._make_weighted_ranker(
-                float(profile["semantic_weight"]),
-                float(profile["keyword_weight"]),
-            )
-            retrieval_mode = f"adaptive_{profile['profile']}"
+            reranker = self._make_rrf_ranker()
+            retrieval_mode = "rrf"
 
         results = collection.hybrid_search(
             [semantic_request, keyword_request],

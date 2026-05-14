@@ -23,8 +23,8 @@ AIHUBMIX_API_KEY = os.getenv("AIHUBMIX_API_KEY")
 AIHUBMIX_BASE_URL = os.getenv("AIHUBMIX_BASE_URL")
 
 alignment_model = ChatOpenAI(
-    model="gpt-5.4-nano",
-    temperature=0.2,
+    model="gpt-4o-mini",
+    temperature=1.0,
     max_retries=2,
     streaming=False,
     openai_api_key=AIHUBMIX_API_KEY,

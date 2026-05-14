@@ -3,7 +3,7 @@ from .store import Store
 import tiktoken
 import json
 import math
-from langchain.messages import HumanMessage, AnyMessage
+from langchain.messages import HumanMessage, AnyMessage, ToolMessage
 
 class ContextManager:
     def __init__(self, max_tokens: int = 4000, model: str = "gpt-3.5-turbo"):
@@ -286,7 +286,15 @@ class ContextManager:
 
         selected.extend(deferred_compressed)
         selected.sort(key=lambda x: x[0])
-        return [item[1] for item in selected]
+
+        # ToolMessage cannot be sent to LLM without its paired tool_calls.
+        sanitized: List[AnyMessage] = []
+        for _, msg, _ in selected:
+            if isinstance(msg, ToolMessage):
+                sanitized.append(self._compress_message_for_context(msg))
+            else:
+                sanitized.append(msg)
+        return sanitized
 
     def retrieve_relevant_memories(self, user_id: str, query: str, top_k: int = 4) -> Dict[str, Any]:
         """从 Store 中检索用户相关记忆（task / model），并从 task 中总结 user_snapshot"""

@@ -631,21 +631,21 @@ export class ChatService {
                                     workflow: finalModelData.workflow,
                                 },
                                 updatedAt: new Date(),
-                            }).exec().then(() => console.log('Model details pre-saved.')).catch(err => console.error('Pre-save error:', err));
+                            }).exec().catch(err => console.error('Pre-save error:', err));
                         }
                         if (payload.type === 'task_spec_generated' && payload.data) {
                             taskSpecData = payload.data;
                             this.sessionModel.findByIdAndUpdate(sessionId, {
                                 taskSpec: taskSpecData,
                                 updatedAt: new Date(),
-                            }).exec().then(() => console.log('Task spec pre-saved.')).catch(err => console.error('Pre-save error:', err));
+                            }).exec().catch(err => console.error('Pre-save error:', err));
                         }
                         if (payload.type === 'model_contract_generated' && payload.data) {
                             modelContractData = payload.data;
                             this.sessionModel.findByIdAndUpdate(sessionId, {
                                 modelContract: modelContractData,
                                 updatedAt: new Date(),
-                            }).exec().then(() => console.log('Model contract pre-saved.')).catch(err => console.error('Pre-save error:', err));
+                            }).exec().catch(err => console.error('Pre-save error:', err));
                         }
                     },
                     complete: async () => {

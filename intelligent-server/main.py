@@ -107,18 +107,13 @@ async def stream_agent(
             "task_hash": "",
             "tool_scope_id": request_id,
             "conversation_summary": "",
-            "summary_revision": 0,
             "user_id": userId,
-            "user_profile": {},
-            "user_preferences": {},
             "latest_user_query": query,
         }
 
         try:
-            final_state: ModelState= {
+            final_state: ModelState = {
                 "messages": [],
-                "session_id": thread_id,
-                "status": "processing",
                 "Task_spec": {},
                 "Model_contract": {},
                 "recommended_model": {},
@@ -130,12 +125,10 @@ async def stream_agent(
                 "task_hash": "",
                 "tool_scope_id": request_id,
                 "conversation_summary": "",
-                "summary_revision": 0,
                 "user_id": userId,
-                "user_profile": {},
-                "user_preferences": {},
                 "latest_user_query": query,
             }
+            model_detail_ready = False
 
             async for mode, chunk in agent.astream(
                 init_input,
@@ -164,6 +157,8 @@ async def stream_agent(
 
                     # 正常的LLM节点才发送 Token
                     if isinstance(message_chunk, AIMessageChunk):
+                        if node_name == "recommend_model_node" and not model_detail_ready:
+                            continue
                         if message_chunk.tool_call_chunks:
                             continue
                         
@@ -228,6 +223,12 @@ async def stream_agent(
                                         tool_result = tmsg.content
                                     
                                     tool_name = getattr(tmsg, "tool_name", None)
+                                    if (
+                                        tool_name == "search_most_model"
+                                        and isinstance(tool_result, dict)
+                                        and tool_result.get("status") == "success"
+                                    ):
+                                        model_detail_ready = True
                                     yield f"data: {json.dumps({
                                         "type": 'tool_result',
                                         "tool": tool_name,
@@ -459,9 +460,12 @@ async def data_scan_stream_endpoint(
 
 def merge_state(old, update):
     if old is None:
-        return update
+        return update or {}
+    if not isinstance(update, dict):
+        return old
     for _, v in update.items():
-        old.update(v)
+        if isinstance(v, dict):
+            old.update(v)
     return old
 
 def merge_data_profiles_for_alignment(data_profiles: List[Dict[str, Any]]) -> Dict[str, Any]:

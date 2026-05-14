@@ -24,8 +24,8 @@ AIHUBMIX_API_KEY = os.getenv("AIHUBMIX_API_KEY", "")
 AIHUBMIX_BASE_URL = os.getenv("AIHUBMIX_BASE_URL", "")
 
 LLM_CONFIG = {
-    "model": "gpt-5-mini",
-    "temperature": 0.7,
+    "model": "gpt-4o-mini",
+    "temperature": 1.0,
     "max_tokens": 1024,
     "top_p": 0.95,
 }
@@ -78,7 +78,7 @@ STRATEGIES = {
     },
     "hybrid": {
         "name": "D-HybridAdaptive",
-        "description": "Adaptive dense + BM25 hybrid retrieval",
+        "description": "RRF dense + BM25 hybrid retrieval (default)",
         "dense_topk": 50,
         "keyword_topk": 50,
         "semantic_weight": 0.65,

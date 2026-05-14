@@ -117,6 +117,165 @@ def get_model_md5_list_from_result(result: Dict[str, Any]) -> list[str]:
     return [m.get("modelMd5") for m in models if isinstance(m, dict) and m.get("modelMd5")]
 
 
+def is_model_change_request(query_text: str) -> bool:
+    text = (query_text or "").strip()
+    if not text:
+        return False
+    change_terms = [
+        "换一个", "换个", "更换", "另一个", "其他模型", "其它模型",
+        "不是使用", "不用这个", "不要这个", "不使用这个", "别用这个",
+    ]
+    return any(term in text for term in change_terms)
+
+
+def previous_search_most_model_md5s(messages: list[AnyMessage]) -> list[str]:
+    md5s: list[str] = []
+    for msg in reversed(messages or []):
+        tool_name = getattr(msg, "tool_name", None) or getattr(msg, "name", None)
+        if not isinstance(msg, ToolMessage) or tool_name != "search_most_model":
+            continue
+        try:
+            data = json.loads(msg.content)
+        except Exception:
+            continue
+        md5 = data.get("md5") if isinstance(data, dict) else None
+        if md5 and md5 not in md5s:
+            md5s.append(md5)
+    return md5s
+
+
+def build_model_search_query(state: ModelState) -> str:
+    latest_query = state.get("latest_user_query") or get_latest_user_query(state.get("messages", []))
+    task_spec = state.get("Task_spec", {}) or {}
+    task_terms = " ".join(
+        str(value).strip()
+        for value in task_spec.values()
+        if str(value or "").strip()
+    )
+    if tools.has_catalog_name_mention(latest_query):
+        return latest_query
+    if is_model_change_request(latest_query) and task_terms:
+        return task_terms
+    return latest_query or task_terms
+
+
+def build_tool_call_message(tool_name: str, args: Dict[str, Any], seed: str = "") -> AIMessage:
+    raw = json.dumps({"tool": tool_name, "args": args, "seed": seed}, ensure_ascii=False, sort_keys=True)
+    call_id = f"{tool_name}_{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:12]}"
+    return AIMessage(
+        content="",
+        tool_calls=[{
+            "name": tool_name,
+            "args": args,
+            "id": call_id,
+            "type": "tool_call",
+        }],
+    )
+
+
+def select_candidate_model_md5(state: ModelState, candidates: list[Dict[str, Any]]) -> str:
+    valid_candidates = [
+        candidate for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("modelMd5")
+    ]
+    if not valid_candidates:
+        return ""
+
+    latest_query = state.get("latest_user_query") or get_latest_user_query(state.get("messages", []))
+    rejected_md5s = set(previous_search_most_model_md5s(state.get("messages", [])))
+    if not is_model_change_request(latest_query):
+        rejected_md5s = set()
+
+    available_candidates = [
+        candidate for candidate in valid_candidates
+        if candidate.get("modelMd5") not in rejected_md5s
+    ] or valid_candidates
+
+    return available_candidates[0].get("modelMd5", "")
+
+
+def normalized_tool_args(tool_name: str, raw_args: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    args = dict(raw_args or {})
+    if tool_name == "search_most_model":
+        return {"model_md5": str(args.get("model_md5") or "").strip()}
+    if tool_name == "search_relevant_models":
+        top_k = args.get("top_k", 10)
+        try:
+            top_k = int(top_k)
+        except Exception:
+            top_k = 10
+        return {
+            "user_query_text": str(args.get("user_query_text") or "").strip(),
+            "top_k": top_k,
+        }
+    return args
+
+
+def tool_call_cache_key(tool_name: str, raw_args: Optional[Dict[str, Any]]) -> str:
+    normalized = normalized_tool_args(tool_name, raw_args)
+    try:
+        args_text = json.dumps(normalized, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        args_text = str(normalized)
+    return f"{tool_name}:{args_text}"
+
+
+def reusable_tool_observation(
+    tool_name: str,
+    raw_args: Optional[Dict[str, Any]],
+    tool_results: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    args = normalized_tool_args(tool_name, raw_args)
+    cached = tool_results.get(tool_name)
+    if not isinstance(cached, dict) or cached.get("status") != "success":
+        return None
+
+    if tool_name == "search_most_model":
+        model_md5 = args.get("model_md5")
+        if model_md5 and cached.get("md5") == model_md5:
+            return cached
+
+    if tool_name == "search_relevant_models":
+        requested_query = args.get("user_query_text") or ""
+        requested_top_k = int(args.get("top_k") or 10)
+        cached_query = str(cached.get("query") or "").strip()
+        cached_top_k = int(cached.get("top_k") or cached.get("count") or 0)
+        if (not requested_query or requested_query == cached_query) and cached_top_k >= requested_top_k:
+            return cached
+
+    return None
+
+
+def validate_model_detail_tool_call(
+    tool_name: str,
+    raw_args: Optional[Dict[str, Any]],
+    tool_results: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if tool_name != "search_most_model":
+        return None
+
+    args = normalized_tool_args(tool_name, raw_args)
+    model_md5 = args.get("model_md5")
+    if not model_md5:
+        return {"status": "error", "message": "search_most_model requires model_md5."}
+
+    relevant_result = tool_results.get("search_relevant_models", {}) or {}
+    candidate_md5s = get_model_md5_list_from_result(relevant_result)
+    if not candidate_md5s:
+        return {
+            "status": "error",
+            "message": "Call search_relevant_models before search_most_model so the final model must come from real candidates.",
+        }
+
+    if model_md5 not in candidate_md5s:
+        return {
+            "status": "error",
+            "message": f"model_md5 {model_md5} is not in the current candidate list; choose one candidate returned by search_relevant_models.",
+        }
+
+    return None
+
+
 def is_injected_state_annotation(annotation: Any) -> bool:
     if annotation is InjectedState:
         return True
@@ -166,15 +325,14 @@ def get_latest_user_query(messages):
     return ""
 
 # 构建任务哈希值
-def build_task_hash(task_spec: Dict[str, Any], latest_query: str) -> str:
+def build_task_hash(task_spec: Dict[str, Any]) -> str:
     payload = {
-        "task_spec": task_spec or {},
-        "latest_query": latest_query or "",
+        "task_spec": task_spec or {}
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
-# 构建工具调用范围ID，优先级：request_id > task_hash > 任务规范+最新用户查询的哈希值
+# 构建工具调用范围ID，优先级：request_id > task_hash > 任务规范的哈希值
 def get_tool_scope_id(state: ModelState) -> str:
     request_id = str(state.get("request_id") or "").strip()
     if request_id:
@@ -182,8 +340,7 @@ def get_tool_scope_id(state: ModelState) -> str:
     task_hash = str(state.get("task_hash") or "").strip()
     if task_hash:
         return task_hash
-    return build_task_hash(state.get("Task_spec", {}) or {}, state.get("latest_user_query", "") or "")
-
+    return build_task_hash(state.get("Task_spec", {}) or {})
 
 def get_scoped_tool_results(state: ModelState) -> Dict[str, Any]:
     tool_results = dict(state.get("tool_results", {}) or {})
@@ -191,7 +348,6 @@ def get_scoped_tool_results(state: ModelState) -> Dict[str, Any]:
     if tool_results.get("_scope_id") and tool_results.get("_scope_id") != scope_id:
         return {}
     return {k: v for k, v in tool_results.items() if not str(k).startswith("_")}
-
 
 def get_scoped_recommended_model(state: ModelState) -> Dict[str, Any]:
     recommended_model = dict(state.get("recommended_model", {}) or {})
@@ -207,6 +363,7 @@ def get_scoped_recommended_model(state: ModelState) -> Dict[str, Any]:
 
 
 def scoped_tool_results_envelope(state: ModelState, base_results: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """在工具调用结果中注入范围标识，确保后续节点能正确识别和使用"""
     scope_id = get_tool_scope_id(state)
     return {
         "_scope_id": scope_id,
@@ -214,7 +371,6 @@ def scoped_tool_results_envelope(state: ModelState, base_results: Optional[Dict[
         "_task_hash": state.get("task_hash", ""),
         **(base_results or {}),
     }
-
 
 def compact_tool_results(tool_results: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     compact: Dict[str, Any] = {}
@@ -247,6 +403,27 @@ def compact_tool_results(tool_results: Optional[Dict[str, Any]]) -> Dict[str, An
             entry["description"] = result.get("description")
         compact[name] = {k: v for k, v in entry.items() if v is not None}
     return compact
+
+
+def compact_model_detail_for_prompt(model: Dict[str, Any]) -> Dict[str, Any]:
+    if not model:
+        return {}
+    workflow_inputs = []
+    for state_item in model.get("workflow", []) or []:
+        for event in state_item.get("events", []) or []:
+            for input_item in event.get("inputs", []) or []:
+                if isinstance(input_item, dict):
+                    workflow_inputs.append({
+                        "name": input_item.get("name", ""),
+                        "type": input_item.get("type", ""),
+                        "description": input_item.get("description", ""),
+                    })
+    return {
+        "name": model.get("name", ""),
+        "md5": model.get("md5", ""),
+        "description": model.get("description", ""),
+        "workflow_inputs": workflow_inputs[:20],
+    }
 
 
 def build_structured_history_digest(messages: list[AnyMessage], ctx_mgr: ContextManager, max_tokens: int = 1400) -> str:
@@ -382,15 +559,32 @@ def parse_task_spec_node(state: ModelState) -> Dict[str, Any]:
         latest_user_query,
     )
 
-    task_hash = build_task_hash(contract, latest_user_query)
+    new_task_hash = build_task_hash(contract)
+    old_task_hash = state.get("task_hash")
 
-    return {
+    update_dict = {
         "messages": [], 
         "Task_spec": contract,
         "latest_user_query": latest_user_query,
-        "task_hash": task_hash,
-        "tool_scope_id": get_tool_scope_id({**state, "task_hash": task_hash}),
+        "task_hash": new_task_hash,
+        "tool_scope_id": new_task_hash,
+        "tool_call_count": 0,
     }
+
+    # 按需清空历史检索结果
+    # 如果是第一次对话，或者核心需求真的变了
+    if not old_task_hash or old_task_hash != new_task_hash:
+        update_dict["tool_results"] = scoped_tool_results_envelope({**state, "task_hash": new_task_hash}, {})
+        update_dict["recommended_model"] = {}
+        update_dict["selected_model_md5"] = ""
+    else:
+        # 明确点名模型时必须重新检索；普通“换一个”则复用候选池并重选。
+        if tools.has_catalog_name_mention(latest_user_query):
+            update_dict["tool_results"] = scoped_tool_results_envelope({**state, "task_hash": new_task_hash}, {})
+        update_dict["recommended_model"] = {}
+        update_dict["selected_model_md5"] = ""
+
+    return update_dict
 
 def recommend_model_node(state: ModelState) -> Dict[str, Any]:
     """
@@ -398,11 +592,10 @@ def recommend_model_node(state: ModelState) -> Dict[str, Any]:
     调用已绑定工具的模型，返回模型产生的新消息
     如果需要调用工具，则返回工具调用指令
     """
-    # 加入SystemMessage以约束模型行为（同时生成 Task Spec 与模型推荐）
-
     tool_results = get_scoped_tool_results(state)
     relevant_models = (tool_results.get("search_relevant_models", {}) or {}).get("models", []) or []
     search_status = (tool_results.get("search_relevant_models", {}) or {}).get("status")
+    recommended_model = get_scoped_recommended_model(state)
 
     if search_status == "error" or (search_status == "success" and len(relevant_models) == 0):
         return {
@@ -415,6 +608,34 @@ def recommend_model_node(state: ModelState) -> Dict[str, Any]:
         }
 
     # 如果存在 user_id（由调用端注入），则检索用户长期记忆并构建 Context Bundle
+    latest_query = state.get("latest_user_query") or get_latest_user_query(state.get("messages", []))
+    model_search_query = build_model_search_query(state)
+
+    if search_status != "success":
+        return {
+            "messages": [
+                build_tool_call_message(
+                    "search_relevant_models",
+                    {"user_query_text": model_search_query, "top_k": 10},
+                    seed=get_tool_scope_id(state),
+                )
+            ]
+        }
+
+    if relevant_models and not recommended_model:
+        selected_model_md5 = select_candidate_model_md5(state, relevant_models)
+        if selected_model_md5:
+            return {
+                "messages": [
+                    build_tool_call_message(
+                        "search_most_model",
+                        {"model_md5": selected_model_md5},
+                        seed=get_tool_scope_id(state),
+                    )
+                ],
+                "selected_model_md5": selected_model_md5,
+            }
+
     user_id = state.get("user_id")
     context_msgs = []
     ctx_mgr = ContextManager(max_tokens=4000)
@@ -427,35 +648,53 @@ def recommend_model_node(state: ModelState) -> Dict[str, Any]:
     except Exception:
         context_msgs = []
 
+    search_status_text = {
+        "success": "成功",
+        "error": "失败",
+    }.get(search_status or "", "未开始")
+    final_detail_status_text = "已就绪" if recommended_model else "未就绪"
+    confirmed_model_detail = compact_model_detail_for_prompt(recommended_model)
+
     system = SystemMessage(content=f"""
-        # Role
+        # 角色
         你是一位资深的地理建模专家，擅长根据复杂的时空需求匹配最合适的数值模型或机器学习模型。
 
-        # Context
+        # 上下文
         - **任务规范**: {state['Task_spec']}
         - **最近对话状态**: {render_recent_context(state['messages'])}
+        - **候选检索状态**: {search_status_text}
+        - **候选模型数量**: {len(relevant_models)}
+        - **最终模型详情状态**: {final_detail_status_text}
+        - **本轮已确认的模型详情**: {json.dumps(confirmed_model_detail, ensure_ascii=False)}
 
-        # Reasoning Process (Chain of Thought)
+        # 流程状态规则
+        - 如果候选检索状态不是“成功”，只调用一次 `search_relevant_models`。
+        - 如果已经存在候选模型，但最终模型详情状态为“未就绪”，请根据任务规范和候选模型描述进行比较，只选择一个最匹配的候选模型，然后只调用一次 `search_most_model`。
+        - 不要把检索排名第一的模型自动视为最终推荐模型；检索排名只表示相关性，不等于最终推荐结论。
+        - 传给 `search_most_model` 的 `model_md5` 必须来自当前 `search_relevant_models` 返回的候选列表。
+        - 如果最终模型详情状态为“已就绪”，禁止继续调用工具，直接输出最终推荐说明。
+
+        # 推理步骤
         在做出决定前，请按以下步骤思考：
-        1. **领域校验**: 分析任务所属领域（如水文、气象），判断是否需要调用 `search_relevant_indices`。
-        2. **初步筛选**: 使用 `search_relevant_models` 获取 MD5 候选池。
-        3. **深度比对**: 根据初选模型的`modelMd5`，调用`search_most_model`方法获取模型详细信息，选择最优模型。
-        4. **详情确认**: 根据选择的最优模型调用 `get_model_details` 获取候选模型的详细工作流和输入要求，确认其是否满足任务规范。
-        5. **决策确认**: 如果模型满足任务需求，则停止调用工具并输出推荐结果。
+        1. **初步筛选**: 调用 `search_relevant_models`。你会得到一个包含名称和描述的候选列表。
+        2. **对比与决策**:
+        - 在不调用额外工具的情况下，根据候选列表的模型描述进行逻辑比对。
+        - **必须且只能**从候选列表中选出【一个】最匹配用户任务规范的模型。
+        3. **深度验证**: 对选定的模型调用 `search_most_model`，获取其模型描述语言和工作流。
+        4. **最终输出**: 基于获取到的完整详情，向用户解释推荐理由。
 
-        # Constraints
-        - **Markdown 输出**: 你的非工具回复必须使用规范的 Markdown 格式。
-        - **参数完整性**: 调用工具时，若状态中已有 `selected_model_md5`，请优先使用。
+        # 约束
+        - **回复格式**: 你的非工具回复必须使用规范的 Markdown 标记格式。
         - **最优模型唯一性**: 根据`search_most_model`方法获取模型详细信息后，选择最优模型。
-        - **结果完整性**: 如果获取到最合适的模型，必须调用`get_model_details`工具获取模型详情，并根据模型要求进一步细化任务规范。
         - **禁止幻觉**: 严禁推荐数据库中不存在的 MD5。
 
-        # Output Guide
+        # 输出指引
         - 如果信息不足：请向用户提问或继续调用工具。
         - 如果找到匹配：请清晰说明推荐理由、模型的优势及局限性。
 
-        # Hard Constraint
+        # 硬性约束
         - 只有在工具返回了真实候选模型后，才允许输出最终推荐。
+        - 如果“本轮已确认的模型详情”不为空，最终回答必须只围绕该模型，不得沿用历史对话中的其他推荐模型。
         - 如果候选池为空，必须直接结束，不得自行猜测或编造模型。
         """)
     # 动态裁剪历史消息，避免超过 token 预算
@@ -471,7 +710,10 @@ def recommend_model_node(state: ModelState) -> Dict[str, Any]:
     # SystemMessage 必须放在第一位；历史记忆作为参考上下文放在其后。
     messages = [system] + context_msgs + fitted_history
 
-    response = tools.model_with_tools.invoke(messages)
+    if recommended_model:
+        response = tools.recommendation_model.invoke(messages)
+    else:
+        response = tools.model_with_tools.invoke(messages)
 
     # 推荐后，若命中了具体模型则把推荐记入 user model memory
     try:
@@ -500,7 +742,7 @@ def model_contract_node(state: ModelState) -> Dict[str, Any]:
         # 兼容旧 checkpoint：旧状态没有 request_id 时，才允许从历史 ToolMessage 回捞。
         for msg in reversed(messages):
             tool_id = getattr(msg, "tool_name", None) or getattr(msg, "name", None)
-            if isinstance(msg, ToolMessage) and tool_id == "get_model_details":
+            if isinstance(msg, ToolMessage) and tool_id == "search_most_model":
                 try:
                     data = json.loads(msg.content)
                     if data.get("status") == "success":
@@ -514,7 +756,7 @@ def model_contract_node(state: ModelState) -> Dict[str, Any]:
             "messages": [],
             "Model_contract": {}
         }
-    
+
     task_spec = state.get("Task_spec", {})
     
     workflow_inputs = []
@@ -592,6 +834,7 @@ def tool_node(state: ModelState) -> Dict[str, Any]:
     selected_model_md5 = state.get("selected_model_md5", "")
     recommended_model = get_scoped_recommended_model(state)
     scope_id = get_tool_scope_id(state)
+    batch_observations: Dict[str, Any] = {}
 
     for tool_call in tool_calls:
         tool_name = tool_call.get("name")
@@ -608,19 +851,25 @@ def tool_node(state: ModelState) -> Dict[str, Any]:
             ))
             continue
 
-        args_with_injected_state = inject_state_for_tool(tool, tool_call.get("args", {}), state)
-        observation = tool.invoke(args_with_injected_state)
+        raw_args = tool_call.get("args", {})
+        validation_error = validate_model_detail_tool_call(tool_name, raw_args, tool_results)
+        cache_key = tool_call_cache_key(tool_name, raw_args)
+        if validation_error is not None:
+            observation = validation_error
+        elif cache_key in batch_observations:
+            observation = batch_observations[cache_key]
+        else:
+            observation = reusable_tool_observation(tool_name, raw_args, tool_results)
+            if observation is None:
+                args_with_injected_state = inject_state_for_tool(tool, raw_args, state)
+                observation = tool.invoke(args_with_injected_state)
+            batch_observations[cache_key] = observation
+
         tool_results[tool_name] = observation
 
         if isinstance(observation, dict):
-            if observation.get("md5"):
+            if tool_name == "search_most_model" and observation.get("status") == "success" and observation.get("md5"):
                 selected_model_md5 = observation.get("md5")
-            else:
-                models = observation.get("models", []) or []
-                if models and isinstance(models[0], dict) and models[0].get("modelMd5"):
-                    selected_model_md5 = models[0]["modelMd5"]
-
-            if tool_name == "get_model_details" and observation.get("status") == "success":
                 recommended_model = {
                     **observation,
                     "_scope_id": scope_id,
@@ -667,28 +916,33 @@ def should_continue(state: ModelState) -> Any:
     """
     messages = state.get("messages", [])
     last_message = messages[-1] if messages else None
+    print(f"should_continue check: last_message={last_message}, tool_call_count={state.get('tool_call_count')}, Task_spec={state.get('Task_spec')}, recommended_model={get_scoped_recommended_model(state)}")
     
     if not last_message:
         return END
 
-    task_spec = state.get("Task_spec", {})
-    has_task_spec = bool(task_spec and any(task_spec.values()))
-    
-    # 只认可本轮作用域内的 get_model_details 结果，避免旧 checkpoint 污染新请求。
-    has_model_details = bool(get_scoped_recommended_model(state))
-    
-    # 如果工作流已完整，进入合约生成阶段
-    if has_task_spec and has_model_details:
-        return "model_contract_node"
-    
-    # 检查是否还需要调用工具（但防止重复调用）
-    # 只有当最后一条消息是 AIMessage 且有 tool_calls 时，才调用工具
+    # 1. 检查是否有工具调用（最高优先级）
+    # 只要模型还想调工具（比如搜索新模型），就必须去 tool_node
     if hasattr(last_message, "tool_calls") and last_message.tool_calls:
         if int(state.get("tool_call_count") or 0) >= MAX_TOOL_CALL_ITERATIONS:
             return "memory_maintenance_node"
         return "tool_node"
+
+    # 2. 检查任务和模型是否真的齐备
+    task_spec = state.get("Task_spec", {})
+    has_task_spec = bool(task_spec and any(task_spec.values()))
+    has_model_details = bool(get_scoped_recommended_model(state))
+
+    # 只有在没有待处理工具调用，且任务规范和模型详情都存在时，才进合约
+    if has_task_spec and has_model_details:
+        return "model_contract_node"
+
+    if has_task_spec and not has_model_details:
+        if int(state.get("tool_call_count") or 0) < MAX_TOOL_CALL_ITERATIONS:
+            return "recommend_model_node"
     
-    # 否则结束
+    # 3. 如果用户要求换模型，此时 has_model_details 为 False
+    # 会回到 recommend_model_node 继续推理（除非已经在该节点了）
     return "memory_maintenance_node"
 
 agent_builder = StateGraph(ModelState)
@@ -717,9 +971,6 @@ agent_builder.add_conditional_edges(
 agent_builder.add_edge("tool_node", "recommend_model_node")
 agent_builder.add_edge("model_contract_node", "memory_maintenance_node")
 agent_builder.add_edge("memory_maintenance_node", END)
-
-if not MONGO_URI or not MONGO_DB_NAME:
-    raise RuntimeError("MONGO_URI and MONGO_DB_NAME must be configured in intelligent-server/.env")
 
 mongo_client = MongoClient(MONGO_URI)
 checkpointer = MongoDBSaver(mongo_client)

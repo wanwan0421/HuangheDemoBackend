@@ -23,8 +23,8 @@ DATA_METHOD_BASE_URL = (os.getenv("DATA_METHOD_BASE_URL") or "http://172.21.252.
 DATA_METHOD_TOKEN = os.getenv("DATA_METHOD_TOKEN") or ""
 
 execute_model = ChatOpenAI(
-    model="gpt-5-mini",
-    temperature=0.2,
+    model="gpt-4o-mini",
+    temperature=1.0,
     max_retries=2,
     streaming=False,
     openai_api_key=AIHUBMIX_API_KEY,

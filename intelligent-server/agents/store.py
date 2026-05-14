@@ -50,6 +50,10 @@ class Store:
     3. 最后回退到关键词匹配
     """
 
+    _shared_milvus_init_attempted = False
+    _shared_milvus_available = False
+    _shared_memory_vector_collection = None
+
     def __init__(self, mongo_uri: str = MONGO_URI, db_name: str = MONGO_DB_NAME):
         if not mongo_uri or not db_name:
             raise RuntimeError("MONGO_URI and MONGO_DB_NAME must be configured in intelligent-server/.env")
@@ -59,8 +63,9 @@ class Store:
         self._embedding_client = None
         self._memory_vector_collection = None
         self._milvus_available = False
+        self._milvus_init_attempted = False  # 延迟初始化标志
         self._ensure_indexes()
-        self._init_milvus()
+        # 注意：Milvus 初始化延迟到首次使用时进行，避免阻塞应用启动
 
     def _collection(self, name: str):
         return self.db[name]
@@ -96,17 +101,83 @@ class Store:
             pass  # MongoDB 版本不支持或索引已存在
 
     def _init_milvus(self) -> None:
-        """尝试连接 Milvus，失败时降级到 MongoDB 向量搜索"""
+        """
+        尝试连接 Milvus，失败时降级到 MongoDB 向量搜索
+        
+        采用延迟初始化 + 重试机制：
+        - 延迟初始化：仅在首次需要时连接
+        - 重试：连接失败时最多重试 5 次，每次等待 1 秒
+        """
         if not (MEMORY_MILVUS_COLLECTION and OpenAI and Collection and connections and AIHUBMIX_API_KEY):
             return
-        try:
-            connections.connect(alias="memory_store", host=MILVUS_HOST, port=MILVUS_PORT)
-            self._memory_vector_collection = Collection(MEMORY_MILVUS_COLLECTION, using="memory_store")
-            self._memory_vector_collection.load()
-            self._milvus_available = True
-        except Exception:
-            self._milvus_available = False
-            self._memory_vector_collection = None
+        
+        if Store._shared_milvus_init_attempted:
+            self._milvus_init_attempted = True
+            self._milvus_available = Store._shared_milvus_available
+            self._memory_vector_collection = Store._shared_memory_vector_collection
+            return  # 已经尝试过初始化
+
+        Store._shared_milvus_init_attempted = True
+        self._milvus_init_attempted = True
+        
+        import time
+        import logging
+        
+        max_retries = 5
+        retry_interval = 1  # 秒
+        
+        for attempt in range(max_retries):
+            try:
+                logging.info(f"Attempting to connect to Milvus (attempt {attempt + 1}/{max_retries})...")
+                connections.connect(alias="memory_store", host=MILVUS_HOST, port=MILVUS_PORT)
+                try:
+                    from pymilvus import utility
+                    if not utility.has_collection(MEMORY_MILVUS_COLLECTION, using="memory_store"):
+                        logging.warning(
+                            f"Milvus collection '{MEMORY_MILVUS_COLLECTION}' not found; disabling Milvus memory store"
+                        )
+                        self._milvus_available = False
+                        Store._shared_milvus_available = False
+                        Store._shared_memory_vector_collection = None
+                        return
+                except Exception:
+                    pass
+
+                self._memory_vector_collection = Collection(MEMORY_MILVUS_COLLECTION, using="memory_store")
+                self._memory_vector_collection.load()
+                self._milvus_available = True
+                Store._shared_milvus_available = True
+                Store._shared_memory_vector_collection = self._memory_vector_collection
+                logging.info("✓ Milvus connected successfully")
+                return
+            except Exception as e:
+                logging.warning(f"Milvus connection failed (attempt {attempt + 1}/{max_retries}): {str(e)[:100]}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_interval)
+        
+        # 所有重试都失败
+        logging.warning("All Milvus connection attempts failed, falling back to MongoDB-only storage")
+        self._milvus_available = False
+        self._memory_vector_collection = None
+        Store._shared_milvus_available = False
+        Store._shared_memory_vector_collection = None
+    
+    def _ensure_milvus_ready(self) -> bool:
+        """
+        确保 Milvus 已初始化（如果配置了的话）
+        这是一个懒加载调用，仅在首次需要向量操作时触发
+        """
+        if not MEMORY_MILVUS_COLLECTION:
+            return False  # 未配置 Milvus
+        
+        if not self._milvus_init_attempted and not Store._shared_milvus_init_attempted:
+            self._init_milvus()
+        else:
+            self._milvus_init_attempted = True
+            self._milvus_available = Store._shared_milvus_available
+            self._memory_vector_collection = Store._shared_memory_vector_collection
+
+        return self._milvus_available
 
     def _normalize_text(self, value: Any) -> str:
         return re.sub(r"\s+", " ", str(value or "").strip().lower())
@@ -194,8 +265,8 @@ class Store:
         if vector is None:
             return
 
-        # 尝试写入 Milvus
-        if self._milvus_available and self._memory_vector_collection:
+        # 尝试写入 Milvus（惰性初始化）
+        if self._ensure_milvus_ready():
             try:
                 row = {
                     "memory_key": memory_key,
@@ -211,7 +282,9 @@ class Store:
                 else:
                     self._memory_vector_collection.insert([row])
                 return
-            except Exception:
+            except Exception as e:
+                import logging
+                logging.warning(f"Milvus write failed: {str(e)[:100]}")
                 self._milvus_available = False
 
         # 降级到 MongoDB 向量存储
@@ -244,7 +317,7 @@ class Store:
             return []
 
         # 尝试 Milvus 搜索
-        if self._milvus_available and self._memory_vector_collection:
+        if self._ensure_milvus_ready():
             try:
                 safe_user_id = str(user_id).replace('"', '\\"')
                 safe_namespace = str(namespace).replace('"', '\\"')
@@ -275,7 +348,9 @@ class Store:
                         hits.append(payload)
                 if hits:
                     return hits[:limit]
-            except Exception:
+            except Exception as e:
+                import logging
+                logging.warning(f"Milvus search failed: {str(e)[:100]}")
                 self._milvus_available = False
 
         # 降级到 MongoDB 本地向量相似度搜索

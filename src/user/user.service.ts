@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { Model, Types } from 'mongoose';
 import { randomUUID } from 'crypto';
 import type { Request } from 'express';
 import { User, UserDocument } from '../auth/schemas/user.schema';
@@ -42,17 +42,25 @@ export class UserService {
 
   private async resolveUserId(userId?: string, req?: Request): Promise<string> {
     const trimmedUserId = (userId || '').trim();
-    if (trimmedUserId) {
+    if (trimmedUserId && Types.ObjectId.isValid(trimmedUserId)) {
       return trimmedUserId;
     }
 
     const accessToken = this.getAccessToken(req);
+    if (accessToken) {
+      const user = await this.authService.me(accessToken);
+      return user.id;
+    }
+
+    if (trimmedUserId) {
+      throw new NotFoundException('用户不存在');
+    }
+
     if (!accessToken) {
       throw new UnauthorizedException('未登录');
     }
 
-    const user = await this.authService.me(accessToken);
-    return user.id;
+    throw new UnauthorizedException('未登录');
   }
 
   private async getUser(userId?: string, req?: Request): Promise<UserDocument> {

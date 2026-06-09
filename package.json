@@ -37,6 +37,7 @@
     "geo-method-sdk": "^2.1.0",
     "global-agent": "^3.0.0",
     "mongoose": "^8.20.2",
+    "openai": "^6.39.1",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
     "typeorm": "^0.3.28",

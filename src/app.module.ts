@@ -15,7 +15,7 @@ import { DataModule } from './data/data.module';
 import { AuthModule } from './auth/auth.module';
 import { UserModule } from './user/user.module';
 import { HuangheMonitoringModule } from './huanghe-monitoring/huanghe-monitoring.module';
-import { ModelRecommendationModule } from './model-recommendation/model-recommendation.module';
+// import { ModelRecommendationModule } from './model-recommendation/model-recommendation.module';
 
 @Module({
   imports: [
@@ -42,9 +42,9 @@ import { ModelRecommendationModule } from './model-recommendation/model-recommen
     AuthModule,
     UserModule,
     HuangheMonitoringModule,
-    ModelRecommendationModule,
+    // ModelRecommendationModule,
   ],
   controllers: [AppController],
   providers: [AppService],
 })
-export class AppModule {}
+export class AppModule { }

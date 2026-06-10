@@ -2,20 +2,17 @@ import os
 import logging
 import re
 from typing import List, Dict, Any, Optional, Annotated
+from pathlib import Path
 from langchain.tools import tool
-from langchain_openai import OpenAIEmbeddings,ChatOpenAI
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chat_models import init_chat_model
-from langchain_core.embeddings import Embeddings
+from langchain_openai import ChatOpenAI
 from langchain.messages import HumanMessage
 from pymongo import MongoClient
-from pymilvus import RRFRanker, connections, Collection, AnnSearchRequest, WeightedRanker
+from pymilvus import connections, Collection, AnnSearchRequest, WeightedRanker
 import math
 from dotenv import load_dotenv
-from google import genai
 from langgraph.prebuilt import InjectedState
 from openai import OpenAI
-import logging
+from rapidfuzz import fuzz
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # 初始化模型
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 AIHUBMIX_API_KEY = os.getenv("AIHUBMIX_API_KEY")
 AIHUBMIX_BASE_URL = os.getenv("AIHUBMIX_BASE_URL")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -34,7 +31,7 @@ client = OpenAI(
 )
 
 recommendation_model = ChatOpenAI(
-    model= "gpt-5-mini",
+    model= "gpt-4o-mini",
     temperature=1.0,
     max_retries=2,
     streaming=True,
@@ -43,11 +40,22 @@ recommendation_model = ChatOpenAI(
 )
 
 # 连接配置
-MONGO_URI = "mongodb://localhost:27017/"
-DB_NAME = "huanghe-demo"
-MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
-MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
-MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION", "modelembeddings")
+MONGO_URI = os.getenv("MONGO_URI")
+DB_NAME = os.getenv("MONGO_DB_NAME")
+MILVUS_HOST = os.getenv("MILVUS_HOST")
+MILVUS_PORT = int(os.getenv("MILVUS_PORT"))
+MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION")
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+DEFAULT_SEMANTIC_WEIGHT = _float_env("MODEL_SEARCH_SEMANTIC_WEIGHT", 0.7)
+DEFAULT_KEYWORD_WEIGHT = _float_env("MODEL_SEARCH_KEYWORD_WEIGHT", 0.3)
+CATALOG_NAME_FUZZY_THRESHOLD = _float_env("CATALOG_NAME_FUZZY_THRESHOLD", 85.0)
+CATALOG_NAME_MIN_FUZZY_LEN = 3
 
 # MongoDB连接池
 _db_client = None
@@ -80,33 +88,11 @@ def _latest_user_query_from_state(state: Optional[Dict[str, Any]]) -> str:
     return ""
 
 
-def _model_md5s_from_state(state: Optional[Dict[str, Any]]) -> List[str]:
-    tool_results = (state or {}).get("tool_results", {}) or {}
-    models = (tool_results.get("search_relevant_models", {}) or {}).get("models", []) or []
-    return [m.get("modelMd5") for m in models if isinstance(m, dict) and m.get("modelMd5")]
-
-
-def _selected_model_md5_from_state(state: Optional[Dict[str, Any]]) -> str:
-    if not state:
-        return ""
-
-    selected = str(state.get("selected_model_md5") or "").strip()
-    if selected:
-        return selected
-
-    tool_results = state.get("tool_results", {}) or {}
-    for key in ["search_most_model", "search_relevant_models"]:
-        models = (tool_results.get(key, {}) or {}).get("models", []) or []
-        if models and isinstance(models[0], dict):
-            md5 = models[0].get("modelMd5")
-            if md5:
-                return md5
-
-    return ""
-
 def get_db():
     """获取 MongoDB 数据库连接"""
     global _db_client
+    if not MONGO_URI or not DB_NAME:
+        raise RuntimeError("MONGO_URI and MONGO_DB_NAME must be configured in intelligent-server/.env")
     if _db_client is None:
         _db_client = MongoClient(MONGO_URI)
     return _db_client[DB_NAME]
@@ -156,39 +142,6 @@ def _make_weighted_ranker(semantic_weight: float = 0.65, keyword_weight: float =
         return WeightedRanker(semantic_weight, keyword_weight)
     except TypeError:
         return WeightedRanker([semantic_weight, keyword_weight])
-
-def _infer_query_profile(query_text: str) -> Dict[str, Any]:
-    text = (query_text or "").strip()
-    lower = text.lower()
-    ascii_tokens = re.findall(r"[A-Za-z][A-Za-z0-9_./-]*", text)
-    has_identifier = any(
-        "_" in token or "/" in token or "." in token or any(ch.isdigit() for ch in token)
-        for token in ascii_tokens
-    )
-    has_acronym = any(
-        len(token) >= 2 and sum(1 for ch in token if ch.isupper()) >= 2
-        for token in ascii_tokens
-    )
-    parameter_terms = [
-        "参数", "输入", "输出", "文件", "格式", "支持", "导入", "设置",
-        "input", "output", "parameter", "param", "data", "file",
-    ]
-    intent_terms = [
-        "我想", "有没有", "推荐", "哪个", "哪一个", "比较好", "适合",
-        "怎么选", "用什么",
-    ]
-
-    keyword_signal = 0
-    keyword_signal += 2 if has_identifier else 0
-    keyword_signal += 2 if has_acronym else 0
-    keyword_signal += sum(1 for term in parameter_terms if term in lower or term in text)
-
-    is_colloquial = any(term in text for term in intent_terms)
-    if is_colloquial and keyword_signal <= 1:
-        return {"profile": "dense_heavy", "semantic_weight": 0.9, "keyword_weight": 0.1}
-    if keyword_signal >= 3:
-        return {"profile": "keyword_aware", "semantic_weight": 0.65, "keyword_weight": 0.35}
-    return {"profile": "balanced", "semantic_weight": 0.8, "keyword_weight": 0.2}
 
 def _extract_hybrid_hits(search_result: Any) -> List[Any]:
     candidates: List[Any] = []
@@ -270,17 +223,20 @@ def _milvus_hybrid_search(query_text: str, query_vector: List[float], top_k: int
             param={"metric_type": "BM25", "params": {}},
             limit=search_limit,
         )
-        profile = _infer_query_profile(query_text)
         results = collection.hybrid_search(
             [semantic_request, keyword_request],
             rerank=_make_weighted_ranker(
-                float(profile["semantic_weight"]),
-                float(profile["keyword_weight"]),
+                DEFAULT_SEMANTIC_WEIGHT,
+                DEFAULT_KEYWORD_WEIGHT,
             ),
             limit=top_k,
             output_fields=["modelId", "modelMd5", "modelName", "modelDescription", "embeddingSource"],
         )
-        logger.info("Milvus adaptive hybrid search profile=%s", profile.get("profile"))
+        logger.info(
+            "Milvus hybrid search weights semantic=%s keyword=%s",
+            DEFAULT_SEMANTIC_WEIGHT,
+            DEFAULT_KEYWORD_WEIGHT,
+        )
 
         hits = _extract_hybrid_hits(results)
         hybrid_results: List[Dict[str, Any]] = []
@@ -318,6 +274,100 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     
     return dot_product / (magnitude1 * magnitude2)
 
+
+def _format_model_hit(model: Dict[str, Any], rank: int, score: float, source: str) -> Dict[str, Any]:
+    return {
+        "modelId": str(model.get("id") or model.get("_id") or ""),
+        "modelMd5": model.get("md5", ""),
+        "modelName": model.get("name", ""),
+        "modelDescription": model.get("description", ""),
+        "embeddingSource": source,
+        "score": score,
+        "rank": rank,
+    }
+
+
+def _model_alias_values(model: Dict[str, Any]) -> List[Any]:
+    values: List[Any] = []
+    for key in ("name", "modelName", "title", "displayName"):
+        if model.get(key):
+            values.append(model.get(key))
+
+    for key in ("aliases", "alias"):
+        raw = model.get(key)
+        if isinstance(raw, list):
+            values.extend(raw)
+        elif isinstance(raw, dict):
+            values.extend(raw.values())
+        elif raw:
+            values.append(raw)
+
+    return values
+
+
+def _catalog_name_match_score(query_text: str, name_value: Any) -> float:
+    """对单个候选名计算与 query 的相似度。
+
+    短名（< CATALOG_NAME_MIN_FUZZY_LEN）退化为精确子串包含；其中 ASCII 短名
+    额外要求"词边界"，避免单字模型名（如 "E"）误命中嵌在其它单词里的字符
+    （如 "SEIMS" 中的 E）。长名走 partial_ratio，名字基本完整出现在 query
+    里就会接近 100。低于阈值返回 0，由调用方过滤。
+    """
+    name = str(name_value or "").strip()
+    query = str(query_text or "").strip()
+    if not name or not query:
+        return 0.0
+
+    if len(name) < CATALOG_NAME_MIN_FUZZY_LEN:
+        if name.isascii():
+            pattern = r"(?<![A-Za-z0-9])" + re.escape(name) + r"(?![A-Za-z0-9])"
+            return 100.0 if re.search(pattern, query) else 0.0
+        return 100.0 if name in query else 0.0
+
+    score = float(fuzz.partial_ratio(name, query))
+    return score if score >= CATALOG_NAME_FUZZY_THRESHOLD else 0.0
+
+
+def _mongo_model_name_search(query_text: str, top_k: int) -> List[Dict[str, Any]]:
+    collection = get_db()["modelResource"]
+    projection = {
+        "id": 1,
+        "name": 1,
+        "md5": 1,
+        "description": 1,
+        "modelName": 1,
+        "title": 1,
+        "displayName": 1,
+        "aliases": 1,
+        "alias": 1,
+    }
+    scored_rows: List[tuple] = []
+    for model in collection.find({}, projection):
+        best_score = 0.0
+        for alias in _model_alias_values(model):
+            score = _catalog_name_match_score(query_text, alias)
+            if score > best_score:
+                best_score = score
+        if best_score > 0:
+            scored_rows.append((best_score, model))
+
+    scored_rows.sort(
+        key=lambda item: (-item[0], -len(str(item[1].get("name") or "")))
+    )
+    return [
+        _format_model_hit(model, rank, score, "mongo_catalog_name")
+        for rank, (score, model) in enumerate(scored_rows[:top_k], start=1)
+    ]
+
+
+def has_catalog_name_mention(query_text: str) -> bool:
+    try:
+        return bool(_mongo_model_name_search(query_text, 1))
+    except Exception:
+        logger.exception("Catalog name lookup failed")
+        return False
+
+
 @tool
 def search_relevant_models(
     user_query_text: Optional[str] = None,
@@ -325,12 +375,12 @@ def search_relevant_models(
     state: Annotated[Dict[str, Any], InjectedState] = None,
 ) -> Dict[str, Any]:
     """
-    使用 Milvus 语义检索 + Milvus 关键词检索（BM25）混合检索。
+    使用语义检索和关键词检索的混合方法，在Milvus中搜索与用户查询相关的模型，并返回相关模型的详细信息列表
     Args:
         user_query_text: 用户查询文本
         top_k: 返回的最相关模型数（默认 10）
     Returns:
-        包含相关模型MD5和相似度分数的字典
+        包含相关模型详细信息的字典
     """
     try:
         if not user_query_text or not str(user_query_text).strip():
@@ -340,6 +390,18 @@ def search_relevant_models(
             return {
                 "status": "error",
                 "message": "缺少 user_query_text，且无法从状态注入中推断。"
+            }
+
+        catalog_name_results = _mongo_model_name_search(user_query_text, top_k)
+        if catalog_name_results:
+            return {
+                "status": "success",
+                "count": len(catalog_name_results),
+                "query": user_query_text,
+                "top_k": top_k,
+                "match_mode": "catalog_name",
+                "models": catalog_name_results,
+                "message": "",
             }
 
         # 生成用户查询向量
@@ -360,6 +422,8 @@ def search_relevant_models(
         return {
             "status": "success",
             "count": len(result),
+            "query": user_query_text,
+            "top_k": top_k,
             "models": result
         }
     except Exception as e:
@@ -370,99 +434,44 @@ def search_relevant_models(
 
 @tool
 def search_most_model(
-    model_md5s: Optional[List[str]] = None,
-    state: Annotated[Dict[str, Any], InjectedState] = None,
+    model_md5: str
 ) -> Dict[str, Any]:
     """
-    根据给定的模型MD5列表，从数据库获取这些模型的详细信息。
-    供LLM使用，让LLM基于详细信息来选择最适合的一个模型。
-    Args:
-        model_md5s: 模型MD5值列表
-    Returns:
-        包含模型详细信息的字典
+    锁定并获取选定模型的最终详细信息和工作流。
+    注意：在调用此工具前，你必须已经从搜索列表中选出了【最匹配的一个】模型 MD5。
     """
     try:
-        if not model_md5s:
-            model_md5s = _model_md5s_from_state(state)
-
-        if not model_md5s:
-            return {
-                "status": "error",
-                "message": "模型 MD5 列表为空，且无法从状态注入中推断。"
-            }
+        if not model_md5:
+            return {"status": "error", "message": "未提供模型 MD5。"}
 
         db = get_db()
         model_resource_collection = db["modelResource"]
 
-        # 根据MD5列表查询模型详细信息
-        models = list(
-            model_resource_collection.find({"md5": {"$in": model_md5s}})
-        )
-        
-        # 构建结果
-        result_models = []
-        for model in models:
-            result_models.append({
-                "modelMd5": model.get("md5", ""),
-                "modelName": model.get("name", ""),
-                "mdl": model.get("mdl", "")
-            })
-        
-        return {
-            "status": "success",
-            "count": len(result_models),
-            "models": result_models
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": f"获取模型详情失败: {str(e)}"
-        }
-
-@tool
-def get_model_details(
-    model_md5: Optional[str] = None,
-    state: Annotated[Dict[str, Any], InjectedState] = None,
-) -> Dict[str, Any]:
-    """
-    根据模型MD5值获取模型的详细信息和工作流
-    Args:
-        model_md5: 模型的MD5值
-    Returns:
-        模型详细信息和工作流
-    """
-    try:
-        if not model_md5:
-            model_md5 = _selected_model_md5_from_state(state)
-
-        if not model_md5:
-            return {
-                "status": "error",
-                "message": "缺少 model_md5，且无法从状态注入中推断。"
-            }
-
-        db = get_db()
-        model_collection = db["modelResource"]
-
-        # 查询模型
-        model = model_collection.find_one({"md5": model_md5})
+        # 查询选中的单个模型
+        model = model_resource_collection.find_one({"md5": model_md5})
         
         if not model:
-            return {
-                "status": "error",
-                "message": f"未找到 MD5 为 {model_md5} 的模型"
-            }
+            return {"status": "error", "message": f"未找到 MD5 为 {model_md5} 的模型。"}
 
-        # 格式化工作流信息
+        # 1. 提取基础信息
+        # 注意：这里直接构建对象，不嵌套在 list 里，方便前端直接 payload.data?.name
+        result = {
+            "status": "success",
+            "name": model.get("name", ""),
+            "md5": model.get("md5", ""),
+            "description": model.get("description", ""),
+            "workflow": []
+        }
+
+        # 2. 格式化工作流信息 (Workflow)
         workflow_steps = []
         if model.get("data") and model["data"].get("input"):
-            for state in model["data"]["input"]:
+            for s in model["data"]["input"]:
                 events = []
-                for event in state.get("events", []):
+                for event in s.get("events", []):
                     event_data = event.get("eventData", {})
                     inputs = []
-                    
-                    # 处理 internal 节点
+
                     if event_data.get("eventDataType") == "internal" and event_data.get("nodeList"):
                         for node in event_data.get("nodeList", []):
                             inputs.append({
@@ -470,8 +479,7 @@ def get_model_details(
                                 "type": node.get("dataType", ""),
                                 "description": node.get("description", "")
                             })
-                    
-                    # 处理 external 节点
+
                     if event_data.get("eventDataType") == "external":
                         inputs.append({
                             "name": event_data.get("eventDataName") or event.get("eventName", ""),
@@ -479,32 +487,25 @@ def get_model_details(
                             "description": event_data.get("exentDataDesc", ""),
                             "nodeList": event_data.get("nodeList", [])
                         })
-                    
+
                     events.append({
                         "eventName": event.get("eventName", ""),
                         "eventDescription": event.get("eventDescription", ""),
                         "inputs": inputs
                     })
-                
+
                 workflow_steps.append({
-                    "stateName": state.get("stateName", ""),
-                    "stateDescription": state.get("stateDescription", ""),
+                    "stateName": s.get("stateName", ""),
+                    "stateDescription": s.get("stateDescription", ""),
                     "events": events
                 })
 
-        return {
-            "status": "success",
-            "name": model.get("name", ""),
-            "md5": model.get("md5", ""),
-            "description": model.get("description", ""),
-            "workflow": workflow_steps
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": f"获取模型详情失败: {str(e)}"
-        }
+        result["workflow"] = workflow_steps
+        return result  # 直接返回对象
 
+    except Exception as e:
+        logger.exception("Failed to get model details")
+        return {"status": "error", "message": f"获取模型详情失败: {str(e)}"}
 
 # ============================================================================
 # 工具集合 - 供 LangGraph 绑定
@@ -512,8 +513,7 @@ def get_model_details(
 
 tools = [
     search_relevant_models,
-    search_most_model,
-    get_model_details
+    search_most_model
 ]
 
 TOOLS_BY_NAME = {tool.name: tool for tool in tools}

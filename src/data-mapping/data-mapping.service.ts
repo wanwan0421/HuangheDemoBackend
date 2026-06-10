@@ -104,7 +104,7 @@ export class DataMappingService {
             this.logger.log(`成功分析数据: ${profile.id}, 最终类型: ${finalProfile.form}`);
             return finalProfile;
         } catch (error) {
-            this.logger.error(`分析数据文件失败: ${error.message}`, error.stack);
+            this.logger.error(`分析数据文件失败: ${error}`);
             throw error;
         }
     }
@@ -328,7 +328,7 @@ export class DataMappingService {
                 }
             })
         } catch (error) {
-            this.logger.warn(`第二阶段内容分析失败: ${error.message}`);
+            this.logger.warn(`第二阶段内容分析失败: ${error}`);
             return candidates;
         }
     }
@@ -365,7 +365,7 @@ export class DataMappingService {
                         const result = JSON.parse(lastLine);
                         resolve(result);
                     } catch (error) {
-                        this.logger.error(`解析Python输出时出错: ${error.message}`);
+                        this.logger.error(`解析Python输出时出错: ${error}`);
                         resolve({ rawOutput: stdoutData });
                     }
                 }
@@ -537,7 +537,7 @@ export class DataMappingService {
 
             profile.semantic = '模型参数定义（Parameter），用于模型运行配置';
         } catch (error) {
-            this.logger.warn(`解析参数文件失败: ${error.message}`);
+            this.logger.warn(`解析参数文件失败: ${error}`);
             profile.parameter = undefined;
             profile.semantic = '参数数据（解析失败）';
         }
@@ -552,6 +552,7 @@ export class DataMappingService {
      */
     async pipeAgentDataScanSSE(filePath: string, res: any, sessionId?: string): Promise<void> {
         const agentApiUrl = `${process.env.agentUrl}/data-scan/stream`;
+        const agentToken = process.env.AGENT_INTERNAL_TOKEN;
         try {
             const params = new URLSearchParams();
             params.append('file_path', filePath);
@@ -565,6 +566,7 @@ export class DataMappingService {
                 responseType: 'stream',
                 headers: {
                     Accept: 'text/event-stream',
+                    ...(agentToken ? { 'X-Agent-Token': agentToken } : {}),
                 }
             });
 
@@ -596,7 +598,7 @@ export class DataMappingService {
             res.write(
                 `data: ${JSON.stringify({
                     type: 'error',
-                    message: `无法连接到 Agent 服务: ${error.message}`,
+                    message: `无法连接到 Agent 服务: ${error}`,
                 })}\n\n`,
             );
             res.end();
@@ -656,6 +658,7 @@ export class DataMappingService {
          */
         private getDataScanStream(filePath: string, sessionId?: string): Observable<{ event?: string; data: any }> {
             const agentApiUrl = `${process.env.agentUrl}/data-scan/stream`;
+            const agentToken = process.env.AGENT_INTERNAL_TOKEN;
             const params = new URLSearchParams();
             params.append('file_path', filePath);
             if (sessionId) {
@@ -667,7 +670,10 @@ export class DataMappingService {
                     method: 'GET',
                     url: `${agentApiUrl}?${params.toString()}`,
                     responseType: 'stream',
-                    headers: { Accept: 'text/event-stream' },
+                    headers: {
+                        Accept: 'text/event-stream',
+                        ...(agentToken ? { 'X-Agent-Token': agentToken } : {}),
+                    },
                 }).then((response) => {
                     let buffer = '';
 
@@ -762,6 +768,7 @@ export class DataMappingService {
      */
     private async refineProfileWithLLM(currentProfile: DataSemanticProfile, filePath: string): Promise<DataSemanticProfile> {
         const pythonApiUrl = `${process.env.agentUrl}/agents/data-refine`;
+        const agentToken = process.env.AGENT_INTERNAL_TOKEN;
 
         try {
             this.logger.log(`请求 LLM 进行语义精炼... ID: ${currentProfile.id}`);
@@ -772,7 +779,11 @@ export class DataMappingService {
                 profile: currentProfile, // 整个对象传过去
             };
 
-            const response = await axios.post(pythonApiUrl, payload);
+            const response = await axios.post(pythonApiUrl, payload, {
+                headers: {
+                    ...(agentToken ? { 'X-Agent-Token': agentToken } : {}),
+                },
+            });
             const data = response.data;
 
             if (data.status === 'ok' && data.profile) {
@@ -796,7 +807,7 @@ export class DataMappingService {
 
         } catch (error) {
             // 容错处理：如果 LLM 服务挂了，返回原始 Profile，不要阻断上传流程
-            this.logger.error(`LLM 精炼服务调用失败: ${error.message}`);
+            this.logger.error(`LLM 精炼服务调用失败: ${error}`);
             return currentProfile;
         }
     }
@@ -840,7 +851,7 @@ export class DataMappingService {
                 const profile = await this.analyzeUploadedData(filePath);
                 results.push(profile);
             } catch (error) {
-                this.logger.error(`分析文件 ${filePath} 失败: ${error.message}`);
+                this.logger.error(`分析文件 ${filePath} 失败: ${error}`);
                 // 继续处理其他文件
             }
         }

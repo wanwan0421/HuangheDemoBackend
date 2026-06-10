@@ -115,6 +115,11 @@ def llm_node(state: DataScanState) -> Dict[str, Any]:
     """
 
     structured_llm = data_scan_model.with_structured_output(SemanticEnvelope)
+    semantic_data = {
+        "Abstract": "基于规则扫描生成的数据画像",
+        "Applications": ["数据入模前质检"],
+        "Tags": ["gis", "data-scan", "validation"],
+    }
     try:
         response = structured_llm.invoke([
             SystemMessage(content=system_prompt),

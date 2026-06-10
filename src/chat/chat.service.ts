@@ -25,13 +25,19 @@ export class ChatService {
     }
 
     // ============ SSE 代理到 Python（带 thread_id） ============
-    getSystemStream(query: string, sessionId?: string): Observable<{ event?: string; data: any }> {
+    getSystemStream(query: string, sessionId?: string, userId?: string): Observable<{ event?: string; data: any }> {
+        const agentToken = process.env.AGENT_INTERNAL_TOKEN;
         return new Observable((observer) => {
             this.httpService
                 .axiosRef({
                     url: `${process.env.agentUrl}/stream?query=${encodeURIComponent(query)}${sessionId ? `&sessionId=${encodeURIComponent(sessionId)}` : ''}`,
                     method: 'GET',
                     responseType: 'stream',
+                    headers: {
+                        Accept: 'text/event-stream',
+                        ...(agentToken ? { 'X-Agent-Token': agentToken } : {}),
+                        ...(userId ? { 'X-User-ID': userId } : {}),
+                    },
                 })
                 .then((response) => {
                     let buffer = '';
@@ -236,7 +242,7 @@ export class ChatService {
                 task_spec: session.taskSpec,
                 model_contract: session.modelContract,
                 data_profiles: dataProfiles,
-            });
+            }, userId);
 
             const alignmentResult = result.alignment_result || {};
             const normalizedGoNoGo = result.go_no_go ?? alignmentResult.go_no_go;
@@ -263,7 +269,8 @@ export class ChatService {
         }
     }
 
-    private async readAlignStreamFinal(requestBody: Record<string, any>): Promise<any> {
+    private async readAlignStreamFinal(requestBody: Record<string, any>, userId: string): Promise<any> {
+        const agentToken = process.env.AGENT_INTERNAL_TOKEN;
         return new Promise((resolve, reject) => {
             this.httpService
                 .axiosRef({
@@ -272,6 +279,8 @@ export class ChatService {
                     headers: {
                         'Content-Type': 'application/json',
                         Accept: 'text/event-stream',
+                        ...(agentToken ? { 'X-Agent-Token': agentToken } : {}),
+                        ...(userId ? { 'X-User-ID': userId } : {}),
                     },
                     responseType: 'stream',
                     data: requestBody,
@@ -598,7 +607,7 @@ export class ChatService {
 
                 // 调用Python，传入sessionId作为thread_id
                 // LangGraph会根据thread_id自动加载和保存对话记忆
-                this.getSystemStream(query, sessionId).subscribe({
+                this.getSystemStream(query, sessionId, userId).subscribe({
                     next: (event) => {
                         const payload = event.data;
                         if (payload?.type === 'heartbeat') {
@@ -622,21 +631,21 @@ export class ChatService {
                                     workflow: finalModelData.workflow,
                                 },
                                 updatedAt: new Date(),
-                            }).exec().then(() => console.log('Model details pre-saved.')).catch(err => console.error('Pre-save error:', err));
+                            }).exec().catch(err => console.error('Pre-save error:', err));
                         }
                         if (payload.type === 'task_spec_generated' && payload.data) {
                             taskSpecData = payload.data;
                             this.sessionModel.findByIdAndUpdate(sessionId, {
                                 taskSpec: taskSpecData,
                                 updatedAt: new Date(),
-                            }).exec().then(() => console.log('Task spec pre-saved.')).catch(err => console.error('Pre-save error:', err));
+                            }).exec().catch(err => console.error('Pre-save error:', err));
                         }
                         if (payload.type === 'model_contract_generated' && payload.data) {
                             modelContractData = payload.data;
                             this.sessionModel.findByIdAndUpdate(sessionId, {
                                 modelContract: modelContractData,
                                 updatedAt: new Date(),
-                            }).exec().then(() => console.log('Model contract pre-saved.')).catch(err => console.error('Pre-save error:', err));
+                            }).exec().catch(err => console.error('Pre-save error:', err));
                         }
                     },
                     complete: async () => {

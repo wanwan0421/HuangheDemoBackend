@@ -125,6 +125,12 @@ def main():
     )
     
     parser.add_argument(
+        "--retrieval-only",
+        action="store_true",
+        help="只评测检索部分，跳过生成部分（节省 LLM API 调用）"
+    )
+    
+    parser.add_argument(
         "--queryset",
         type=str,
         default=cfg.QUERYSET_PATH,
@@ -145,12 +151,14 @@ def main():
     print("="*80)
     print(f"策略: {', '.join(args.strategies)}")
     print(f"重复运行: {args.runs} 次")
+    if args.retrieval_only:
+        print(f"模式: 仅检索（跳过生成）")
     print(f"查询集: {args.queryset}")
     print("="*80 + "\n")
     
     try:
         # 执行评测
-        results = evaluate_all_strategies(args.strategies, runs=args.runs)
+        results = evaluate_all_strategies(args.strategies, runs=args.runs, retrieval_only=args.retrieval_only)
         
         # 打印总结
         print_summary(results)

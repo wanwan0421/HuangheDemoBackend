@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import PROJECT_NAME, API_PREFIX, ALLOWED_ORIGINS
 from app.routers.landcover import router as landcover_router
+from app.routers.hydrology import router as hydrology_router
 
 
 app = FastAPI(
@@ -37,5 +38,11 @@ def root():
 # 注册土地覆盖遥感路由
 app.include_router(
     landcover_router,
+    prefix=API_PREFIX,
+)
+
+# 注册水文遥感路由
+app.include_router(
+    hydrology_router,
     prefix=API_PREFIX,
 )

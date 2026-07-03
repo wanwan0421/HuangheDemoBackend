@@ -40,6 +40,8 @@ lerna-debug.log*
 
 # Python virtual env
 .venv/
+__pycache__/
+*.pyc
 
 # dotenv environment variable files
 .env

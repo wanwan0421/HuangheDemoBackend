@@ -5,7 +5,11 @@ import { Model } from 'mongoose';
 import { ConfigService } from '@nestjs/config';
 import { plainToInstance } from 'class-transformer';
 import { ModelResource, ResourceType } from './schemas/modelResource.schema';
-import { Md5Item, OnePageMd5Result, PortalMd5Data } from './interfaces/portalSync.interface';
+import {
+    Md5Item,
+    OnePageMd5Result,
+    PortalMd5Data,
+} from './interfaces/portalSync.interface';
 import { firstValueFrom } from 'rxjs';
 import { ModelItemDataDto } from './dto/modelItemData.dto';
 import { ModelItemStateDto } from './dto/modelItemState.dto';
@@ -29,24 +33,27 @@ export class ResourceService implements OnApplicationBootstrap {
     private readonly embeddingSource = 'RETRIEVAL_DOCUMENT';
     private initVectorRunning = false;
 
-    constructor(private readonly httpService: HttpService,
-                private readonly configService: ConfigService,
-                private readonly modelUtilsService: ModelUtilsService,
-                private readonly genAIService: GenAIService,
-                private readonly milvusService: MilvusService,
-                @InjectModel(ModelResource.name)
-                private modelResourceModel: Model<ModelResource>,
+    constructor(
+        private readonly httpService: HttpService,
+        private readonly configService: ConfigService,
+        private readonly modelUtilsService: ModelUtilsService,
+        private readonly genAIService: GenAIService,
+        private readonly milvusService: MilvusService,
+        @InjectModel(ModelResource.name)
+        private modelResourceModel: Model<ModelResource>,
     ) {
         this.portalLocation = this.configService.get<string>('portalLocation')!;
         this.portalToken = this.configService.get<string>('portalToken')!;
-        this.dataServerLocation = this.configService.get<string>('dataServerLocation') ?? '';
-        this.dataServerToken = this.configService.get<string>('dataServerToken') ?? '';
+        this.dataServerLocation =
+            this.configService.get<string>('dataServerLocation') ?? '';
+        this.dataServerToken =
+            this.configService.get<string>('dataServerToken') ?? '';
     }
 
     public onApplicationBootstrap(): void {
-        setImmediate(() => {
-            void this.runInitResourceModelVectorData('startup');
-        });
+        // setImmediate(() => {
+        //     void this.runInitResourceModelVectorData('startup');
+        // });
     }
 
     private async runInitResourceModelVectorData(reason: string): Promise<void> {
@@ -69,7 +76,10 @@ export class ResourceService implements OnApplicationBootstrap {
     // 获取单页健康模型的md5列表
     // @param page 页码
     // @param pageSize 每页数量
-    private async getHealthyModelMd5List(page: number, pageSize: number): Promise<OnePageMd5Result> {
+    private async getHealthyModelMd5List(
+        page: number,
+        pageSize: number,
+    ): Promise<OnePageMd5Result> {
         const url = `http://${this.portalLocation}/managementSystem/deployedModel?${this.portalToken}`;
 
         const body = {
@@ -77,20 +87,24 @@ export class ResourceService implements OnApplicationBootstrap {
             page: page,
             pageSize: pageSize,
             searchText: '',
-            sortField: 'viewCount'
-        }
+            sortField: 'viewCount',
+        };
 
         // 发送GET请求并接收ResonseEntity
         try {
             // 取Observable第一次输出的值作为Promise结果
             // Observable = 可持续产生数据的“数据流”
             const response = await firstValueFrom(
-                this.httpService.post<any>(url, body)
-            )
+                this.httpService.post<any>(url, body),
+            );
 
             if (response.status !== 200 || !response.data) {
-                this.logger.error(`Failed to fetch data from portal, status: ${response.status}`);
-                throw new Error(`Failed to fetch data from portal, status: ${response.status}`);
+                this.logger.error(
+                    `Failed to fetch data from portal, status: ${response.status}`,
+                );
+                throw new Error(
+                    `Failed to fetch data from portal, status: ${response.status}`,
+                );
             }
 
             const dataNode: PortalMd5Data = response.data.data;
@@ -98,7 +112,7 @@ export class ResourceService implements OnApplicationBootstrap {
 
             return {
                 totalNumber: dataNode.total,
-                md5List: md5List
+                md5List: md5List,
             };
         } catch (error) {
             this.logger.error(`Error fetching data from portal: ${error}`);
@@ -120,14 +134,19 @@ export class ResourceService implements OnApplicationBootstrap {
                 onePageMd5 = await this.getHealthyModelMd5List(page, pageSize);
                 modelsMd5List.push(...onePageMd5.md5List);
             } catch (error) {
-                this.logger.error(`Error fetching data from portal on page ${page}: ${error}`);
+                this.logger.error(
+                    `Error fetching data from portal on page ${page}: ${error}`,
+                );
                 continue;
             }
         }
         return modelsMd5List;
     }
 
-    private async getHealthyDataMethodList(page: number, pageSize: number): Promise<{ totalNumber: number; methodList: Record<string, any>[] }> {
+    private async getHealthyDataMethodList(
+        page: number,
+        pageSize: number,
+    ): Promise<{ totalNumber: number; methodList: Record<string, any>[] }> {
         const url = `http://${this.dataServerLocation}/container/method/listWithStringTag?page=${page}&limit=${pageSize}`;
 
         try {
@@ -140,8 +159,12 @@ export class ResourceService implements OnApplicationBootstrap {
             );
 
             if (response.status !== 200 || !response.data) {
-                this.logger.error(`Failed to fetch method data from portal, status: ${response.status}`);
-                throw new Error(`Failed to fetch method data from portal, status: ${response.status}`);
+                this.logger.error(
+                    `Failed to fetch method data from portal, status: ${response.status}`,
+                );
+                throw new Error(
+                    `Failed to fetch method data from portal, status: ${response.status}`,
+                );
             }
 
             const pageNode = response.data?.page;
@@ -163,12 +186,18 @@ export class ResourceService implements OnApplicationBootstrap {
             return [];
         }
 
-        if (typeof input === 'string' || typeof input === 'number' || typeof input === 'boolean') {
+        if (
+            typeof input === 'string' ||
+            typeof input === 'number' ||
+            typeof input === 'boolean'
+        ) {
             return [String(input)];
         }
 
         if (Array.isArray(input)) {
-            return input.flatMap((item) => this.extractStringValues(item)).filter((item) => item.length > 0);
+            return input
+                .flatMap((item) => this.extractStringValues(item))
+                .filter((item) => item.length > 0);
         }
 
         if (typeof input === 'object') {
@@ -196,7 +225,11 @@ export class ResourceService implements OnApplicationBootstrap {
         return Object.values(input).some((value) => this.hasKeyDeep(value, key));
     }
 
-    private parseMethodParams(paramsNode: any): { params: ModelItemParamDto[]; inputParams: ModelItemParamDto[]; outputParams: ModelItemParamDto[] } {
+    private parseMethodParams(paramsNode: any): {
+        params: ModelItemParamDto[];
+        inputParams: ModelItemParamDto[];
+        outputParams: ModelItemParamDto[];
+    } {
         const params: ModelItemParamDto[] = [];
         const inputParams: ModelItemParamDto[] = [];
         const outputParams: ModelItemParamDto[] = [];
@@ -204,8 +237,13 @@ export class ResourceService implements OnApplicationBootstrap {
         const paramsArray = Array.isArray(paramsNode) ? paramsNode : [];
 
         for (const node of paramsArray) {
-            const parameterTypeValues = this.extractStringValues(node?.parameter_type);
-            const type = parameterTypeValues.length > 0 ? parameterTypeValues.join('|') : 'Unknown';
+            const parameterTypeValues = this.extractStringValues(
+                node?.parameter_type,
+            );
+            const type =
+                parameterTypeValues.length > 0
+                    ? parameterTypeValues.join('|')
+                    : 'Unknown';
 
             const param = plainToInstance(ModelItemParamDto, {
                 name: node?.Name || '',
@@ -238,7 +276,7 @@ export class ResourceService implements OnApplicationBootstrap {
     // 每小时更新一次
     @Cron(CronExpression.EVERY_DAY_AT_1AM)
     public async synchronizePortalModels(): Promise<void> {
-        console.log("Start synchronizing portal models...");
+        console.log('Start synchronizing portal models...');
         const modelsMd5List = await this.getPortalModelMd5();
         const baseUrl = `http://${this.portalLocation}/computableModel/ModelInfoAndClassifications_pid/`;
 
@@ -246,16 +284,20 @@ export class ResourceService implements OnApplicationBootstrap {
         for (const md5 of modelsMd5List) {
             try {
                 const detailResponse = await firstValueFrom(
-                    this.httpService.get<any>(baseUrl + md5)
-                )
+                    this.httpService.get<any>(baseUrl + md5),
+                );
 
                 if (detailResponse.status !== 200 || !detailResponse.data) {
-                    throw new Error(`Failed to fetch model details for md5 ${md5}, status: ${detailResponse.status}`);
+                    throw new Error(
+                        `Failed to fetch model details for md5 ${md5}, status: ${detailResponse.status}`,
+                    );
                 }
 
                 const modelData = detailResponse.data.data;
                 // 将mdl的XML转换为JSON对象
-                const mdlJson = await this.modelUtilsService.convertMdlXmlToJson(modelData.mdl);
+                const mdlJson = await this.modelUtilsService.convertMdlXmlToJson(
+                    modelData.mdl,
+                );
 
                 // 获取mdl中的states
                 const statesJson = mdlJson['mdl']?.states;
@@ -281,7 +323,6 @@ export class ResourceService implements OnApplicationBootstrap {
                 };
 
                 await this.saveModel(newModel);
-
             } catch (error) {
                 this.logger.error(`Error processing model with md5 ${md5}: ${error}`);
             }
@@ -311,7 +352,9 @@ export class ResourceService implements OnApplicationBootstrap {
                 firstPageResult = await this.getHealthyDataMethodList(page, pageSize);
                 allMethods.push(...firstPageResult.methodList);
             } catch (error) {
-                this.logger.error(`Error fetching method data on page ${page}: ${error}`);
+                this.logger.error(
+                    `Error fetching method data on page ${page}: ${error}`,
+                );
             }
         }
 
@@ -322,7 +365,9 @@ export class ResourceService implements OnApplicationBootstrap {
                     continue;
                 }
 
-                const { params, inputParams, outputParams } = this.parseMethodParams(methodItem?.params);
+                const { params, inputParams, outputParams } = this.parseMethodParams(
+                    methodItem?.params,
+                );
 
                 const methodData: Partial<ModelResource> = {
                     id,
@@ -341,16 +386,22 @@ export class ResourceService implements OnApplicationBootstrap {
 
                 await this.saveModel(methodData);
             } catch (error) {
-                this.logger.error(`Error processing method item ${methodItem?.id || 'unknown'}: ${error}`);
+                this.logger.error(
+                    `Error processing method item ${methodItem?.id || 'unknown'}: ${error}`,
+                );
             }
         }
 
-        this.logger.log(`Data method synchronization completed, total processed: ${allMethods.length}`);
+        this.logger.log(
+            `Data method synchronization completed, total processed: ${allMethods.length}`,
+        );
     }
 
     // 从解析后的MDL中的states中提取输入/输出数据结构
     // @param statesJson 经过MDL解析后的States JSON数组
-    public getModelItemData(states: Record<string, any>[] | null | undefined): ModelItemDataDto {
+    public getModelItemData(
+        states: Record<string, any>[] | null | undefined,
+    ): ModelItemDataDto {
         const inputStates: ModelItemStateDto[] = [];
         const outputStates: ModelItemStateDto[] = [];
 
@@ -365,12 +416,15 @@ export class ResourceService implements OnApplicationBootstrap {
         // 转换为顶层 ModelItemDataDto 实例
         return plainToInstance(ModelItemDataDto, {
             input: inputStates,
-            output: outputStates
+            output: outputStates,
         });
     }
 
     // 从解析后的MDL中提取states流程
-    private getModelItemStates(state: Record<string, any>): { input: ModelItemStateDto, output: ModelItemStateDto } {
+    private getModelItemStates(state: Record<string, any>): {
+        input: ModelItemStateDto;
+        output: ModelItemStateDto;
+    } {
         const inputEvents: ModelItemEventDto[] = [];
         const outputEvents: ModelItemEventDto[] = [];
 
@@ -380,12 +434,12 @@ export class ResourceService implements OnApplicationBootstrap {
                 const modelItemEvent = this.getModelItemEvents(event);
 
                 // 根据eventType区分输入输出事件
-                if (modelItemEvent.eventType === "response") {
+                if (modelItemEvent.eventType === 'response') {
                     inputEvents.push(modelItemEvent);
                 } else {
                     outputEvents.push(modelItemEvent);
                 }
-            } 
+            }
         }
 
         // 组合state对象
@@ -397,13 +451,13 @@ export class ResourceService implements OnApplicationBootstrap {
         // 创建inputState DTO实例
         const inputStateDto = plainToInstance(ModelItemStateDto, {
             ...statePlain,
-            events: inputEvents
+            events: inputEvents,
         });
 
         // 创建outputState DTO实例
         const outputStateDto = plainToInstance(ModelItemStateDto, {
             ...statePlain,
-            events: outputEvents
+            events: outputEvents,
         });
 
         return { input: inputStateDto, output: outputStateDto };
@@ -427,14 +481,16 @@ export class ResourceService implements OnApplicationBootstrap {
             eventType: event.eventType,
             optional: optional,
             eventData: eventData,
-        }
+        };
 
         // 转换为ModelItemEventDto实例并返回
         return plainToInstance(ModelItemEventDto, eventPlain);
     }
 
     // 从解析后的MDL中的states中提取event事件中使用的data细节结构
-    private getModelItemEventData(dataArr: any[] | null | undefined): ModelItemEventDataDto | null {
+    private getModelItemEventData(
+        dataArr: any[] | null | undefined,
+    ): ModelItemEventDataDto | null {
         if (!dataArr || !Array.isArray(dataArr) || dataArr.length === 0) {
             return null;
         }
@@ -444,7 +500,10 @@ export class ResourceService implements OnApplicationBootstrap {
         let nodeList: ModelItemEventDataNodeDto[] = [];
         if (eventData.nodes && Array.isArray(eventData.nodes)) {
             // 转换每个node为ModelItemEventDataNodeDto实例，其中第一个参数为类构造函数，第二个参数为数组
-            nodeList = plainToInstance<ModelItemEventDataNodeDto, any[]>(ModelItemEventDataNodeDto, eventData.nodes);
+            nodeList = plainToInstance<ModelItemEventDataNodeDto, any[]>(
+                ModelItemEventDataNodeDto,
+                eventData.nodes,
+            );
         }
 
         // 组合eventData对象
@@ -452,7 +511,7 @@ export class ResourceService implements OnApplicationBootstrap {
             eventDataType: eventData.type,
             eventDataName: eventData.name,
             exentDataDesc: eventData.description,
-            nodeList: nodeList
+            nodeList: nodeList,
         };
 
         // 转换为ModelItemEventDataDto实例并返回
@@ -461,19 +520,23 @@ export class ResourceService implements OnApplicationBootstrap {
 
     // 将解析和转换后的ModelResource保存到数据库
     // @param modelData 包含模型数据的Partial<ModelResource>对象
-    private async saveModel(modelData: Partial<ModelResource>): Promise<ModelResource> {
+    private async saveModel(
+        modelData: Partial<ModelResource>,
+    ): Promise<ModelResource> {
         const updateData = {
             // 使用$set确保只更新提供的字段
-            $set: {  ...modelData }
+            $set: { ...modelData },
         };
 
         try {
             // 使用fineOneAndUpdate实现upsert操作
-            const result = await this.modelResourceModel.findOneAndUpdate(
-                { id: modelData.id }, // 查找条件
-                updateData,          // 更新数据
-                { new: true, upsert: true } // 选项：返回更新后的文档，若不存在则创建新文档
-            ).exec();
+            const result = await this.modelResourceModel
+                .findOneAndUpdate(
+                    { id: modelData.id }, // 查找条件
+                    updateData, // 更新数据
+                    { new: true, upsert: true }, // 选项：返回更新后的文档，若不存在则创建新文档
+                )
+                .exec();
 
             return result;
         } catch (error) {
@@ -482,27 +545,26 @@ export class ResourceService implements OnApplicationBootstrap {
     }
 
     // 前端根据关键词或者分类查询模型资源列表
-    public async findModels(filter: { categoryId?: string[]; keyword?: string}): Promise<ModelResource[]> {
+    public async findModels(filter: {
+        categoryId?: string[];
+        keyword?: string;
+    }): Promise<ModelResource[]> {
         const { categoryId, keyword } = filter;
-        const query: any = {type: ResourceType.MODEL};
+        const query: any = { type: ResourceType.MODEL };
 
         // 根据分类过滤
         if (categoryId && categoryId.length > 0) {
-            query.normalTags = { $in: categoryId } // 使用 $in 操作符查找normalTags数组中包含任一指定ID(类别)的资源
-
+            query.normalTags = { $in: categoryId }; // 使用 $in 操作符查找normalTags数组中包含任一指定ID(类别)的资源
         }
 
         // 根据关键字查找
         if (keyword) {
-            const regex = new RegExp(keyword, 'i') //'i'表示不区分大小写
+            const regex = new RegExp(keyword, 'i'); //'i'表示不区分大小写
 
             // 使用 $or 组合名称和描述的模糊匹配条件
             const keywordQuery = {
-                $or: [
-                    { name: { $regex: regex }},
-                    { description: { $regex: regex }},
-                ]
-            }
+                $or: [{ name: { $regex: regex } }, { description: { $regex: regex } }],
+            };
 
             Object.assign(query, keywordQuery);
         }
@@ -511,12 +573,15 @@ export class ResourceService implements OnApplicationBootstrap {
             const results = await this.modelResourceModel.find(query).exec();
 
             return results;
-        } catch(error) {
-            throw new Error("Faild to fetch model resources.");
+        } catch (error) {
+            throw new Error('Faild to fetch model resources.');
         }
     }
 
-    public async findMethods(filter: { categoryId?: string[]; keyword?: string}): Promise<ModelResource[]> {
+    public async findMethods(filter: {
+        categoryId?: string[];
+        keyword?: string;
+    }): Promise<ModelResource[]> {
         const { categoryId, keyword } = filter;
         const query: any = { type: ResourceType.METHOD };
 
@@ -527,10 +592,7 @@ export class ResourceService implements OnApplicationBootstrap {
         if (keyword) {
             const regex = new RegExp(keyword, 'i');
             Object.assign(query, {
-                $or: [
-                    { name: { $regex: regex } },
-                    { description: { $regex: regex } },
-                ],
+                $or: [{ name: { $regex: regex } }, { description: { $regex: regex } }],
             });
         }
 
@@ -585,14 +647,21 @@ export class ResourceService implements OnApplicationBootstrap {
             .trim();
     }
 
-    private pushTextPart(parts: string[], label: string, value: unknown, maxLength = 0): void {
+    private pushTextPart(
+        parts: string[],
+        label: string,
+        value: unknown,
+        maxLength = 0,
+    ): void {
         const text = this.normalizeText(value, maxLength);
         if (text) {
             parts.push(`${label}: ${text}`);
         }
     }
 
-    private buildMdlJsonStructuredText(mdlJson: Record<string, any> | undefined): string {
+    private buildMdlJsonStructuredText(
+        mdlJson: Record<string, any> | undefined,
+    ): string {
         const mdl = mdlJson?.mdl ?? {};
         const parts: string[] = [];
 
@@ -612,12 +681,17 @@ export class ResourceService implements OnApplicationBootstrap {
 
             for (const item of dataItems.slice(0, 6)) {
                 const nodeParts = Array.isArray(item?.nodes)
-                    ? item.nodes.slice(0, 8)
-                        .map((node: any) => [
-                            this.normalizeText(node?.name),
-                            this.normalizeText(node?.description, 160),
-                            this.normalizeText(node?.dataType),
-                        ].filter(Boolean).join(' '))
+                    ? item.nodes
+                        .slice(0, 8)
+                        .map((node: any) =>
+                            [
+                                this.normalizeText(node?.name),
+                                this.normalizeText(node?.description, 160),
+                                this.normalizeText(node?.dataType),
+                            ]
+                                .filter(Boolean)
+                                .join(' '),
+                        )
                         .filter(Boolean)
                     : [];
 
@@ -626,7 +700,9 @@ export class ResourceService implements OnApplicationBootstrap {
                     this.normalizeText(item?.type),
                     this.normalizeText(item?.description, 180),
                     nodeParts.join(' '),
-                ].filter(Boolean).join(' ');
+                ]
+                    .filter(Boolean)
+                    .join(' ');
 
                 if (itemText) {
                     dataParts.push(itemText);
@@ -649,7 +725,9 @@ export class ResourceService implements OnApplicationBootstrap {
                     this.normalizeText(event?.eventName),
                     this.normalizeText(event?.eventDesc, 240),
                     formatEventData(event?.data),
-                ].filter(Boolean).join(' - ');
+                ]
+                    .filter(Boolean)
+                    .join(' - ');
 
                 if (!eventText) {
                     continue;
@@ -663,16 +741,35 @@ export class ResourceService implements OnApplicationBootstrap {
             }
         }
 
-        this.pushTextPart(parts, 'mdlStates', stateParts.slice(0, 40).join('; '), 2400);
-        this.pushTextPart(parts, 'inputEvents', inputParts.slice(0, 80).join('; '), 3600);
-        this.pushTextPart(parts, 'outputEvents', outputParts.slice(0, 80).join('; '), 3600);
+        this.pushTextPart(
+            parts,
+            'mdlStates',
+            stateParts.slice(0, 40).join('; '),
+            2400,
+        );
+        this.pushTextPart(
+            parts,
+            'inputEvents',
+            inputParts.slice(0, 80).join('; '),
+            3600,
+        );
+        this.pushTextPart(
+            parts,
+            'outputEvents',
+            outputParts.slice(0, 80).join('; '),
+            3600,
+        );
 
         return parts.join('. ');
     }
 
     private buildResourceEmbeddingText(resource: Partial<ModelResource>): string {
         const parts: string[] = [];
-        const pushDistinct = (label: string, value: unknown, maxLength = 0): void => {
+        const pushDistinct = (
+            label: string,
+            value: unknown,
+            maxLength = 0,
+        ): void => {
             const text = this.normalizeText(value, maxLength);
             if (!text) {
                 return;
@@ -709,15 +806,18 @@ export class ResourceService implements OnApplicationBootstrap {
         }>,
         activeModelMd5s: string[],
     ): Promise<void> {
-        const dedupedTaskMap = new Map<string, {
-            modelId: string;
-            modelMd5: string;
-            modelName: string;
-            modelDescription: string;
-            mdl?: string;
-            mdlJson?: Record<string, any>;
-            modelText?: string;
-        }>();
+        const dedupedTaskMap = new Map<
+            string,
+            {
+                modelId: string;
+                modelMd5: string;
+                modelName: string;
+                modelDescription: string;
+                mdl?: string;
+                mdlJson?: Record<string, any>;
+                modelText?: string;
+            }
+        >();
 
         for (const task of tasks) {
             if (!task.modelId || !task.modelMd5) {
@@ -736,17 +836,27 @@ export class ResourceService implements OnApplicationBootstrap {
             for (let i = 0; i < dedupedTasks.length; i += CHUNK_SIZE) {
                 try {
                     const chunk = dedupedTasks.slice(i, i + CHUNK_SIZE);
-                    const texts = chunk.map((task) => task.modelText || this.buildResourceEmbeddingText({
-                        name: task.modelName,
-                        description: task.modelDescription,
-                        mdl: task.mdl,
-                        mdlJson: task.mdlJson,
-                    }));
+                    const texts = chunk.map(
+                        (task) =>
+                            task.modelText ||
+                            this.buildResourceEmbeddingText({
+                                name: task.modelName,
+                                description: task.modelDescription,
+                                mdl: task.mdl,
+                                mdlJson: task.mdlJson,
+                            }),
+                    );
 
                     const vectors = await this.genAIService.generateEmbeddings(texts);
 
-                    if (!vectors || !Array.isArray(vectors) || vectors.length !== chunk.length) {
-                        this.logger.error(`⚠️ 批次索引 ${i} 失败：API 返回数据无效或受限。跳过此批次。`);
+                    if (
+                        !vectors ||
+                        !Array.isArray(vectors) ||
+                        vectors.length !== chunk.length
+                    ) {
+                        this.logger.error(
+                            `⚠️ 批次索引 ${i} 失败：API 返回数据无效或受限。跳过此批次。`,
+                        );
                         failedBatchCount += 1;
                         await new Promise((resolve) => setTimeout(resolve, 60000));
                         continue;
@@ -768,12 +878,14 @@ export class ResourceService implements OnApplicationBootstrap {
 
                     const upserted = await this.milvusService.upsertDocuments(
                         batchDocuments,
-                        activeModelMd5s
+                        activeModelMd5s,
                     );
 
                     if (!upserted) {
                         failedBatchCount += 1;
-                        this.logger.error(`批次索引 ${i} 写入 Milvus 失败，已保留此前成功批次。`);
+                        this.logger.error(
+                            `批次索引 ${i} 写入 Milvus 失败，已保留此前成功批次。`,
+                        );
                     } else {
                         insertedCount += batchDocuments.length;
                         this.logger.log(
@@ -785,7 +897,9 @@ export class ResourceService implements OnApplicationBootstrap {
                     await new Promise((resolve) => setTimeout(resolve, 30000));
                 } catch (error) {
                     failedBatchCount += 1;
-                    this.logger.error(`处理模型向量批次（起始索引 ${i}）时出错: ${error}`);
+                    this.logger.error(
+                        `处理模型向量批次（起始索引 ${i}）时出错: ${error}`,
+                    );
                 }
             }
 
@@ -800,16 +914,19 @@ export class ResourceService implements OnApplicationBootstrap {
         if (activeModelMd5s.length === 0) {
             this.logger.warn('门户模型列表为空，跳过向量清理。');
         }
-
     }
 
     public async initResourceModelVectorData() {
         const data = await this.modelResourceModel
-            .find({ type: ResourceType.MODEL }, { id: 1, md5: 1, name: 1, description: 1, mdl: 1, mdlJson: 1 })
+            .find(
+                { type: ResourceType.MODEL },
+                { id: 1, md5: 1, name: 1, description: 1, mdl: 1, mdlJson: 1 },
+            )
             .lean();
         console.log(`查找到 ${data.length} 条模型资源数据`);
 
-        const existingEmbeddingDocs = await this.milvusService.getExistingDocumentMap();
+        const existingEmbeddingDocs =
+            await this.milvusService.getExistingDocumentMap();
         this.logger.log(`Milvus 现有模型向量: ${existingEmbeddingDocs.size} 条`);
 
         const activeModelMd5s: string[] = [];

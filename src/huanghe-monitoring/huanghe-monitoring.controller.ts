@@ -1,11 +1,11 @@
 import { Controller, Get, Param, Query } from '@nestjs/common';
 import { HuangheMonitoringService } from './huanghe-monitoring.service';
 
-@Controller('huanghe-monitoring')
+@Controller('api/huanghe-monitoring')
 export class HuangheMonitoringController {
   constructor(
     private readonly huangheMonitoringService: HuangheMonitoringService,
-  ) {}
+  ) { }
 
   /**
    * 获取黄河流域内所有空气质量监测站点

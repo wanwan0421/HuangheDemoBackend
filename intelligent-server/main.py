@@ -164,7 +164,7 @@ async def stream_agent(
                         
                         content = extract_text(message_chunk.content)
                         if content:
-                            yield f"data: {json.dumps({'type': 'token', 'message': content}, ensure_ascii=False)}\n\n"
+                            yield "data:" + json.dumps({'type': 'token', 'message': content}, ensure_ascii=False) + "\n\n"
 
                 elif mode == "updates":
                     # 一般是节点名+小更新内容
@@ -182,10 +182,10 @@ async def stream_agent(
                                         task_spec=specific_spec
                                     )
                                     
-                                    yield f"data: {json.dumps({
+                                    yield "data:" + json.dumps({
                                         'type': 'task_spec_generated', 
                                         'data': specific_spec
-                                    }, ensure_ascii=False)}\n\n"
+                                    }, ensure_ascii=False) + "\n\n"
 
                             # 处理recommend_model_node节点
                             elif node_name == "recommend_model_node":
@@ -199,17 +199,17 @@ async def stream_agent(
                                         for tool_call in last_msg.tool_calls:
                                             current_tool = tool_call.get('name', 'unknown')
 
-                                            yield f"data: {json.dumps({
+                                            yield "data:" + json.dumps({
                                                 'type': 'tool_call',
                                                 'tool': current_tool,
                                                 'message': f'工具开始执行: {current_tool}'
-                                            }, ensure_ascii=False)}\n\n"
+                                            }, ensure_ascii=False) + "\n\n"
                                     else:
                                         # LLM 生成了最终结果
-                                        yield f"data: {json.dumps({
+                                        yield "data:" + json.dumps({
                                             'type': 'status',
                                             'message': 'LLM 生成推荐结果'
-                                        }, ensure_ascii=False)}\n\n"
+                                        }, ensure_ascii=False) + "\n\n"
 
                             # 处理tool_node节点
                             elif node_name == "tool_node":
@@ -229,11 +229,11 @@ async def stream_agent(
                                         and tool_result.get("status") == "success"
                                     ):
                                         model_detail_ready = True
-                                    yield f"data: {json.dumps({
+                                    yield "data:" + json.dumps({
                                         "type": 'tool_result',
                                         "tool": tool_name,
                                         "data": tool_result
-                                    }, ensure_ascii=False)}\n\n"
+                                    }, ensure_ascii=False) + "\n\n"
 
                             # 处理model_contract_node节点
                             elif node_name == "model_contract_node":
@@ -245,10 +245,10 @@ async def stream_agent(
                                         model_contract=model_contract
                                     )
                                     
-                                    yield f"data: {json.dumps({
+                                    yield "data:" + json.dumps({
                                         'type': 'model_contract_generated',
                                         'data': model_contract
-                                    }, ensure_ascii=False)}\n\n"
+                                    }, ensure_ascii=False) + "\n\n"
 
                         continue
 
@@ -256,22 +256,22 @@ async def stream_agent(
 
                 elif mode == "custom":
                     # 工具内部通过 StreamWriter 发出的数据
-                    yield f"data: {json.dumps({
+                    yield "data:" + json.dumps({
                         'type': 'custom',
                         'data': chunk
-                    }, ensure_ascii=False)}\n\n"
+                    }, ensure_ascii=False) + "\n\n"
             
             session = coordinator.get_session(thread_id)
-            yield f"data: {json.dumps({
+            yield "data:" + json.dumps({
                 'type': 'final',
                 'session_id': thread_id,
                 'phase': 'task_model_completed',
                 'has_task_spec': bool(session and session.task_spec),
                 'has_model_contract': bool(session and session.model_contract)
-            }, ensure_ascii=False)}\n\n"
+            }, ensure_ascii=False) + "\n\n"
                 
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+            yield "data:" + json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False) + "\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -315,7 +315,7 @@ async def data_scan_stream_endpoint(
     async def event_generator():
         try:
             # 发送初始化事件
-            yield f"data: {json.dumps({'type': 'status', 'message': '初始化数据扫描', 'session_id': session_id}, ensure_ascii=False)}\n\n"
+            yield "data:" + json.dumps({'type': 'status', 'message': '初始化数据扫描', 'session_id': session_id}, ensure_ascii=False) + "\n\n"
             
             # 初始化 LangGraph 状态
             initial_state: DataScanState = {
@@ -351,10 +351,10 @@ async def data_scan_stream_endpoint(
                         if isinstance(content, str) and content.strip():
                             if content:
                                 full_response += content
-                                yield f"data: {json.dumps({
+                                yield "data:" + json.dumps({
                                     'type': 'token',
                                     'message': content
-                                }, ensure_ascii=False)}\n\n"
+                                }, ensure_ascii=False) + "\n\n"
 
                         # 如果是 list（结构化 chunk）
                         elif isinstance(content, list):
@@ -363,10 +363,10 @@ async def data_scan_stream_endpoint(
                                     text = part.get("text", "")
                                     if text:
                                         full_response += text
-                                        yield f"data: {json.dumps({
+                                        yield "data:" + json.dumps({
                                             'type': 'token',
                                             'message': text
-                                        }, ensure_ascii=False)}\n\n"
+                                        }, ensure_ascii=False) + "\n\n"
 
                         # 其他类型（忽略）
                         else:
@@ -374,11 +374,11 @@ async def data_scan_stream_endpoint(
 
                         # 逻辑分流：
                         if "```json" not in full_response:
-                            yield f"data: {json.dumps({'type': 'token', 'message': content}, ensure_ascii=False)}\n\n"
+                            yield "data:" + json.dumps({'type': 'token', 'message': content}, ensure_ascii=False) + "\n\n"
                         else:
                             if not is_json_started:
                                 is_json_started = True
-                                yield f"data: {json.dumps({'type': 'status', 'message': '正在构建数据可视化视图...'}, ensure_ascii=False)}\n\n"
+                                yield "data:" + json.dumps({'type': 'status', 'message': '正在构建数据可视化视图...'}, ensure_ascii=False) + "\n\n"
                 
                 elif mode == "updates":
                 # 处理不同类型的事件
@@ -397,17 +397,17 @@ async def data_scan_stream_endpoint(
                                         for tool_call in last_msg.tool_calls:
                                             current_tool = tool_call.get("name", "unknown")
                                             
-                                            yield f"data: {json.dumps({
+                                            yield "data:" + json.dumps({
                                                 'type': 'tool_call',
                                                 'tool': current_tool,
                                                 'message': f'工具开始执行: {current_tool}'
-                                            }, ensure_ascii=False)}\n\n"
+                                            }, ensure_ascii=False) + "\n\n"
                                     else:
                                         # LLM 生成了最终结果
-                                        yield f"data: {json.dumps({
+                                        yield "data:" + json.dumps({
                                             'type': 'status',
                                             'message': 'LLM 生成分析结果'
-                                        }, ensure_ascii=False)}\n\n"
+                                        }, ensure_ascii=False) + "\n\n"
                             
                             # 工具执行节点事件
                             elif node_name == "tool_node":
@@ -416,11 +416,11 @@ async def data_scan_stream_endpoint(
                                 for tmsg in tool_results:
                                     tool_name = getattr(tmsg, "tool_name", "unknown")
                                     
-                                    yield f"data: {json.dumps({
+                                    yield "data:" + json.dumps({
                                         'type': 'tool_result',
                                         'tool': tool_name,
                                         'message': f'工具执行完成: {tool_name}'
-                                    }, ensure_ascii=False)}\n\n"
+                                    }, ensure_ascii=False) + "\n\n"
 
                         continue
                     
@@ -433,21 +433,21 @@ async def data_scan_stream_endpoint(
                 profile=final_profile
             )
 
-            yield f"data: {json.dumps({
+            yield "data:" + json.dumps({
                 'type': 'final',
                 'profile': final_profile,
                 'session_id': session_id,
                 'saved_to_session': True,
                 'data_profile_count': len(session.data_profiles)
-            }, ensure_ascii=False)}\n\n"
+            }, ensure_ascii=False) + "\n\n"
 
         except Exception as e:
-            yield f"data: {json.dumps({
+            yield "data:" + json.dumps({
                 'type': 'error',
                 'message': f'分析失败: {str(e)}',
                 'session_id': session_id
-            }, ensure_ascii=False)}\n\n"
-    
+            }, ensure_ascii=False) + "\n\n"
+
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
@@ -553,7 +553,7 @@ async def align_session_stream(
         latest_status = "processing"
 
         try:
-            yield f"data: {json.dumps({'type': 'status', 'message': '对齐智能体开始执行', 'session_id': request.session_id}, ensure_ascii=False)}\n\n"
+            yield "data:" + json.dumps({'type': 'status', 'message': '对齐智能体开始执行', 'session_id': request.session_id}, ensure_ascii=False) + "\n\n"
 
             async for mode, chunk in alignment_agent.astream(initial_state, stream_mode=["updates"]):
                 if mode != "updates" or not isinstance(chunk, dict):
@@ -566,13 +566,13 @@ async def align_session_stream(
                         latest_result = node_output.get("Alignment_result", latest_result) or {}
 
                     if node_name == "alignment_node":
-                        yield f"data: {json.dumps({'type': 'status', 'stage': 'alignment', 'message': '对齐分析完成，正在生成决策包'}, ensure_ascii=False)}\n\n"
+                        yield "data:" + json.dumps({'type': 'status', 'stage': 'alignment', 'message': '对齐分析完成，正在生成决策包'}, ensure_ascii=False) + "\n\n"
 
                     elif node_name == "decision_package_node":
-                        yield f"data: {json.dumps({'type': 'status', 'stage': 'decision', 'message': '决策包已生成，检查是否需要自动转换'}, ensure_ascii=False)}\n\n"
+                        yield "data:" + json.dumps({'type': 'status', 'stage': 'decision', 'message': '决策包已生成，检查是否需要自动转换'}, ensure_ascii=False) + "\n\n"
 
                     elif node_name == "auto_transform_node":
-                        yield f"data: {json.dumps({'type': 'alignment_done', 'alignment_status': latest_status, 'alignment_result': latest_result}, ensure_ascii=False)}\n\n"
+                        yield "data:" + json.dumps({'type': 'alignment_done', 'alignment_status': latest_status, 'alignment_result': latest_result}, ensure_ascii=False) + "\n\n"
 
             final_payload = {
                 "status": "success",
@@ -588,10 +588,10 @@ async def align_session_stream(
 
             session.alignment_result = latest_result
             session.status = coordinator._status_from_text(latest_status)
-            yield f"data: {json.dumps({'type': 'final', 'data': final_payload}, ensure_ascii=False)}\n\n"
+            yield "data:" + json.dumps({'type': 'final', 'data': final_payload}, ensure_ascii=False) + "\n\n"
 
         except Exception as exc:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
+            yield "data:" + json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False) + "\n\n"
 
     return StreamingResponse(
         event_generator(),

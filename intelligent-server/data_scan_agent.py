@@ -12,14 +12,12 @@ This agent operates independently and can be invoked by a supervisor or directly
 from typing import TypedDict, List, Dict, Any, Annotated
 from langchain.messages import HumanMessage, SystemMessage, AIMessage, AnyMessage
 from langgraph.graph import StateGraph, START, END
-from langchain_google_genai import ChatGoogleGenerativeAI
 import operator
-import os
 import json
 from dotenv import load_dotenv
+from llm_factory import create_chat_model
 
 load_dotenv()
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 
 class DataScanState(TypedDict):
@@ -81,10 +79,13 @@ def format_analyzer_node(state: DataScanState) -> Dict[str, Any]:
 {f'检测时间: {state.get("time_detected", False)}' if 'time_detected' in state else ''}
 """
     
-    model = ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash-exp",
+    model = create_chat_model(
+        "LIGHT_DATA_SCAN",
+        default_model="gemini-2.0-flash-exp",
+        default_provider="google",
         temperature=0.2,
-        google_api_key=GOOGLE_API_KEY,
+        max_retries=2,
+        streaming=False,
     )
     
     messages = [
@@ -146,10 +147,13 @@ def metadata_extractor_node(state: DataScanState) -> Dict[str, Any]:
     if state.get("dimensions"):
         sample_text += f"维度信息: {state['dimensions']}\n"
     
-    model = ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash-exp",
+    model = create_chat_model(
+        "LIGHT_DATA_SCAN",
+        default_model="gemini-2.0-flash-exp",
+        default_provider="google",
         temperature=0.2,
-        google_api_key=GOOGLE_API_KEY,
+        max_retries=2,
+        streaming=False,
     )
     
     messages = [
@@ -232,10 +236,13 @@ def llm_refiner_node(state: DataScanState) -> Dict[str, Any]:
 请综合判断数据的最终类型。
 """
     
-    model = ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash-exp",
+    model = create_chat_model(
+        "LIGHT_DATA_SCAN",
+        default_model="gemini-2.0-flash-exp",
+        default_provider="google",
         temperature=0.1,
-        google_api_key=GOOGLE_API_KEY,
+        max_retries=2,
+        streaming=False,
     )
     
     messages = [

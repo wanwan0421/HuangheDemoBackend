@@ -67,3 +67,12 @@ pids
 
 # Diagnostic reports (https://nodejs.org/api/report.html)
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# Python virtual environment
+venv/
+*/venv/
+**/venv/
+
+# Python cache
+__pycache__/
+*.pyc

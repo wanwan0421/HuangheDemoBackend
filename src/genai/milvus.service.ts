@@ -40,14 +40,20 @@ export class MilvusService {
         this.initClient();
     }
 
+    private readNumber(name: string, fallback: number): number {
+        const rawValue = this.configService.get<string>(name);
+        const parsed = Number.parseInt(String(rawValue ?? ''), 10);
+        return Number.isFinite(parsed) ? parsed : fallback;
+    }
+
     private initConfig(): void {
         this.config = {
-            host: this.configService.get<string>('MILVUS_HOST', 'localhost'),
-            port: this.configService.get<number>('MILVUS_PORT', 19530),
+            host: this.configService.get<string>('MILVUS_HOST', '127.0.0.1'),
+            port: this.readNumber('MILVUS_PORT', 19530),
             username: this.configService.get<string>('MILVUS_USERNAME'),
             password: this.configService.get<string>('MILVUS_PASSWORD'),
             collectionName: this.configService.get<string>('MILVUS_COLLECTION', 'modelembeddings'),
-            vectorDim: this.configService.get<number>('EMBEDDING_DIM', 3072),
+            vectorDim: this.readNumber('EMBEDDING_DIM', 3072),
         };
     }
 
@@ -58,6 +64,32 @@ export class MilvusService {
             password: this.config.password,
             timeout: 10000,
         });
+    }
+
+    private isUnavailableError(error: unknown): boolean {
+        const message = String((error as any)?.message || error || '');
+        const code = (error as any)?.code;
+        return code === 14 || message.includes('14 UNAVAILABLE') || message.includes('No connection established');
+    }
+
+    private reconnectClient(): void {
+        this.logger.warn(`Reconnecting Milvus client: ${this.config.host}:${this.config.port}`);
+        this.initClient();
+    }
+
+    private async withReconnect<T>(operationName: string, action: () => Promise<T>): Promise<T> {
+        try {
+            return await action();
+        } catch (error) {
+            if (!this.isUnavailableError(error)) {
+                throw error;
+            }
+
+            const err = error as any;
+            this.logger.warn(`${operationName} hit transient Milvus connection error, retrying once: ${err.message || String(error)}`);
+            this.reconnectClient();
+            return await action();
+        }
     }
 
     private normalizeText(value: unknown, maxLength = 0): string {
@@ -249,8 +281,10 @@ export class MilvusService {
 
     async connect(): Promise<boolean> {
         try {
-            await this.client.connectPromise;
-            await this.client.showCollections();
+            await this.withReconnect('connect', async () => {
+                await this.client.connectPromise;
+                await this.client.showCollections();
+            });
             this.logger.log(`Milvus connected: ${this.config.host}:${this.config.port}`);
             return true;
         } catch (error: unknown) {
@@ -262,109 +296,111 @@ export class MilvusService {
 
     async createCollection(): Promise<boolean> {
         try {
-            const hasCollection = await this.client.hasCollection({
-                collection_name: this.config.collectionName,
-            });
+            await this.withReconnect('createCollection', async () => {
+                const hasCollection = await this.client.hasCollection({
+                    collection_name: this.config.collectionName,
+                });
 
-            if (hasCollection.value) {
-                const hasHybridSchema = await this.collectionHasHybridSchema();
-                if (hasHybridSchema) {
-                    await this.client.loadCollectionSync({
-                        collection_name: this.config.collectionName,
-                    });
-                    this.logger.log(`Collection ${this.config.collectionName} loaded`);
-                    return true;
+                if (hasCollection.value) {
+                    const hasHybridSchema = await this.collectionHasHybridSchema();
+                    if (hasHybridSchema) {
+                        await this.client.loadCollectionSync({
+                            collection_name: this.config.collectionName,
+                        });
+                        this.logger.log(`Collection ${this.config.collectionName} loaded`);
+                        return;
+                    }
+
+                    this.logger.warn(
+                        `Collection ${this.config.collectionName} has an old schema; rebuilding for Milvus hybrid search`,
+                    );
+                    await this.dropCollectionIfExists();
                 }
 
-                this.logger.warn(
-                    `Collection ${this.config.collectionName} has an old schema; rebuilding for Milvus hybrid search`,
-                );
-                await this.dropCollectionIfExists();
-            }
-
-            await this.client.createCollection({
-                collection_name: this.config.collectionName,
-                fields: [
-                    {
-                        name: 'id',
-                        data_type: DataType.Int64,
-                        is_primary_key: true,
-                        autoID: true,
-                    },
-                    {
-                        name: 'modelId',
-                        data_type: DataType.VarChar,
-                        max_length: 255,
-                    },
-                    {
-                        name: 'modelMd5',
-                        data_type: DataType.VarChar,
-                        max_length: 255,
-                    },
-                    {
-                        name: 'modelName',
-                        data_type: DataType.VarChar,
-                        max_length: 1024,
-                    },
-                    {
-                        name: 'modelDescription',
-                        data_type: DataType.VarChar,
-                        max_length: 8192,
-                    },
-                    {
-                        name: 'modelText',
-                        data_type: DataType.VarChar,
-                        max_length: 16384,
-                        enable_analyzer: true,
-                        enable_match: true,
-                        analyzer_params: {
-                            type: 'chinese',
+                await this.client.createCollection({
+                    collection_name: this.config.collectionName,
+                    fields: [
+                        {
+                            name: 'id',
+                            data_type: DataType.Int64,
+                            is_primary_key: true,
+                            autoID: true,
                         },
-                    },
-                    {
-                        name: 'embeddingSource',
-                        data_type: DataType.VarChar,
-                        max_length: 255,
-                    },
-                    {
-                        name: 'embedding',
-                        data_type: DataType.FloatVector,
-                        dim: this.config.vectorDim,
-                    },
-                    {
-                        name: 'sparse',
-                        data_type: DataType.SparseFloatVector,
-                        is_function_output: true,
-                    },
-                ],
-                functions: [
-                    {
-                        name: 'model_text_bm25',
-                        type: FunctionType.BM25,
-                        input_field_names: ['modelText'],
-                        output_field_names: ['sparse'],
-                        params: {},
-                    },
-                ],
-                index_params: [
-                    {
-                        field_name: 'embedding',
-                        index_type: IndexType.HNSW,
-                        metric_type: MetricType.COSINE,
-                        params: { M: 8, efConstruction: 200 },
-                    },
-                    {
-                        field_name: 'sparse',
-                        index_type: IndexType.SPARSE_INVERTED_INDEX,
-                        metric_type: MetricType.BM25,
-                        params: {},
-                    },
-                ],
-                enable_dynamic_field: false,
-            });
+                        {
+                            name: 'modelId',
+                            data_type: DataType.VarChar,
+                            max_length: 255,
+                        },
+                        {
+                            name: 'modelMd5',
+                            data_type: DataType.VarChar,
+                            max_length: 255,
+                        },
+                        {
+                            name: 'modelName',
+                            data_type: DataType.VarChar,
+                            max_length: 1024,
+                        },
+                        {
+                            name: 'modelDescription',
+                            data_type: DataType.VarChar,
+                            max_length: 8192,
+                        },
+                        {
+                            name: 'modelText',
+                            data_type: DataType.VarChar,
+                            max_length: 16384,
+                            enable_analyzer: true,
+                            enable_match: true,
+                            analyzer_params: {
+                                type: 'chinese',
+                            },
+                        },
+                        {
+                            name: 'embeddingSource',
+                            data_type: DataType.VarChar,
+                            max_length: 255,
+                        },
+                        {
+                            name: 'embedding',
+                            data_type: DataType.FloatVector,
+                            dim: this.config.vectorDim,
+                        },
+                        {
+                            name: 'sparse',
+                            data_type: DataType.SparseFloatVector,
+                            is_function_output: true,
+                        },
+                    ],
+                    functions: [
+                        {
+                            name: 'model_text_bm25',
+                            type: FunctionType.BM25,
+                            input_field_names: ['modelText'],
+                            output_field_names: ['sparse'],
+                            params: {},
+                        },
+                    ],
+                    index_params: [
+                        {
+                            field_name: 'embedding',
+                            index_type: IndexType.HNSW,
+                            metric_type: MetricType.COSINE,
+                            params: { M: 8, efConstruction: 200 },
+                        },
+                        {
+                            field_name: 'sparse',
+                            index_type: IndexType.SPARSE_INVERTED_INDEX,
+                            metric_type: MetricType.BM25,
+                            params: {},
+                        },
+                    ],
+                    enable_dynamic_field: false,
+                });
 
-            await this.client.loadCollectionSync({
-                collection_name: this.config.collectionName,
+                await this.client.loadCollectionSync({
+                    collection_name: this.config.collectionName,
+                });
             });
 
             this.logger.log(`Collection ${this.config.collectionName} created for hybrid search`);
@@ -437,52 +473,54 @@ export class MilvusService {
         activeModelMd5s: string[]
     ): Promise<boolean> {
         try {
-            await this.createCollection();
+            await this.withReconnect('upsertDocuments', async () => {
+                await this.createCollection();
 
-            const rows = this.normalizeRows(documents)
-                .filter((doc) => {
-                    const valid = doc.embedding.length === this.config.vectorDim;
-                    if (!valid) {
-                        this.logger.warn(`Skip invalid embedding dimension for model ${doc.modelMd5 || doc.modelId}`);
-                    }
-                    return valid;
-                })
-                .map((doc) => ({
-                    modelId: doc.modelId,
-                    modelMd5: doc.modelMd5,
-                    modelName: doc.modelName,
-                    modelDescription: doc.modelDescription,
-                    modelText: doc.modelText || this.buildModelText(doc),
-                    embeddingSource: doc.embeddingSource,
-                    embedding: doc.embedding,
-                }));
+                const rows = this.normalizeRows(documents)
+                    .filter((doc) => {
+                        const valid = doc.embedding.length === this.config.vectorDim;
+                        if (!valid) {
+                            this.logger.warn(`Skip invalid embedding dimension for model ${doc.modelMd5 || doc.modelId}`);
+                        }
+                        return valid;
+                    })
+                    .map((doc) => ({
+                        modelId: doc.modelId,
+                        modelMd5: doc.modelMd5,
+                        modelName: doc.modelName,
+                        modelDescription: doc.modelDescription,
+                        modelText: doc.modelText || this.buildModelText(doc),
+                        embeddingSource: doc.embeddingSource,
+                        embedding: doc.embedding,
+                    }));
 
-            if (rows.length === 0) {
-                await this.deleteStaleByMd5(activeModelMd5s);
-                this.logger.warn('No valid documents to insert; stale Milvus rows cleaned only');
-                return true;
-            }
+                if (rows.length === 0) {
+                    await this.deleteStaleByMd5(activeModelMd5s);
+                    this.logger.warn('No valid documents to insert; stale Milvus rows cleaned only');
+                    return;
+                }
 
-            await this.deleteByModelMd5s(rows.map((row) => row.modelMd5));
+                await this.deleteByModelMd5s(rows.map((row) => row.modelMd5));
 
-            const chunkSize = 500;
-            for (let i = 0; i < rows.length; i += chunkSize) {
-                await this.client.insert({
-                    collection_name: this.config.collectionName,
-                    data: rows.slice(i, i + chunkSize),
+                const chunkSize = 500;
+                for (let i = 0; i < rows.length; i += chunkSize) {
+                    await this.client.insert({
+                        collection_name: this.config.collectionName,
+                        data: rows.slice(i, i + chunkSize),
+                    });
+                }
+
+                await this.client.flush({
+                    collection_names: [this.config.collectionName],
                 });
-            }
 
-            await this.client.flush({
-                collection_names: [this.config.collectionName],
+                await this.deleteStaleByMd5(activeModelMd5s);
+                await this.client.loadCollectionSync({
+                    collection_name: this.config.collectionName,
+                });
+
+                this.logger.log(`Inserted ${rows.length} model embeddings into Milvus`);
             });
-
-            await this.deleteStaleByMd5(activeModelMd5s);
-            await this.client.loadCollectionSync({
-                collection_name: this.config.collectionName,
-            });
-
-            this.logger.log(`Inserted ${rows.length} model embeddings into Milvus`);
             return true;
         } catch (error: unknown) {
             const err = error as any;
@@ -511,30 +549,32 @@ export class MilvusService {
         const existing = new Map<string, MilvusEmbeddingDocument>();
 
         try {
-            await this.createCollection();
+            await this.withReconnect('getExistingDocumentMap', async () => {
+                await this.createCollection();
 
-            const rows = await this.queryAllRowsByExpr(
-                '',
-                ['modelMd5', 'modelId', 'modelName', 'modelDescription', 'modelText', 'embeddingSource'],
-            );
+                const rows = await this.queryAllRowsByExpr(
+                    '',
+                    ['modelMd5', 'modelId', 'modelName', 'modelDescription', 'modelText', 'embeddingSource'],
+                );
 
-            this.logger.log(`Milvus existing model embeddings fetched (by modelMd5): ${rows.length}`);
-            for (const row of Array.isArray(rows) ? rows : []) {
-                const modelMd5 = String(row?.modelMd5 || '');
-                if (!modelMd5) {
-                    continue;
+                this.logger.log(`Milvus existing model embeddings fetched (by modelMd5): ${rows.length}`);
+                for (const row of Array.isArray(rows) ? rows : []) {
+                    const modelMd5 = String(row?.modelMd5 || '');
+                    if (!modelMd5) {
+                        continue;
+                    }
+
+                    existing.set(modelMd5, {
+                        modelId: String(row?.modelId || ''),
+                        modelMd5: modelMd5,
+                        modelName: String(row?.modelName || ''),
+                        modelDescription: String(row?.modelDescription || ''),
+                        modelText: String(row?.modelText || ''),
+                        embeddingSource: String(row?.embeddingSource || ''),
+                        embedding: [],
+                    });
                 }
-
-                existing.set(modelMd5, {
-                    modelId: String(row?.modelId || ''),
-                    modelMd5: modelMd5,
-                    modelName: String(row?.modelName || ''),
-                    modelDescription: String(row?.modelDescription || ''),
-                    modelText: String(row?.modelText || ''),
-                    embeddingSource: String(row?.embeddingSource || ''),
-                    embedding: [],
-                });
-            }
+            });
         } catch (error: unknown) {
             const err = error as any;
             this.logger.warn(`Read existing Milvus documents failed; regenerating as needed: ${err.message || String(error)}`);
@@ -545,30 +585,32 @@ export class MilvusService {
 
     async search(embedding: number[], limit: number = 10, filter?: string): Promise<any[]> {
         try {
-            await this.createCollection();
+            return await this.withReconnect('search', async () => {
+                await this.createCollection();
 
-            const searchResult = await this.client.search({
-                collection_name: this.config.collectionName,
-                data: [embedding],
-                anns_field: 'embedding',
-                limit,
-                filter,
-                output_fields: ['modelId', 'modelMd5', 'modelName', 'modelDescription', 'embeddingSource'],
-                metric_type: MetricType.COSINE,
-                params: { ef: 128 },
+                const searchResult = await this.client.search({
+                    collection_name: this.config.collectionName,
+                    data: [embedding],
+                    anns_field: 'embedding',
+                    limit,
+                    filter,
+                    output_fields: ['modelId', 'modelMd5', 'modelName', 'modelDescription', 'embeddingSource'],
+                    metric_type: MetricType.COSINE,
+                    params: { ef: 128 },
+                });
+
+                const rows = (searchResult as any)?.results ?? [];
+                const firstBatch = Array.isArray(rows) ? rows[0] : [];
+                return Array.isArray(firstBatch) ? firstBatch.map((item: any) => ({
+                    id: item.id,
+                    score: item.score,
+                    modelId: item.modelId,
+                    modelMd5: item.modelMd5,
+                    modelName: item.modelName,
+                    modelDescription: item.modelDescription,
+                    embeddingSource: item.embeddingSource,
+                })) : [];
             });
-
-            const rows = (searchResult as any)?.results ?? [];
-            const firstBatch = Array.isArray(rows) ? rows[0] : [];
-            return Array.isArray(firstBatch) ? firstBatch.map((item: any) => ({
-                id: item.id,
-                score: item.score,
-                modelId: item.modelId,
-                modelMd5: item.modelMd5,
-                modelName: item.modelName,
-                modelDescription: item.modelDescription,
-                embeddingSource: item.embeddingSource,
-            })) : [];
         } catch (error: unknown) {
             const err = error as any;
             this.logger.error(`Vector search failed: ${err.message || String(error)}`);
@@ -578,49 +620,51 @@ export class MilvusService {
 
     async hybridSearch(queryText: string, embedding: number[], limit: number = 10, filter?: string): Promise<any[]> {
         try {
-            await this.createCollection();
+            return await this.withReconnect('hybridSearch', async () => {
+                await this.createCollection();
 
-            const searchLimit = Math.max(limit * 5, 50);
-            const hybridProfile = this.inferHybridWeights(queryText);
-            const hybridRequests: any[] = [
-                {
-                    data: [embedding],
-                    anns_field: 'embedding',
-                    limit: searchLimit,
-                    filter,
-                    metric_type: MetricType.COSINE,
-                    params: { ef: 128 },
-                },
-                {
-                    data: [queryText],
-                    anns_field: 'sparse',
-                    limit: searchLimit,
-                    filter,
-                    metric_type: MetricType.BM25,
-                    params: {},
-                },
-            ];
-            const searchResult = await this.client.hybridSearch({
-                collection_name: this.config.collectionName,
-                data: hybridRequests,
-                rerank: {
-                    strategy: 'weighted',
-                    params: { weights: hybridProfile.weights },
-                },
-                limit,
-                output_fields: ['modelId', 'modelMd5', 'modelName', 'modelDescription', 'embeddingSource'],
+                const searchLimit = Math.max(limit * 5, 50);
+                const hybridProfile = this.inferHybridWeights(queryText);
+                const hybridRequests: any[] = [
+                    {
+                        data: [embedding],
+                        anns_field: 'embedding',
+                        limit: searchLimit,
+                        filter,
+                        metric_type: MetricType.COSINE,
+                        params: { ef: 128 },
+                    },
+                    {
+                        data: [queryText],
+                        anns_field: 'sparse',
+                        limit: searchLimit,
+                        filter,
+                        metric_type: MetricType.BM25,
+                        params: {},
+                    },
+                ];
+                const searchResult = await this.client.hybridSearch({
+                    collection_name: this.config.collectionName,
+                    data: hybridRequests,
+                    rerank: {
+                        strategy: 'weighted',
+                        params: { weights: hybridProfile.weights },
+                    },
+                    limit,
+                    output_fields: ['modelId', 'modelMd5', 'modelName', 'modelDescription', 'embeddingSource'],
+                });
+
+                const rows = (searchResult as any)?.results ?? [];
+                return Array.isArray(rows) ? rows.map((item: any) => ({
+                    id: item.id,
+                    score: item.score,
+                    modelId: item.modelId,
+                    modelMd5: item.modelMd5,
+                    modelName: item.modelName,
+                    modelDescription: item.modelDescription,
+                    embeddingSource: item.embeddingSource,
+                })) : [];
             });
-
-            const rows = (searchResult as any)?.results ?? [];
-            return Array.isArray(rows) ? rows.map((item: any) => ({
-                id: item.id,
-                score: item.score,
-                modelId: item.modelId,
-                modelMd5: item.modelMd5,
-                modelName: item.modelName,
-                modelDescription: item.modelDescription,
-                embeddingSource: item.embeddingSource,
-            })) : [];
         } catch (error: unknown) {
             const err = error as any;
             this.logger.error(`Hybrid search failed: ${err.message || String(error)}`);
@@ -630,9 +674,11 @@ export class MilvusService {
 
     async getCollectionStats(): Promise<any> {
         try {
-            await this.createCollection();
-            return await this.client.getCollectionStatistics({
-                collection_name: this.config.collectionName,
+            return await this.withReconnect('getCollectionStats', async () => {
+                await this.createCollection();
+                return await this.client.getCollectionStatistics({
+                    collection_name: this.config.collectionName,
+                });
             });
         } catch (error: unknown) {
             const err = error as any;
@@ -643,8 +689,10 @@ export class MilvusService {
 
     async flush(): Promise<boolean> {
         try {
-            await this.client.flush({
-                collection_names: [this.config.collectionName],
+            await this.withReconnect('flush', async () => {
+                await this.client.flush({
+                    collection_names: [this.config.collectionName],
+                });
             });
             this.logger.log('Milvus data flushed');
             return true;
@@ -657,7 +705,9 @@ export class MilvusService {
 
     async deleteCollection(): Promise<boolean> {
         try {
-            await this.dropCollectionIfExists();
+            await this.withReconnect('deleteCollection', async () => {
+                await this.dropCollectionIfExists();
+            });
             this.logger.log(`Collection ${this.config.collectionName} deleted`);
             return true;
         } catch (error: unknown) {

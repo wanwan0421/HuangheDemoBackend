@@ -6,13 +6,11 @@ Specialized agents collaborate to analyze and classify geospatial data.
 from typing import TypedDict, List, Dict, Any, Literal, Annotated
 from langchain.messages import HumanMessage, SystemMessage, AIMessage, AnyMessage
 from langgraph.graph import StateGraph, START, END
-from langchain_google_genai import ChatGoogleGenerativeAI
 import operator
-import os
 from dotenv import load_dotenv
+from llm_factory import create_chat_model
 
 load_dotenv()
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 
 class DataAnalysisState(TypedDict):
@@ -44,12 +42,15 @@ class DataAnalysisState(TypedDict):
 
 
 # Initialize specialized LLMs
-def create_specialized_model(temperature: float = 0.3) -> ChatGoogleGenerativeAI:
-    """Create a Gemini model instance"""
-    return ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash-exp",
+def create_specialized_model(temperature: float = 0.3):
+    """Create a configurable chat model instance."""
+    return create_chat_model(
+        "DATA_REFINE_AGENT",
+        default_model="gemini-2.0-flash-exp",
+        default_provider="google",
         temperature=temperature,
-        google_api_key=GOOGLE_API_KEY,
+        max_retries=2,
+        streaming=False,
     )
 
 

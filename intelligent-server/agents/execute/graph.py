@@ -19,16 +19,19 @@ load_dotenv()
 
 AIHUBMIX_API_KEY = os.getenv("AIHUBMIX_API_KEY")
 AIHUBMIX_BASE_URL = os.getenv("AIHUBMIX_BASE_URL")
+EXECUTE_AGENT_API_KEY = os.getenv("EXECUTE_AGENT_API_KEY") or os.getenv("OPENAI_COMPAT_API_KEY") or AIHUBMIX_API_KEY
+EXECUTE_AGENT_BASE_URL = os.getenv("EXECUTE_AGENT_BASE_URL") or os.getenv("OPENAI_COMPAT_BASE_URL") or AIHUBMIX_BASE_URL or "https://aihubmix.com/v1"
+EXECUTE_AGENT_MODEL = os.getenv("EXECUTE_AGENT_MODEL") or os.getenv("LLM_CHAT_MODEL") or "gpt-4o-mini"
 DATA_METHOD_BASE_URL = (os.getenv("DATA_METHOD_BASE_URL") or "http://172.21.252.222:8080").rstrip("/")
 DATA_METHOD_TOKEN = os.getenv("DATA_METHOD_TOKEN") or ""
 
 execute_model = ChatOpenAI(
-    model="gpt-4o-mini",
+    model=EXECUTE_AGENT_MODEL,
     temperature=1.0,
     max_retries=2,
     streaming=False,
-    openai_api_key=AIHUBMIX_API_KEY,
-    openai_api_base=AIHUBMIX_BASE_URL or "https://aihubmix.com/v1",
+    openai_api_key=EXECUTE_AGENT_API_KEY,
+    openai_api_base=EXECUTE_AGENT_BASE_URL,
 )
 
 

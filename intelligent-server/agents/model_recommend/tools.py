@@ -22,16 +22,18 @@ logger = logging.getLogger(__name__)
 
 # 初始化模型
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
-AIHUBMIX_API_KEY = os.getenv("AIHUBMIX_API_KEY")
-AIHUBMIX_BASE_URL = os.getenv("AIHUBMIX_BASE_URL")
+AIHUBMIX_API_KEY = os.getenv("MODEL_RECOMMEND_API_KEY") or os.getenv("OPENAI_COMPAT_API_KEY") or os.getenv("AIHUBMIX_API_KEY")
+AIHUBMIX_BASE_URL = os.getenv("MODEL_RECOMMEND_BASE_URL") or os.getenv("OPENAI_COMPAT_BASE_URL") or os.getenv("AIHUBMIX_BASE_URL")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+MODEL_RECOMMEND_CHAT_MODEL = os.getenv("MODEL_RECOMMEND_CHAT_MODEL") or os.getenv("LLM_CHAT_MODEL") or "gpt-4o-mini"
+MODEL_RECOMMEND_EMBEDDING_MODEL = os.getenv("MODEL_RECOMMEND_EMBEDDING_MODEL") or os.getenv("LLM_EMBEDDING_MODEL") or "gemini-embedding-001"
 client = OpenAI(
     api_key=AIHUBMIX_API_KEY,
     base_url=AIHUBMIX_BASE_URL
 )
 
 recommendation_model = ChatOpenAI(
-    model= "gpt-4o-mini",
+    model=MODEL_RECOMMEND_CHAT_MODEL,
     temperature=1.0,
     max_retries=2,
     streaming=True,
@@ -406,7 +408,7 @@ def search_relevant_models(
 
         # 生成用户查询向量
         query_vector = client.embeddings.create(
-            model="gemini-embedding-001",
+            model=MODEL_RECOMMEND_EMBEDDING_MODEL,
             input=user_query_text
         ).data[0].embedding
 

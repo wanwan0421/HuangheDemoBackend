@@ -23,8 +23,14 @@ MONGO_DB_NAME = os.getenv("MONGO_DB_NAME")
 MEMORY_COLLECTION = "userMemories"
 MEMORY_MILVUS_COLLECTION = os.getenv("MEMORY_MILVUS_COLLECTION", "")
 MEMORY_EMBEDDING_MODEL = os.getenv("MEMORY_EMBEDDING_MODEL", os.getenv("EMBEDDING_MODEL", "gemini-embedding-001"))
-AIHUBMIX_API_KEY = os.getenv("AIHUBMIX_API_KEY")
-AIHUBMIX_BASE_URL = os.getenv("AIHUBMIX_BASE_URL")
+MEMORY_EMBEDDING_DIM = int(
+    os.getenv(
+        "MEMORY_EMBEDDING_DIM",
+        os.getenv("EMBEDDING_DIM", "1536"),
+    )
+)
+AIHUBMIX_API_KEY = os.getenv("MEMORY_AGENT_API_KEY") or os.getenv("OPENAI_COMPAT_API_KEY") or os.getenv("AIHUBMIX_API_KEY")
+AIHUBMIX_BASE_URL = os.getenv("MEMORY_AGENT_BASE_URL") or os.getenv("OPENAI_COMPAT_BASE_URL") or os.getenv("AIHUBMIX_BASE_URL")
 MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
 MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
 
@@ -90,7 +96,7 @@ class Store:
                             "fields": {
                                 "embedding": {
                                     "type": "knnVector",
-                                    "dimensions": 1536,
+                                    "dimensions": MEMORY_EMBEDDING_DIM,
                                     "similarity": "cosine"
                                 }
                             }

@@ -51,9 +51,9 @@ export class ResourceService implements OnApplicationBootstrap {
     }
 
     public onApplicationBootstrap(): void {
-        // setImmediate(() => {
-        //     void this.runInitResourceModelVectorData('startup');
-        // });
+        setImmediate(() => {
+            void this.runInitResourceModelVectorData('startup');
+        });
     }
 
     private async runInitResourceModelVectorData(reason: string): Promise<void> {

@@ -1,22 +1,20 @@
-import { Type } from '@google/genai';
-
 export const indexRecommendationTool = {
     name: 'recommend_index',
     description: 'Recommend the top 5 most suitable indexes from the the provided context.',
     parameters: {
-        type: Type.OBJECT,
+        type: 'object',
         properties: {
             recommendations: {
-                type: Type.ARRAY,
+                type: 'array',
                 items: {
-                    type: Type.OBJECT,
+                    type: 'object',
                     properties: {
                         name: {
-                            type: Type.STRING,
+                            type: 'string',
                             description: 'Index name (e.g., "Terrain Relief", "Total Solar Radiation")'
                         },
                         reason: {
-                            type: Type.STRING,
+                            type: 'string',
                             description: 'Explain why this index matches the user requirement.'
                         }
                     },
@@ -33,14 +31,14 @@ export const modelRecommendationTool = {
     name: 'recommend_model',
     description: 'Recommend the most suitable geographic computing model from the provided model information.',
     parameters: {
-        type: Type.OBJECT,
+        type: 'object',
         properties: {
             md5: {
-                type: Type.STRING,
+                type: 'string',
                 description: 'The md5 of the most matching geographical model recommended by the system (e.g., "00ac830b4da73eab8d482b2f11b537db")'
             },
             reason: {
-                type: Type.STRING,
+                type: 'string',
                 description: 'Explain why the system recommends the best matching geographic model.'
             }
         },

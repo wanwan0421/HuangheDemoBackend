@@ -9,19 +9,19 @@ import operator
 from typing import TypedDict, Dict, Any, List, Annotated
 from langchain.messages import HumanMessage, SystemMessage, AnyMessage, AIMessage
 from langgraph.graph import StateGraph, START, END
-from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
 import os
+from llm_factory import create_chat_model
 
 load_dotenv()
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-task_model = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
+task_model = create_chat_model(
+    "TASK_AGENT",
+    default_model="gemini-2.5-flash",
+    default_provider="google",
     temperature=0.1,
     max_retries=2,
     streaming=False,
-    google_api_key=GOOGLE_API_KEY,
 )
 
 

@@ -25,11 +25,12 @@ ARCHIVE_EXTENSIONS = ['.zip', '.tar', '.gz', '.rar']
 
 # 初始化模型
 load_dotenv()
-AIHUBMIX_API_KEY = os.getenv("AIHUBMIX_API_KEY")
-AIHUBMIX_BASE_URL = os.getenv("AIHUBMIX_BASE_URL")
+AIHUBMIX_API_KEY = os.getenv("DATA_SCAN_AGENT_API_KEY") or os.getenv("OPENAI_COMPAT_API_KEY") or os.getenv("AIHUBMIX_API_KEY")
+AIHUBMIX_BASE_URL = os.getenv("DATA_SCAN_AGENT_BASE_URL") or os.getenv("OPENAI_COMPAT_BASE_URL") or os.getenv("AIHUBMIX_BASE_URL")
+DATA_SCAN_MODEL_NAME = os.getenv("DATA_SCAN_AGENT_MODEL") or os.getenv("LLM_CHAT_MODEL") or "gpt-4o-mini"
 
 data_scan_model = ChatOpenAI(
-    model="gpt-4o-mini",
+    model=DATA_SCAN_MODEL_NAME,
     temperature=1.0,
     max_retries=2,
     streaming=True,

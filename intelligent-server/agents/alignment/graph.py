@@ -19,11 +19,12 @@ from agents.execute.graph import execute_agent
 """
 
 load_dotenv()
-AIHUBMIX_API_KEY = os.getenv("AIHUBMIX_API_KEY")
-AIHUBMIX_BASE_URL = os.getenv("AIHUBMIX_BASE_URL")
+AIHUBMIX_API_KEY = os.getenv("ALIGNMENT_AGENT_API_KEY") or os.getenv("OPENAI_COMPAT_API_KEY") or os.getenv("AIHUBMIX_API_KEY")
+AIHUBMIX_BASE_URL = os.getenv("ALIGNMENT_AGENT_BASE_URL") or os.getenv("OPENAI_COMPAT_BASE_URL") or os.getenv("AIHUBMIX_BASE_URL")
+ALIGNMENT_MODEL_NAME = os.getenv("ALIGNMENT_AGENT_MODEL") or os.getenv("LLM_CHAT_MODEL") or "gpt-4o-mini"
 
 alignment_model = ChatOpenAI(
-    model="gpt-4o-mini",
+    model=ALIGNMENT_MODEL_NAME,
     temperature=1.0,
     max_retries=2,
     streaming=False,

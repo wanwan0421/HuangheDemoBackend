@@ -43,12 +43,24 @@ class OGMSTask(Service):
             sys.exit(1)
         config.read(config_path)
         self.username = config.get("DEFAULT", "username").strip()
-        self.portalServer = config.get("DEFAULT", "portalServer").strip()
-        self.portalPort = config.get("DEFAULT", "portalPort").strip()
-        self.managerServer = config.get("DEFAULT", "managerServer").strip()
-        self.managerPort = config.get("DEFAULT", "managerPort").strip()
-        self.dataServer = config.get("DEFAULT", "dataServer").strip()
-        self.dataPort = config.get("DEFAULT", "dataPort").strip()
+        self.portalServer = os.getenv(
+            "OGMS_PORTAL_SERVER", config.get("DEFAULT", "portalServer")
+        ).strip()
+        self.portalPort = int(os.getenv(
+            "OGMS_PORTAL_PORT", config.get("DEFAULT", "portalPort")
+        ).strip())
+        self.managerServer = os.getenv(
+            "OGMS_MANAGER_SERVER", config.get("DEFAULT", "managerServer")
+        ).strip()
+        self.managerPort = int(os.getenv(
+            "OGMS_MANAGER_PORT", config.get("DEFAULT", "managerPort")
+        ).strip())
+        self.dataServer = os.getenv(
+            "OGMS_DATA_SERVER", config.get("DEFAULT", "dataServer")
+        ).strip()
+        self.dataPort = int(os.getenv(
+            "OGMS_DATA_PORT", config.get("DEFAULT", "dataPort")
+        ).strip())
         if not (
                 self.username
                 or self.portalServer
@@ -339,11 +351,26 @@ class OGMSTask(Service):
             if self.status == 0 and status == 1:
                 print("模型运算中，请稍后...")
             if status == 2:
+                outputs = res["data"].get("outputs") or []
+                print(
+                    "[diagnostic] refreshTaskRecord completed response: "
+                    + json.dumps(
+                        {
+                            "tid": res["data"].get("tid", self.tid),
+                            "pid": res["data"].get("pid"),
+                            "status": status,
+                            "outputs": outputs,
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                    flush=True,
+                )
                 hasValue = False
-                for output in res["data"]["outputs"]:
-                    if output.get("url") is not None and output.get("url") != "":
-                        url = output.get("url")
-                        print(url)
+                for output in outputs:
+                    url = output.get("url")
+                    if url is not None and url != "" and url != []:
+                        print(f"[diagnostic] output ready: {url}", flush=True)
                         # url = output.get("url")
                         # updated_url = url.replace(
                         #     "http://112.4.132.6:8083",
@@ -352,12 +379,41 @@ class OGMSTask(Service):
                         # output["url"] = updated_url
                         hasValue = True
                 if hasValue is False:
-                    return -1
-                for output in res["data"]["outputs"]:
-                    if "[" in output.get("url"):
+                    wait_timeout = max(
+                        0,
+                        int(os.getenv("MODEL_OUTPUT_READY_TIMEOUT_SECONDS", "60")),
+                    )
+                    now = time.time()
+                    wait_started_at = getattr(self, "_output_wait_started_at", None)
+                    if wait_started_at is None:
+                        wait_started_at = now
+                        self._output_wait_started_at = wait_started_at
+                    elapsed = now - wait_started_at
+
+                    if elapsed < wait_timeout:
+                        print(
+                            "[diagnostic] task completed, but output URLs are not "
+                            f"ready; retrying ({elapsed:.1f}/{wait_timeout}s)",
+                            flush=True,
+                        )
+                        self.status = 1
+                        return 1
+
+                    tid = res["data"].get("tid", self.tid)
+                    pid = res["data"].get("pid")
+                    raise RuntimeError(
+                        "远程模型任务已结束但没有产生输出文件"
+                        f"（tid={tid}, pid={pid}）。请检查模型输入数据、"
+                        "模型容器日志以及输出事件配置。"
+                    )
+                for output in outputs:
+                    url = output.get("url")
+                    if isinstance(url, list) or (
+                            isinstance(url, str) and "[" in url
+                    ):
                         output["multiple"] = True
                 self.pid = res["data"]["pid"]
-                self.outputs = res["data"]["outputs"]
+                self.outputs = outputs
                 print("模型运算完成，获取结果中，请稍后...")
             if status == -1:
                 print("模型服务计算异常!")
@@ -520,10 +576,18 @@ class OGMSTaskAccess(Service):
             print("读取配置信息出错，请联系管理员！")
             sys.exit(1)
         config.read(config_path)
-        self.portalServer = config.get("DEFAULT", "portalServer").strip()
-        self.portalPort = int(config.get("DEFAULT", "portalPort").strip())
-        self.managerServer = config.get("DEFAULT", "managerServer").strip()
-        self.managerPort = config.get("DEFAULT", "managerPort").strip()
+        self.portalServer = os.getenv(
+            "OGMS_PORTAL_SERVER", config.get("DEFAULT", "portalServer")
+        ).strip()
+        self.portalPort = int(os.getenv(
+            "OGMS_PORTAL_PORT", config.get("DEFAULT", "portalPort")
+        ).strip())
+        self.managerServer = os.getenv(
+            "OGMS_MANAGER_SERVER", config.get("DEFAULT", "managerServer")
+        ).strip()
+        self.managerPort = int(os.getenv(
+            "OGMS_MANAGER_PORT", config.get("DEFAULT", "managerPort")
+        ).strip())
         if not (
                 self.portalServer
                 or self.portalPort
@@ -546,23 +610,23 @@ class OGMSTaskAccess(Service):
             self.portalPort,
             "/computableModel/ModelInfo_name/" + encode_url,
             )
-        if res is None:
-            print(f"《{modelName}》模型库维护中，请联系管理员！")
-            sys.exit(1)
-        else:
-            if (
+        if not isinstance(res, dict):
+            raise RuntimeError(
+                f"模型信息服务返回了无效数据: {type(res).__name__}: {res}"
+            )
+        if (
                     res["code"] == 0
                     and res["data"] != None
                     and res["data"].get("md5") != None
-            ):
-                print("模型资源已载入，准备创建服务！")
-                # get first model pid
-                pid = res["data"]["md5"]
-                self.checkModelService(pid)
-                self.mdlData = res["data"]
-            else:
-                print(f"《{modelName}》资源不存在！")
-                sys.exit(1)
+        ):
+            print("模型资源已载入，准备创建服务！")
+            # get first model pid
+            pid = res["data"]["md5"]
+            self.checkModelService(pid)
+            self.mdlData = res["data"]
+        else:
+            print(f"《{modelName}》资源不存在！")
+            sys.exit(1)
 
     def checkModelService(self, pid: str):
         if not pid:

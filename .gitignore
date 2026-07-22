@@ -72,6 +72,8 @@ report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 venv/
 */venv/
 **/venv/
+venv_old/
+**/venv_old/
 
 # Python cache
 __pycache__/

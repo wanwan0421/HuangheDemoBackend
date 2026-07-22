@@ -99,6 +99,50 @@ def get_db():
         _db_client = MongoClient(MONGO_URI)
     return _db_client[DB_NAME]
 
+
+def get_candidate_model_summaries(md5s: List[str]) -> List[Dict[str, Any]]:
+    """Return display-only candidate metadata without changing retrieval order."""
+    if not md5s:
+        return []
+    collection = get_db()["modelResource"]
+    documents = {
+        str(item.get("md5")): item
+        for item in collection.find(
+            {"md5": {"$in": md5s}},
+            {"name": 1, "md5": 1, "description": 1, "data": 1},
+        )
+    }
+    summaries: List[Dict[str, Any]] = []
+    for md5 in md5s:
+        model = documents.get(str(md5))
+        if not model:
+            continue
+        inputs: List[str] = []
+        outputs: List[str] = []
+        data = model.get("data") or {}
+        for direction, target in (("input", inputs), ("output", outputs)):
+            for state in data.get(direction, []) or []:
+                for event in state.get("events", []) or []:
+                    event_data = event.get("eventData") or {}
+                    values = event_data.get("nodeList") or []
+                    if values:
+                        for node in values:
+                            name = str(node.get("name") or node.get("description") or "").strip()
+                            if name and name not in target:
+                                target.append(name)
+                    else:
+                        name = str(event_data.get("eventDataName") or event.get("eventName") or "").strip()
+                        if name and name not in target:
+                            target.append(name)
+        summaries.append({
+            "md5": str(model.get("md5") or ""),
+            "name": str(model.get("name") or ""),
+            "description": str(model.get("description") or ""),
+            "inputs": inputs[:8],
+            "outputs": outputs[:8],
+        })
+    return summaries
+
 def get_milvus_collection():
     """获取 Milvus collection 连接"""
     global _milvus_collection
@@ -307,6 +351,20 @@ def _model_alias_values(model: Dict[str, Any]) -> List[Any]:
     return values
 
 
+def _normalize_catalog_name_text(value: Any) -> str:
+    """Normalize catalog names and user text for explicit model-name matching.
+
+    Model catalogs commonly store names such as ``SWAT_Model`` while users type
+    ``SWAT模型``.  Separators and the generic Chinese/English word "model" do
+    not identify the resource, so remove them before comparing names.  Keep all
+    other characters to avoid broadening the normal semantic-retrieval branch.
+    """
+    text = str(value or "").casefold()
+    text = text.replace("模型", "")
+    text = re.sub(r"model", "", text, flags=re.IGNORECASE)
+    return re.sub(r"[_\-\s]+", "", text)
+
+
 def _catalog_name_match_score(query_text: str, name_value: Any) -> float:
     """对单个候选名计算与 query 的相似度。
 
@@ -320,13 +378,24 @@ def _catalog_name_match_score(query_text: str, name_value: Any) -> float:
     if not name or not query:
         return 0.0
 
-    if len(name) < CATALOG_NAME_MIN_FUZZY_LEN:
-        if name.isascii():
-            pattern = r"(?<![A-Za-z0-9])" + re.escape(name) + r"(?![A-Za-z0-9])"
-            return 100.0 if re.search(pattern, query) else 0.0
-        return 100.0 if name in query else 0.0
+    normalized_name = _normalize_catalog_name_text(name)
+    normalized_query = _normalize_catalog_name_text(query)
+    if not normalized_name or not normalized_query:
+        return 0.0
 
-    score = float(fuzz.partial_ratio(name, query))
+    # Very short resource names still require a boundary-aware exact mention;
+    # otherwise a one-letter model could match an unrelated word.
+    if len(normalized_name) < CATALOG_NAME_MIN_FUZZY_LEN:
+        if normalized_name.isascii():
+            pattern = r"(?<![A-Za-z0-9])" + re.escape(normalized_name) + r"(?![A-Za-z0-9])"
+            normalized_boundary_query = re.sub(r"[_\-\s]+", " ", query.casefold()).replace("模型", "")
+            return 100.0 if re.search(pattern, normalized_boundary_query) else 0.0
+        return 100.0 if normalized_name in normalized_query else 0.0
+
+    if normalized_name in normalized_query:
+        return 100.0
+
+    score = float(fuzz.partial_ratio(normalized_name, normalized_query))
     return score if score >= CATALOG_NAME_FUZZY_THRESHOLD else 0.0
 
 

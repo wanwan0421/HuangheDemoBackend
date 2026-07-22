@@ -27,6 +27,7 @@ export class Session {
     recommendedModel?: {
         name: string;
         description: string;
+        reason?: string;
         workflow: any[];
     };
 

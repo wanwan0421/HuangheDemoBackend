@@ -11,6 +11,8 @@ charstr = "QWERTYUIOPASDFGHJKLZXCVBNMzyxwvutsrqponmlkjihgfedcba!@#$%^&*()"
 
 
 class HttpHelper:
+    DEFAULT_TIMEOUT = (10, 60)
+
     @staticmethod
     def Request_get_url_sync(url: str) -> json:
         try:
@@ -22,14 +24,21 @@ class HttpHelper:
 
     @staticmethod
     def Request_get_sync(ip: str, port: int, path: str, headers: object = {}) -> json:
+        url = f"http://{ip}:{port}{path}"
         try:
-            conn = httplib.HTTPConnection(ip, port)
+            conn = httplib.HTTPConnection(ip, port, timeout=60)
             conn.request("GET", path, headers=headers)
             res = conn.getresponse()
-            jsData = json.loads(res.read())
+            body = res.read()
+            if not 200 <= res.status < 300:
+                raise RuntimeError(
+                    f"GET {url} returned HTTP {res.status}: "
+                    f"{body.decode('utf-8', errors='replace')[:500]}"
+                )
+            jsData = json.loads(body)
             return jsData
         except Exception as e:
-            return f"Error:{e}"
+            raise RuntimeError(f"GET {url} failed: {e}") from e
 
     @staticmethod
     def Request_get_stream_sync(ip: str, port: int, path: str) -> str:
@@ -60,15 +69,20 @@ class HttpHelper:
         # 构建完整的URL
         url = f"http://{ip}:{port}{path}"
         try:
-            response = requests.post(url, json=params, headers=headers)
+            response = requests.post(
+                url,
+                json=params,
+                headers=headers,
+                timeout=HttpHelper.DEFAULT_TIMEOUT,
+            )
             response.raise_for_status()  # 如果响应状态码不是200，会抛出异常
             return response.json()  # 返回JSON格式的响应数据
         except requests.exceptions.HTTPError as http_err:
-            print(f"HTTP error occurred: {http_err}")
-            return None
+            raise RuntimeError(f"POST {url} failed: {http_err}") from http_err
         except Exception as err:
-            print(f"Other error occurred: {err}")
-            return None
+            if isinstance(err, RuntimeError):
+                raise
+            raise RuntimeError(f"POST {url} failed: {err}") from err
 
     @staticmethod
     def Request_post_sync(
@@ -76,12 +90,17 @@ class HttpHelper:
     ):
         try:
             r = requests.post(
-                "http://" + ip + ":" + str(port) + path, params, files=files
+                "http://" + ip + ":" + str(port) + path,
+                params,
+                files=files,
+                timeout=HttpHelper.DEFAULT_TIMEOUT,
             )
+            r.raise_for_status()
             jsData = json.loads(r.text)
             return jsData
         except Exception as e:
-            return "Error"
+            url = "http://" + ip + ":" + str(port) + path
+            raise RuntimeError(f"POST {url} failed: {e}") from e
 
     @staticmethod
     def Request_put_sync(ip: str, port: int, path: str):

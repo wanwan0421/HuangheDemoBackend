@@ -103,6 +103,8 @@ async def stream_agent(
             "recommended_model": {},
             "tool_results": {},
             "selected_model_md5": "",
+            "candidate_selection_required": False,
+            "candidate_options": [],
             "request_id": request_id,
             "task_hash": "",
             "tool_scope_id": request_id,
@@ -119,6 +121,8 @@ async def stream_agent(
                 "recommended_model": {},
                 "tool_results": {},
                 "selected_model_md5": "",
+                "candidate_selection_required": False,
+                "candidate_options": [],
                 "llm_calls": 0,
                 "tool_call_count": 0,
                 "request_id": request_id,
@@ -189,6 +193,11 @@ async def stream_agent(
 
                             # 处理recommend_model_node节点
                             elif node_name == "recommend_model_node":
+                                if node_output.get("candidate_selection_required"):
+                                    yield "data:" + json.dumps({
+                                        "type": "candidate_selection_required",
+                                        "data": node_output.get("candidate_options", []),
+                                    }, ensure_ascii=False) + "\n\n"
                                 # 获取messages列表
                                 messages = node_output.get("messages", [])
                                 if messages and len(messages) > 0:

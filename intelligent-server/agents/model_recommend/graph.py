@@ -9,6 +9,8 @@ import json
 import inspect
 import hashlib
 import os
+import re
+from difflib import SequenceMatcher
 from pathlib import Path
 from pymongo import MongoClient
 from langgraph.checkpoint.mongodb import MongoDBSaver
@@ -58,6 +60,8 @@ class ModelState(TypedDict):
     tool_results: Annotated[Dict[str, Any], replace_state_value]
     # 候选最优模型md5
     selected_model_md5: Annotated[str, replace_state_value]
+    candidate_selection_required: Annotated[bool, replace_state_value]
+    candidate_options: Annotated[list[Dict[str, Any]], replace_state_value]
 
 # 任务规范结构
 class TaskSpec(BaseModel):
@@ -182,6 +186,12 @@ def select_candidate_model_md5(state: ModelState, candidates: list[Dict[str, Any
         return ""
 
     latest_query = state.get("latest_user_query") or get_latest_user_query(state.get("messages", []))
+    selected_match = re.search(r"\[MODEL_MD5:([a-fA-F0-9]{32})\]", latest_query or "")
+    if selected_match:
+        selected_md5 = selected_match.group(1).lower()
+        if any(str(candidate.get("modelMd5") or "").lower() == selected_md5 for candidate in valid_candidates):
+            return selected_md5
+
     rejected_md5s = set(previous_search_most_model_md5s(state.get("messages", [])))
     if not is_model_change_request(latest_query):
         rejected_md5s = set()
@@ -192,6 +202,40 @@ def select_candidate_model_md5(state: ModelState, candidates: list[Dict[str, Any
     ] or valid_candidates
 
     return available_candidates[0].get("modelMd5", "")
+
+
+def normalized_model_family_name(value: str) -> str:
+    return "".join(
+        character
+        for character in str(value or "").casefold()
+        if character.isalnum()
+    )
+
+
+def requires_candidate_selection(state: ModelState, candidates: list[Dict[str, Any]]) -> bool:
+    if len(candidates) < 2:
+        return False
+    query = state.get("latest_user_query") or get_latest_user_query(state.get("messages", []))
+    if re.search(r"\[MODEL_MD5:[a-fA-F0-9]{32}\]", query or "") or tools.has_catalog_name_mention(query):
+        return False
+
+    task_spec = state.get("Task_spec", {}) or {}
+    domain = str(task_spec.get("Domain") or "").strip()
+    target = str(task_spec.get("Target_object") or "").strip()
+    vague_values = {"", "未指定", "未知", "不明确", "unknown", "none"}
+    is_vague = domain.lower() in vague_values or target.lower() in vague_values
+
+    names = [normalized_model_family_name(item.get("modelName", "")) for item in candidates[:5]]
+    has_similar_models = any(
+        left and right and (
+            left in right
+            or right in left
+            or SequenceMatcher(None, left, right).ratio() >= 0.88
+        )
+        for index, left in enumerate(names)
+        for right in names[index + 1:]
+    )
+    return is_vague or has_similar_models
 
 
 def normalized_tool_args(tool_name: str, raw_args: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -623,6 +667,17 @@ def recommend_model_node(state: ModelState) -> Dict[str, Any]:
         }
 
     if relevant_models and not recommended_model:
+        if requires_candidate_selection(state, relevant_models):
+            candidate_md5s = [
+                str(item.get("modelMd5") or "")
+                for item in relevant_models[:5]
+                if item.get("modelMd5")
+            ]
+            return {
+                "messages": [AIMessage(content="")],
+                "candidate_selection_required": True,
+                "candidate_options": tools.get_candidate_model_summaries(candidate_md5s),
+            }
         selected_model_md5 = select_candidate_model_md5(state, relevant_models)
         if selected_model_md5:
             return {
@@ -914,6 +969,9 @@ def should_continue(state: ModelState) -> Any:
     判断是否需要继续迭代
     优先级：已完成工作流 > 还需工具 > 结束
     """
+    if state.get("candidate_selection_required"):
+        return END
+
     messages = state.get("messages", [])
     last_message = messages[-1] if messages else None
     print(f"should_continue check: last_message={last_message}, tool_call_count={state.get('tool_call_count')}, Task_spec={state.get('Task_spec')}, recommended_model={get_scoped_recommended_model(state)}")

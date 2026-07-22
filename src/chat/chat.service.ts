@@ -621,13 +621,18 @@ export class ChatService {
                         if (payload?.tool && payload.type === 'tool_result') {
                             tools.push(payload);
                         }
-                        if (payload.type === 'tool_result' && payload.tool === 'get_model_details' && payload.data) {
+                        if (
+                            payload.type === 'tool_result'
+                            && ['get_model_details', 'search_most_model'].includes(payload.tool)
+                            && payload.data
+                        ) {
                             finalModelData = payload.data;
                             this.sessionModel.findByIdAndUpdate(sessionId, {
                                 recommendedModel: {
                                     name: finalModelData.name,
                                     md5: finalModelData.md5,
                                     description: finalModelData.description,
+                                    reason: finalModelData.reason,
                                     workflow: finalModelData.workflow,
                                 },
                                 updatedAt: new Date(),

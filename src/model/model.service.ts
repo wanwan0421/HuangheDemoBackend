@@ -7,7 +7,10 @@ import FormData from 'form-data';
 import fetch from 'node-fetch';
 import { spawn } from 'child_process';
 import { CreateModelRunRequest } from './dto/create-model-run.dto';
-import { ModelRunRecord, ModelRunRecordDocument } from './schemas/model-run-record.schema';
+import {
+  ModelRunRecord,
+  ModelRunRecordDocument,
+} from './schemas/model-run-record.schema';
 
 @Injectable()
 export class ModelRunnerService {
@@ -15,12 +18,20 @@ export class ModelRunnerService {
   private readonly projectRoot = process.cwd();
   private readonly modelDataDir = path.join(process.cwd(), 'model-scripts');
   private readonly uploadsDir = path.join(this.modelDataDir, 'uploads');
-  private readonly jsonScriptsDir = path.join(this.modelDataDir, 'json-scripts');
-  private readonly driverScriptsPath = path.join(this.modelDataDir, 'python-scripts', 'ogms_driver.py');
+  private readonly jsonScriptsDir = path.join(
+    this.modelDataDir,
+    'json-scripts',
+  );
+  private readonly driverScriptsPath = path.join(
+    this.modelDataDir,
+    'python-scripts',
+    'ogms_driver.py',
+  );
   private readonly pythonExe = this.findPythonExecutable();
 
   constructor(
-    @InjectModel(ModelRunRecord.name) private modelRunRecordModel: Model<ModelRunRecordDocument>,
+    @InjectModel(ModelRunRecord.name)
+    private modelRunRecordModel: Model<ModelRunRecordDocument>,
   ) {
     this.initializeDirectories();
   }
@@ -29,7 +40,7 @@ export class ModelRunnerService {
    * 初始化必要的目录
    */
   private initializeDirectories() {
-    [this.modelDataDir, this.jsonScriptsDir].forEach(dir => {
+    [this.modelDataDir, this.jsonScriptsDir].forEach((dir) => {
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
         this.logger.log(`创建目录: ${dir}`);
@@ -37,7 +48,9 @@ export class ModelRunnerService {
     });
 
     if (!fs.existsSync(this.driverScriptsPath)) {
-      this.logger.warn(`警告: Python驱动脚本未找到，请确保文件存在于: ${this.driverScriptsPath}`);
+      this.logger.warn(
+        `警告: Python驱动脚本未找到，请确保文件存在于: ${this.driverScriptsPath}`,
+      );
     }
   }
 
@@ -46,8 +59,27 @@ export class ModelRunnerService {
    */
   private findPythonExecutable(): string {
     const possiblePaths = [
-      path.join(this.projectRoot, 'intelligent-server', 'intelligent-server', 'Scripts', 'python.exe'),
-      path.join(this.projectRoot, 'intelligent-server', 'intelligent-server', 'bin', 'python'),
+      path.join(
+        this.projectRoot,
+        'intelligent-server',
+        'venv',
+        'Scripts',
+        'python.exe',
+      ),
+      path.join(
+        this.projectRoot,
+        'intelligent-server',
+        'intelligent-server',
+        'Scripts',
+        'python.exe',
+      ),
+      path.join(
+        this.projectRoot,
+        'intelligent-server',
+        'intelligent-server',
+        'bin',
+        'python',
+      ),
       path.join(this.projectRoot, '.venv', 'Scripts', 'python.exe'),
       path.join(this.projectRoot, '.venv', 'bin', 'python'),
       path.join(this.projectRoot, 'venv', 'Scripts', 'python.exe'),
@@ -106,24 +138,31 @@ export class ModelRunnerService {
 
       for (const [eventName, eventData] of Object.entries(events)) {
         if (typeof eventData !== 'object') {
-          throw new Error(`状态 "${stateName}" 的事件 "${eventName}" 数据格式不正确`);
+          throw new Error(
+            `状态 "${stateName}" 的事件 "${eventName}" 数据格式不正确`,
+          );
         }
 
         // 至少需要 url 或 value
         if (!eventData.name && !eventData.url && !eventData.value) {
-          throw new Error(`状态 "${stateName}" 的事件 "${eventName}" 必须包含 name、url 或 value`);
+          throw new Error(
+            `状态 "${stateName}" 的事件 "${eventName}" 必须包含 name、url 或 value`,
+          );
         }
       }
     }
   }
 
   /**
-    * 将用户上传的模型以及数据生成JSON文件
-    * @param taskId 任务ID
-    * @param request 创建模型运行请求
-    * @returns JSON文件路径
-  */
-  private async generateInputJson(taskId: string, request: CreateModelRunRequest): Promise<string> {
+   * 将用户上传的模型以及数据生成JSON文件
+   * @param taskId 任务ID
+   * @param request 创建模型运行请求
+   * @returns JSON文件路径
+   */
+  private async generateInputJson(
+    taskId: string,
+    request: CreateModelRunRequest,
+  ): Promise<string> {
     const lists = await this.buildRunLists(request.states);
 
     // 构造传递给Python的完整数据包
@@ -133,16 +172,22 @@ export class ModelRunnerService {
     };
 
     const jsonPath = path.join(this.jsonScriptsDir, `${taskId}_input.json`);
-    await fs.promises.writeFile(jsonPath, JSON.stringify(inputData, null, 2), 'utf-8');
+    await fs.promises.writeFile(
+      jsonPath,
+      JSON.stringify(inputData, null, 2),
+      'utf-8',
+    );
     return jsonPath;
   }
 
   /**
-    * 构建run列表，即lists中的run部分，直接生成对象存JSON格式
-    * @param states 状态及其事件数据
-    * @returns 构建好的run对象
-  */
-  private async buildRunLists(states: Record<string, Record<string, any>>): Promise<Record<string, any>> {
+   * 构建run列表，即lists中的run部分，直接生成对象存JSON格式
+   * @param states 状态及其事件数据
+   * @returns 构建好的run对象
+   */
+  private async buildRunLists(
+    states: Record<string, Record<string, any>>,
+  ): Promise<Record<string, any>> {
     const run: Record<string, any> = {};
 
     for (const [stateName, events] of Object.entries(states)) {
@@ -151,7 +196,6 @@ export class ModelRunnerService {
       for (const [eventName, eventData] of Object.entries(events)) {
         // 本地文件型参数，需要先上传至数据中转服务器
         if (eventData.filePath) {
-
           const filePath = eventData.filePath;
           const fileUrl = await this.uploadFileToDataServer(filePath);
           await this.cleanupUploadedLocalFile(filePath);
@@ -171,8 +215,14 @@ export class ModelRunnerService {
         // 数值 / 字符串参数
         else if (eventData.value !== undefined) {
           const inputName = eventData.name || eventName;
-          const valueFileName = inputName.includes('.') ? inputName : `${inputName}.xml`;
-          const xmlFileUrl = await this.uploadValueAsXml(inputName, 'string', eventData.value);
+          const valueFileName = inputName.includes('.')
+            ? inputName
+            : `${inputName}.xml`;
+          const xmlFileUrl = await this.uploadValueAsXml(
+            inputName,
+            'string',
+            eventData.value,
+          );
           run[stateName][eventName] = {
             name: valueFileName,
             url: xmlFileUrl,
@@ -195,18 +245,23 @@ export class ModelRunnerService {
       const form = new FormData();
       form.append('datafile', fs.createReadStream(filePath));
 
-      const response = await fetch(`http://${process.env.dataServer}:${process.env.dataPort}/data`, {
-        method: 'POST',
-        body: form,
-        headers: form.getHeaders(),
-      });
+      const response = await fetch(
+        `http://${process.env.dataServer}:${process.env.dataPort}/data`,
+        {
+          method: 'POST',
+          body: form,
+          headers: form.getHeaders(),
+        },
+      );
 
-      const responseData = await response.json() as any;
+      const responseData = (await response.json()) as any;
 
       if (responseData.code === 1 && responseData.data?.id) {
         return `http://geomodeling.njnu.edu.cn/dataTransferServer/data/${responseData.data.id}`;
       } else {
-        throw new Error(`上传文件失败: ${responseData.data.message || '未知错误'}`);
+        throw new Error(
+          `上传文件失败: ${responseData.data.message || '未知错误'}`,
+        );
       }
     } catch (error) {
       throw new Error(`上传文件异常: ${error}`);
@@ -242,9 +297,16 @@ export class ModelRunnerService {
    * @param value 参数值
    * @returns XML文件URL
    */
-  private async uploadValueAsXml(eventName: string, type: string, value: string): Promise<string> {
+  private async uploadValueAsXml(
+    eventName: string,
+    type: string,
+    value: string,
+  ): Promise<string> {
     // 生成临时xml文件
-    const tmpXmlPath = path.join(this.jsonScriptsDir, `${crypto.randomUUID()}_${eventName}.xml`);
+    const tmpXmlPath = path.join(
+      this.jsonScriptsDir,
+      `${crypto.randomUUID()}_${eventName}.xml`,
+    );
     const xmlContent = `<Dataset>\n  <XDO name="${eventName}" kernelType="${type}" value="${value}" />\n</Dataset>`;
     await fs.promises.writeFile(tmpXmlPath, xmlContent, 'utf-8');
 
@@ -258,13 +320,17 @@ export class ModelRunnerService {
   }
 
   /**
-    * 创建模型运行任务记录
-    * @param taskId 任务ID
-    * @param request 创建模型运行请求
-    * @param jsonPath JSON文件路径
-    * @returns 任务记录文档
-  */
-  private async createRunRecord(taskId: string, request: CreateModelRunRequest, jsonPath: string): Promise<ModelRunRecordDocument> {
+   * 创建模型运行任务记录
+   * @param taskId 任务ID
+   * @param request 创建模型运行请求
+   * @param jsonPath JSON文件路径
+   * @returns 任务记录文档
+   */
+  private async createRunRecord(
+    taskId: string,
+    request: CreateModelRunRequest,
+    jsonPath: string,
+  ): Promise<ModelRunRecordDocument> {
     const record = new this.modelRunRecordModel({
       taskId,
       modelName: request.modelName,
@@ -278,11 +344,11 @@ export class ModelRunnerService {
   }
 
   /**
- * 异步运行模型
- * @param taskId 任务ID
- * @param jsonPath JSON文件路径
- * @param recordId 任务记录ID
- */
+   * 异步运行模型
+   * @param taskId 任务ID
+   * @param jsonPath JSON文件路径
+   * @param recordId 任务记录ID
+   */
   private runModelAsync(taskId: string, jsonPath: string, recordId: string) {
     setImmediate(async () => {
       try {
@@ -316,7 +382,8 @@ export class ModelRunnerService {
 
         this.logger.log(`模型任务完成: ${taskId}`);
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
+        const errorMessage =
+          error instanceof Error ? error.message : String(error);
 
         // 更新状态为失败
         await this.modelRunRecordModel.updateOne(
@@ -335,7 +402,7 @@ export class ModelRunnerService {
    * 执行Python驱动脚本
    * @param jsonPath 输入JSON文件路径
    * @returns 脚本执行结果
-  */
+   */
   private executePythonDriver(jsonPath: string): Promise<any> {
     return new Promise((resolve, reject) => {
       // 检查驱动脚本是否存在
@@ -344,7 +411,7 @@ export class ModelRunnerService {
       }
 
       // 运行python：ogms_driver.py
-      const python = spawn(this.pythonExe, [this.driverScriptsPath, jsonPath], {
+      const python = spawn(this.pythonExe, ['-u', this.driverScriptsPath, jsonPath], {
         cwd: path.dirname(this.driverScriptsPath),
         env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
       });
@@ -354,6 +421,7 @@ export class ModelRunnerService {
 
       python.stdout.on('data', (data) => {
         stdoutData += data.toString();
+        this.logger.log(`[Python Log]: ${data.toString().trim()}`);
       });
 
       python.stderr.on('data', (data) => {
@@ -361,7 +429,14 @@ export class ModelRunnerService {
         this.logger.debug(`[Python Log]: ${data.toString().trim()}`);
       });
 
+      const timeoutMs = Number(process.env.MODEL_RUN_TIMEOUT_MS || 30 * 60 * 1000);
+      const timeout = setTimeout(() => {
+        python.kill();
+        reject(new Error(`模型运行超过 ${timeoutMs}ms，已终止 Python 驱动`));
+      }, timeoutMs);
+
       python.on('close', (code) => {
+        clearTimeout(timeout);
         if (code !== 0) {
           const stderrText = stderrData.trim();
           const stdoutText = stdoutData.trim();
@@ -370,11 +445,16 @@ export class ModelRunnerService {
           let pythonMessage = '';
           if (stdoutText) {
             try {
-              const lines = stdoutText.split('\n').map(line => line.trim()).filter(Boolean);
+              const lines = stdoutText
+                .split('\n')
+                .map((line) => line.trim())
+                .filter(Boolean);
               const lastLine = lines[lines.length - 1];
               const payload = JSON.parse(lastLine);
               if (payload && typeof payload === 'object') {
-                pythonMessage = String(payload.message || payload.error || '').trim();
+                pythonMessage = String(
+                  payload.message || payload.error || '',
+                ).trim();
               }
             } catch {
               // 非 JSON 输出保持原始文本回传即可。
@@ -385,9 +465,15 @@ export class ModelRunnerService {
             pythonMessage ? `python_message: ${pythonMessage}` : '',
             stderrText ? `stderr: ${stderrText}` : '',
             stdoutText ? `stdout: ${stdoutText}` : '',
-          ].filter(Boolean).join(' | ');
+          ]
+            .filter(Boolean)
+            .join(' | ');
 
-          reject(new Error(`Python驱动脚本执行失败，退出码: ${code}${details ? `, 详情: ${details}` : ''}`));
+          reject(
+            new Error(
+              `Python驱动脚本执行失败，退出码: ${code}${details ? `, 详情: ${details}` : ''}`,
+            ),
+          );
         } else {
           try {
             const lines = stdoutData.trim().split('\n');
@@ -402,9 +488,10 @@ export class ModelRunnerService {
       });
 
       python.on('error', (error) => {
+        clearTimeout(timeout);
         reject(new Error(`执行Python驱动脚本时出错: ${error}`));
-      })
-    })
+      });
+    });
   }
 
   /**

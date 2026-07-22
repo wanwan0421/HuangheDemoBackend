@@ -2,7 +2,10 @@ import { Module } from '@nestjs/common';
 import { LlmAgentService } from './llm-agent.service';
 import { LlmAgentController } from './llm-agent.controller';
 import { MongooseModule } from '@nestjs/mongoose';
-import { ModelResource, ModelResourceSchema } from 'src/resource/schemas/modelResource.schema';
+import {
+  ModelResource,
+  ModelResourceSchema,
+} from 'src/resource/schemas/modelResource.schema';
 import { IndexModule } from 'src/index/index.module';
 import { ResourceModule } from 'src/resource/resource.module';
 import { GenAIModule } from 'src/genai/genai.module';
@@ -13,12 +16,12 @@ import { HttpModule } from '@nestjs/axios';
     MongooseModule.forFeature([
       { name: ModelResource.name, schema: ModelResourceSchema },
     ]),
-    IndexModule, 
-    ResourceModule, 
-    GenAIModule, 
-    HttpModule
+    IndexModule,
+    ResourceModule,
+    GenAIModule,
+    HttpModule,
   ],
   providers: [LlmAgentService],
-  controllers: [LlmAgentController]
+  controllers: [LlmAgentController],
 })
 export class LlmAgentModule {}
